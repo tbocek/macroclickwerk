@@ -5,8 +5,10 @@ conditions that can look at the screen.
 
 ![Macroclickwerk Extension Screenshot](docs/screenshot.png)
 
-A macro is a tree of steps: clicks, key presses, typed text, scrolls, waits and
-recorded event trains. Around them you can put `loop` and `if` blocks. A loop
+A macro is a tree of steps: clicks, key presses, typed text, scrolls, waits,
+recorded event trains — and `on event`, which parks the run until a button or
+key of your choosing is pressed and swallows that press, so a side button can
+mean "do the next steps" instead of what it normally does. Around them you can put `loop` and `if` blocks. A loop
 only counts — forever, or a fixed number of times; you leave it with `break`
 inside an `if`, which keeps every condition in one place:
 
@@ -53,12 +55,25 @@ repeat forever:
   draws a green outline over the checked area for a second every time it runs,
   taken just after the screenshot so it is never in the picture the model sees.
 - **Emergency stop** that aborts mid-macro and releases every held key.
+- **Triggers** — a mouse button or key the daemon takes over, and what happens
+  in its place: press another key (side button becomes E), or start, pause or
+  stop a macro — one of them, or everything switched on, which turns a spare
+  button into a physical run/stop switch. The original click is consumed, so
+  the game only ever sees the replacement. Set up under *Preferences → Input →
+  Triggers*. A trigger with no action set leaves its button alone, and every
+  trigger falls back to being a plain button when the daemon or the extension
+  is not there to act — never a dead button. Recordings skip trigger presses:
+  they capture what the screen saw, not what the mouse did. The same machinery
+  drives the **on event step**: put it in a macro and the run parks there until
+  the button is pressed, consuming the press — `repeat forever: [on event
+  side button, click …, press E]` is a side button that plays a sequence. A
+  run parked on a button outranks a standing trigger on the same button.
 
 ## How it fits together
 
 | Piece | Role |
 |---|---|
-| `macroclickwerk.c` | Root daemon. Grabs the real input devices, mirrors them to uinput clones, injects event trains on request, and streams observed events while recording. Always forwards real input. **No macro logic.** |
+| `macroclickwerk.c` | Root daemon. Grabs the real input devices, mirrors them to uinput clones, injects event trains on request, and streams observed events while recording. Always forwards real input, and only holds a grab while something is reading the clone. **No macro logic.** |
 | `gnome-shell/` | The extension. Owns the macro model, the editor UI, all control flow, screenshots and the model calls. |
 
 The split is deliberate: the daemon is the only thing that can see and synthesise
@@ -163,10 +178,19 @@ running against devices that no longer existed, with nothing but a line in the
 journal to say so. `journalctl -u macroclickwerk -f` shows `captured`, `reattached`
 and `detached` as they happen.
 
-The daemon takes an exclusive grab on those devices. The kernel drops a grab when
-the process dies, so a crash self-heals — but while changing the C code, run it
-from an **SSH session or a second TTY** and wrap it in `timeout 60`, so a mistake
-cannot lock you out of your own keyboard.
+The daemon takes an exclusive grab on those devices — but only while something
+else is actually reading the clone, which it checks once a second by looking
+for the clone's node in `/proc/*/fd`. Grabbing reroutes a device through this
+process, so it never happens on faith: at boot, before any compositor is up,
+nothing is grabbed and input flows directly; when the session's compositor
+picks the clones up, the grabs engage; when it goes away, they let go. A
+forward that fails releases its grab on the spot, and after three such
+failures the device stays observe-only until it reattaches — real input
+flowing twice for a moment is an annoyance, real input flowing nowhere is a
+dead keyboard. The kernel also drops every grab when the process dies, so a
+crash self-heals. While changing the C code, still run it from an **SSH
+session or a second TTY** and wrap it in `timeout 60`, so a mistake cannot
+lock you out of your own keyboard.
 
 Shutdown and sleep are both clean. Stopping the daemon (or shutting the machine
 down) releases the grabs, releases anything still held down, and destroys the

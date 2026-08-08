@@ -366,6 +366,85 @@ check('pathToStep of a missing step is empty', pathToStep(flat.body, 'gone').len
           `count ${counted?.count}`);
 }
 
+// --- a run parked on a click -----------------------------------------------
+
+// The onevent step hands the waiting to the trigger engine; here that engine is
+// a stub, so what is under test is the runner's half of the bargain — parking,
+// continuing on the press, and being stoppable while parked.
+{
+    const until = cond => new Promise(resolve => {
+        let tries = 0;
+        GLib.timeout_add(GLib.PRIORITY_DEFAULT, 5, () => {
+            if (cond() || ++tries > 400) {
+                resolve();
+                return GLib.SOURCE_REMOVE;
+            }
+            return GLib.SOURCE_CONTINUE;
+        });
+    });
+
+    const waiters = [];
+    const waitForInput = () => {
+        let resolver;
+        const promise = new Promise(resolve => { resolver = resolve; });
+        const waiter = { fire: () => resolver(true), cancelled: false };
+        waiters.push(waiter);
+        return {
+            promise,
+            cancel: () => { waiter.cancelled = true; resolver(false); },
+        };
+    };
+
+    const clicky = newMacro('clicky');
+    const on = named('onevent', 'on');
+    on.source = 'BTN_SIDE';
+    clicky.body.push(on, named('key', 'then'));
+
+    const seen = [];
+    let reason = '';
+    const runnerFor = () => new MacroRunner(daemon, evaluator, {}, {}, {
+        onStepsChanged: path => {
+            if (path.length > 0) {
+                seen.push(NAMES.get(path[path.length - 1].id) ?? '?');
+            }
+        },
+        onFinished: r => { reason = r; },
+        waitForInput,
+    });
+
+    const first = runnerFor();
+    const run = first.run(clicky);
+    await until(() => waiters.length === 1);
+    check('the run parks on the onevent step', waiters.length === 1 && seen.join(' ') === 'on',
+          seen.join(' '));
+    waiters[0].fire();
+    await run;
+    check('the press lets it continue', seen.join(' ') === 'on then', seen.join(' '));
+    check('and the run ends well', reason === 'done', reason);
+
+    seen.length = 0;
+    const second = runnerFor();
+    const parked = second.run(clicky);
+    await until(() => waiters.length === 2);
+    second.stop();
+    await parked;
+    check('stopping a parked run calls the wait off', waiters[1].cancelled === true);
+    check('and it unwinds without running what follows',
+          reason === 'stopped' && seen.join(' ') === 'on', `${reason}: ${seen.join(' ')}`);
+
+    const askew = newMacro('askew');
+    const bad = named('onevent', 'bad');
+    bad.source = 'BTN_NOPE';
+    askew.body.push(bad);
+    const failing = new MacroRunner(daemon, evaluator, {}, {}, {
+        onFinished: r => { reason = r; },
+        waitForInput: () => null,
+    });
+    await failing.run(askew);
+    check('a source that names nothing fails the run instead of hanging',
+          reason === 'error', reason);
+}
+
 print(failures === 0 ? '\nALL PASSED' : `\n${failures} FAILURES`);
 if (failures > 0) {
     imports.system.exit(1);

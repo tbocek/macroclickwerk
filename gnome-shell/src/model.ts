@@ -150,6 +150,17 @@ export type WaitStep = StepCommon & {
 };
 
 /**
+ * Wait until a button or key is pressed, then go on. While a run is parked
+ * here the daemon consumes that button, so the desktop only ever sees what
+ * the steps after it do — press the side button, get the macro instead.
+ */
+export type OnEventStep = StepCommon & {
+    kind: 'onevent';
+    /** evdev name of what is waited for: BTN_SIDE, KEY_F13, … */
+    source: string;
+};
+
+/**
  * A loop, and nothing else. It has no condition of its own: `loop while C` is
  * exactly `loop forever: [if not C: break, …]`, and expressing it that way keeps
  * conditions in one place — inside `if` — instead of two.
@@ -200,6 +211,7 @@ export type Step =
     | KeyStep
     | TextStep
     | WaitStep
+    | OnEventStep
     | LoopStep
     | IfStep
     | FlowStep
@@ -288,6 +300,8 @@ export function newStep(kind: StepKind): Step {
             return { id, kind: 'text', value: '', delayMs: 12 };
         case 'wait':
             return { id, kind: 'wait', ms: 1000, jitterMs: 0 };
+        case 'onevent':
+            return { id, kind: 'onevent', source: 'BTN_SIDE' };
         case 'loop':
             return { id, kind: 'loop', count: 'forever', body: [] };
         case 'if':
@@ -970,6 +984,15 @@ export function describeCondition(cond: Condition | null | undefined): string {
     }
 }
 
+/** BTN_SIDE → "the side button is clicked", KEY_F13 → "F13 is pressed". */
+export function prettySource(source: string): string {
+    const button = source.match(/^BTN_(\w+)$/);
+    if (button) {
+        return `the ${button[1].toLowerCase()} button is clicked`;
+    }
+    return `${source.replace(/^KEY_/, '') || '…'} is pressed`;
+}
+
 function formatMs(ms: number): string {
     if (ms >= 1000 && ms % 1000 === 0) {
         return `${ms / 1000}s`;
@@ -1019,6 +1042,8 @@ export function describeStep(
             return step.jitterMs
                 ? `Wait ${formatMs(step.ms)} ±${formatMs(step.jitterMs)}`
                 : `Wait ${formatMs(step.ms)}`;
+        case 'onevent':
+            return `When ${prettySource(step.source)}`;
         case 'loop':
             return step.count === 'forever' ? 'Repeat forever' : `Repeat ${step.count}×`;
         case 'if':
@@ -1049,7 +1074,7 @@ export function describeStep(
  * recording is gone, is all of them.
  */
 export const AUTHORABLE_STEP_KINDS: StepKind[] = [
-    'click', 'move', 'scroll', 'key', 'text', 'wait',
+    'click', 'move', 'scroll', 'key', 'text', 'wait', 'onevent',
     'loop', 'if', 'break', 'continue', 'start', 'stop',
 ];
 
@@ -1060,6 +1085,7 @@ export const STEP_KIND_LABELS: Record<StepKind, string> = {
     key: 'Key press',
     text: 'Type text',
     wait: 'Wait',
+    onevent: 'On event',
     loop: 'Loop',
     if: 'If / else',
     break: 'Break',

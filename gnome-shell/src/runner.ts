@@ -25,13 +25,14 @@ import type {
     KeyStep,
     Macro,
     MoveStep,
+    OnEventStep,
     RawEvent,
     ScrollStep,
     Step,
     TextStep,
     WaitStep,
 } from './model.js';
-import { describeStep, findStep, pathToStep } from './model.js';
+import { describeStep, findStep, pathToStep, prettySource } from './model.js';
 import { reportProblem } from './problems.js';
 import type { Config } from './store.js';
 
@@ -69,6 +70,13 @@ export interface RunnerCallbacks {
     onMacroControl?: (action: 'start' | 'stop', macroId: string, at?: string) => string | null;
     /** Names a macro for `describeStep`, so those steps read as what they poke. */
     macroName?: (macroId: string) => string | undefined;
+    /**
+     * Park until a button or key is pressed, consuming the press. Resolves
+     * true on the press, false if cancelled; null for a source that names no
+     * real input, undefined when nothing here can wait at all — either way the
+     * step fails rather than hangs.
+     */
+    waitForInput?: (source: string) => { promise: Promise<boolean>; cancel: () => void } | null | undefined;
 }
 
 // A warp lands exactly, so a couple of passes only cover the pointer being
@@ -90,6 +98,8 @@ export class MacroRunner {
     private _cancelled = false;
     private _sleepId = 0;
     private _wakeSleep: (() => void) | null = null;
+    /** Calls off the onevent wait this run is parked on, if it is on one. */
+    private _waitCancel: (() => void) | null = null;
     private _warnedAboutMotion = false;
     private _paused = false;
     private _path: RunningStep[] = [];
@@ -408,6 +418,9 @@ export class MacroRunner {
             case 'wait':
                 await this._doWait(step);
                 return 'normal';
+            case 'onevent':
+                await this._doOnEvent(step);
+                return 'normal';
 
             case 'loop': {
                 // A repeat with nothing in it can only spin: each pass does no
@@ -720,6 +733,25 @@ export class MacroRunner {
         await this._sleep(Math.max(0, Math.round(step.ms + offset)));
     }
 
+    private async _doOnEvent(step: OnEventStep): Promise<void> {
+        const wait = this._callbacks.waitForInput?.(step.source);
+        if (wait === undefined) {
+            throw new Error('waiting for a click is not available here');
+        }
+        if (wait === null) {
+            throw new Error(`“${step.source}” names no button or key`);
+        }
+        this._status(`Waiting until ${prettySource(step.source)}`);
+        this._waitCancel = wait.cancel;
+        try {
+            // Resolves false when cancelled — a stopped run, not a failure; the
+            // interpreter's own cancellation check unwinds from here.
+            await wait.promise;
+        } finally {
+            this._waitCancel = null;
+        }
+    }
+
     // --- helpers -----------------------------------------------------------
 
     /** See `_defaultSeat`. `undefined` means not asked yet. */
@@ -754,6 +786,11 @@ export class MacroRunner {
         const wake = this._wakeSleep;
         this._wakeSleep = null;
         wake?.();
+        // A run parked on an onevent step is sleeping in the trigger engine
+        // rather than in _sleep; being stopped has to reach in there too.
+        const cancelWait = this._waitCancel;
+        this._waitCancel = null;
+        cancelWait?.();
     }
 
     private _sleep(ms: number): Promise<void> {

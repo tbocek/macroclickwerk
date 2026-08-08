@@ -82,7 +82,14 @@ export class MacroPopup {
         this._problemHeader = new St.Label({ text: '', style_class: 'macroclickwerk-problems-title' });
         this._problemList = new St.BoxLayout({ vertical: true, style_class: 'macroclickwerk-problems' });
         this._clearItem = new PopupMenu.PopupMenuItem('Clear problems');
-        this._clearItem.connect('activate', () => clearProblems());
+        // Clearing is tidying, not navigating, so the menu stays open and the
+        // messages just vanish. The method is replaced rather than connected
+        // to: the menu closes itself by listening for the activate *signal*,
+        // and a handler that never emits it keeps the menu out of the loop —
+        // for clicks and for keyboard activation alike, since both arrive
+        // through this method.
+        (this._clearItem as unknown as { activate: (event: unknown) => void })
+            .activate = () => clearProblems();
 
         // The list is built while the menu is closed as often as not, so keep it
         // current rather than rebuilding it on open: the count is also what the

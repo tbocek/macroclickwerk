@@ -32,6 +32,7 @@ import {
     macroEnabled,
     moveStepNested,
     newCondition,
+    newId,
     newMacro,
     newStep,
     parseDocument,
@@ -42,6 +43,7 @@ import {
 } from './src/model.js';
 import { MacroStore } from './src/store.js';
 import { buildInstruction, testConnection } from './src/llm.js';
+import { isArmed, parseTriggers, type Trigger } from './src/triggers.js';
 
 const CONDITION_TYPES: ConditionType[] = ['always', 'llm', 'color', 'and', 'or', 'not'];
 
@@ -109,6 +111,7 @@ const STEP_ICONS: Record<StepKind, string> = {
     key: 'input-keyboard-symbolic',
     text: 'insert-text-symbolic',
     wait: 'alarm-symbolic',
+    onevent: 'input-touchpad-symbolic',   // a press coming *in*: the step that waits for one
     loop: 'media-playlist-repeat-symbolic',
     if: 'media-playlist-shuffle-symbolic',
     break: 'application-exit-symbolic',   // an arrow leaving: out of the loop, not the macro
@@ -410,6 +413,44 @@ function chooser<T extends string>(
     return dropdown;
 }
 
+/** A bare entry for a row suffix, where an EntryRow would be a whole row. */
+function suffixEntry(
+    text: string, placeholder: string, tooltip: string,
+    onChange: (text: string) => void,
+): Gtk.Entry {
+    const entry = new Gtk.Entry({
+        text,
+        placeholder_text: placeholder,
+        tooltip_text: tooltip,
+        valign: Gtk.Align.CENTER,
+        width_chars: 9,
+    });
+    entry.connect('changed', () => onChange(entry.get_text() ?? ''));
+    return entry;
+}
+
+/** What a trigger can take over, beside any key by name. */
+const TRIGGER_SOURCES = ['BTN_LEFT', 'BTN_RIGHT', 'BTN_MIDDLE', 'BTN_SIDE', 'BTN_EXTRA'] as const;
+
+const triggerSourceLabels = (): Record<string, string> => ({
+    BTN_LEFT: _('Left click'),
+    BTN_RIGHT: _('Right click'),
+    BTN_MIDDLE: _('Middle click'),
+    BTN_SIDE: _('Side button'),
+    BTN_EXTRA: _('Extra button'),
+    custom: _('A key…'),
+});
+
+const TRIGGER_ACTIONS = ['none', 'key', 'run', 'pause', 'stop'] as const;
+
+const triggerActionLabels = (): Record<string, string> => ({
+    none: _('No action yet'),
+    key: _('Press a key'),
+    run: _('Start a macro'),
+    pause: _('Pause a macro'),
+    stop: _('Stop a macro'),
+});
+
 function iconButton(iconName: string, tooltip: string, onClick: () => void): Gtk.Button {
     const button = new Gtk.Button({
         icon_name: iconName,
@@ -521,9 +562,12 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
     private _macroGroups: Adw.PreferencesGroup[] = [];
 
     // Structural edits rebuild the whole page, which would otherwise collapse
-    // every expander. Expansion is keyed by step id so it survives a rebuild.
+    // every expander. Expansion is keyed by step id so it survives a rebuild —
+    // and it is persisted to settings, so the window reopens the way it was
+    // left rather than every macro folded shut again.
     private _expanded = new Set<string>();
     private _collapsed = new Set<string>();
+    private _persistExpansion = debounce(() => this._saveExpansion());
     private _rebuilding = false;
     private _rebuildScheduled = false;
     // Seeded from the clock, not 0: a reopened preferences window would otherwise
@@ -566,6 +610,8 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
     // Every page but Macros. Their rows read the settings once, when built, so
     // importing settings has to build them again to show what arrived.
     private _settingsPages: Adw.PreferencesPage[] = [];
+    private _triggersGroup!: Adw.PreferencesGroup;
+    private _triggerRows: Adw.ActionRow[] = [];
 
     /**
      * One text field for a group of related numbers — a point, an offset, a
@@ -815,8 +861,44 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
                 this._expanded.delete(key);
                 this._collapsed.add(key);
             }
+            this._persistExpansion();
         });
         return row;
+    }
+
+    /** Restore which rows were open when the window was last used. */
+    private _loadExpansion(): void {
+        try {
+            const raw = JSON.parse(this._settings.get_string('expanded-rows')) as {
+                open?: string[]; shut?: string[];
+            };
+            this._expanded = new Set(Array.isArray(raw.open) ? raw.open : []);
+            this._collapsed = new Set(Array.isArray(raw.shut) ? raw.shut : []);
+        } catch {
+            // A bad document is a fresh start, not a crash.
+        }
+    }
+
+    /**
+     * Written debounced on every toggle rather than on close: a settings
+     * window has no reliable goodbye, but it always has a latest state.
+     */
+    private _saveExpansion(): void {
+        if (this._closed) {
+            return;
+        }
+        // Keys all embed a step id (`step:<id>`, `step:<id>:body`, …). Keys of
+        // deleted steps are dropped here, or every step ever removed would
+        // leave its state behind forever.
+        const ids = new Set<string>();
+        for (const macro of this._store.macros) {
+            walk(macro.body, location => { ids.add(location.step.id); });
+        }
+        const alive = (key: string) => ids.has(key.split(':')[1] ?? '');
+        this._settings.set_string('expanded-rows', JSON.stringify({
+            open: [...this._expanded].filter(alive),
+            shut: [...this._collapsed].filter(alive),
+        }));
     }
 
     /** Load the editor's own style classes once, on top of whatever theme is set. */
@@ -840,6 +922,7 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
         this._window = window;
         this._settings = this.getSettings();
         this._store = new MacroStore(this._settings);
+        this._loadExpansion();
         this._installCss();
 
         this._macrosPage = new Adw.PreferencesPage({
@@ -1612,6 +1695,26 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
                     this._save();
                 }));
             break;
+        case 'onevent': {
+            const isButton = (TRIGGER_SOURCES as readonly string[]).includes(step.source);
+            suffixes.append(chooser([...TRIGGER_SOURCES, 'custom'], triggerSourceLabels(),
+                isButton ? step.source : 'custom',
+                _('Which button or key this step waits for — the press is swallowed'),
+                value => {
+                    step.source = value === 'custom' ? '' : value;
+                    retitle();
+                    this._saveAndRebuild();
+                }, 12));
+            if (!isButton) {
+                suffixes.append(suffixEntry(step.source, 'KEY_F13',
+                    _('The key waited for, by evdev name'), text => {
+                        step.source = text.trim().toUpperCase();
+                        retitle();
+                        this._save();
+                    }));
+            }
+            break;
+        }
 
         case 'start':
         case 'stop':
@@ -2632,7 +2735,146 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
         ));
         page.add(recording);
 
+        page.add(this._buildTriggersGroup());
+
         return page;
+    }
+
+    // --- triggers -----------------------------------------------------------
+
+    private _buildTriggersGroup(): Adw.PreferencesGroup {
+        this._triggersGroup = new Adw.PreferencesGroup({
+            title: _('Triggers'),
+            description: _('A button or key the daemon takes over, and what happens ' +
+                'instead. A trigger with no action set leaves its button alone, and ' +
+                'every trigger falls back to being a plain button whenever the ' +
+                'daemon or the extension is not running.'),
+        });
+        this._triggersGroup.set_header_suffix(iconButton('list-add-symbolic', _('Add a trigger'), () => {
+            const triggers = this._loadTriggers();
+            triggers.push({ id: newId(), source: 'BTN_SIDE', action: 'none' });
+            this._saveTriggers(triggers, true);
+        }));
+        this._fillTriggersGroup();
+        return this._triggersGroup;
+    }
+
+    private _loadTriggers(): Trigger[] {
+        return parseTriggers(this._settings.get_string('triggers'));
+    }
+
+    /** Writes through to gsettings, where the running extension picks it up live. */
+    private _saveTriggers(triggers: Trigger[], rebuild = false): void {
+        this._settings.set_string('triggers', JSON.stringify(triggers));
+        if (rebuild) {
+            this._fillTriggersGroup();
+        }
+    }
+
+    private _fillTriggersGroup(): void {
+        for (const row of this._triggerRows) {
+            this._triggersGroup.remove(row);
+        }
+        this._triggerRows = [];
+        const triggers = this._loadTriggers();
+        triggers.forEach((_trigger, index) => {
+            const row = this._triggerRow(triggers, index);
+            this._triggerRows.push(row);
+            this._triggersGroup.add(row);
+        });
+    }
+
+    private _triggerRow(triggers: Trigger[], index: number): Adw.ActionRow {
+        const trigger = triggers[index];
+        const row = new Adw.ActionRow({ title: this._describeTrigger(trigger) });
+
+        const retitle = () => {
+            row.set_title(this._describeTrigger(trigger));
+            row.set_subtitle(this._triggerCaveat(trigger));
+        };
+        retitle();
+
+        // What is taken over: one of the mouse buttons, or any key by name.
+        const sources = [...TRIGGER_SOURCES, 'custom'];
+        const isButton = (TRIGGER_SOURCES as readonly string[]).includes(trigger.source);
+        row.add_suffix(chooser(sources, triggerSourceLabels(), isButton ? trigger.source : 'custom',
+            _('Which button or key this trigger takes over'), value => {
+                trigger.source = value === 'custom' ? '' : value;
+                this._saveTriggers(triggers, true);
+            }, 12));
+        if (!isButton) {
+            row.add_suffix(suffixEntry(trigger.source, 'KEY_F13',
+                _('The key taken over, by evdev name'), text => {
+                    trigger.source = text.trim().toUpperCase();
+                    this._saveTriggers(triggers);
+                    retitle();
+                }));
+        }
+
+        row.add_suffix(chooser(TRIGGER_ACTIONS, triggerActionLabels(), trigger.action,
+            _('What a press does instead'), value => {
+                trigger.action = value;
+                this._saveTriggers(triggers, true);
+            }, 14));
+
+        if (trigger.action === 'key') {
+            row.add_suffix(suffixEntry(trigger.key ?? '', 'KEY_E',
+                _('The key pressed in its place, by evdev name'), text => {
+                    trigger.key = text.trim().toUpperCase();
+                    this._saveTriggers(triggers);
+                    retitle();
+                }));
+        } else if (trigger.action !== 'none') {
+            const macros = this._store.macros;
+            const options = ['', ...macros.map(macro => macro.id)];
+            const labels: Record<string, string> = { '': _('Everything switched on') };
+            for (const macro of macros) {
+                labels[macro.id] = macro.name;
+            }
+            row.add_suffix(chooser(options, labels, trigger.macro ?? '',
+                _('Which macro this drives'), value => {
+                    trigger.macro = value;
+                    this._saveTriggers(triggers);
+                    retitle();
+                }, 16));
+        }
+
+        row.add_suffix(iconButton('user-trash-symbolic', _('Remove this trigger'), () => {
+            triggers.splice(index, 1);
+            this._saveTriggers(triggers, true);
+        }));
+        return row;
+    }
+
+    private _describeTrigger(trigger: Trigger): string {
+        const labels = triggerSourceLabels();
+        const source = labels[trigger.source] ?? (trigger.source || _('Pick a key'));
+        switch (trigger.action) {
+            case 'key': return `${source} → ${trigger.key || '…'}`;
+            case 'run': return `${source} ${_('starts')} ${this._triggerMacroName(trigger)}`;
+            case 'pause': return `${source} ${_('pauses')} ${this._triggerMacroName(trigger)}`;
+            case 'stop': return `${source} ${_('stops')} ${this._triggerMacroName(trigger)}`;
+            default: return source;
+        }
+    }
+
+    private _triggerMacroName(trigger: Trigger): string {
+        if (!trigger.macro) {
+            return _('everything switched on');
+        }
+        const macro = this._store.getMacro(trigger.macro);
+        return macro ? `“${macro.name}”` : _('a deleted macro');
+    }
+
+    private _triggerCaveat(trigger: Trigger): string {
+        if (!isArmed(trigger)) {
+            // The user's rule: an onevent with nothing attached is still a click.
+            return _('no action yet — the click passes through');
+        }
+        if (trigger.source === 'BTN_LEFT' || trigger.source === 'BTN_RIGHT') {
+            return _('taken over everywhere, in every app, while the daemon runs');
+        }
+        return '';
     }
 
     private _buildShortcutsPage(): Adw.PreferencesPage {

@@ -256,6 +256,12 @@ export class Recorder {
     }
 
     private _onEvent(event: StreamedEvent): void {
+        // Consumed by a trigger: the desktop never saw this press, so a
+        // recording must not contain it either — what plays back should be
+        // what happened on screen, not what happened to the mouse.
+        if (event.trig) {
+            return;
+        }
         if (this._mode === 'idle') {
             return;
         }

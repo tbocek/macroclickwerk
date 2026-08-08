@@ -24,6 +24,8 @@ import {
     resolveRecordTarget, resolveRunStart, type Macro, type RecordTarget, type Step,
 } from './src/model.js';
 import { clearProblems, onProblemsChanged, problemCount, reportProblem } from './src/problems.js';
+import { EV_KEY } from './src/keymap.js';
+import { TriggerEngine, parseTriggers } from './src/triggers.js';
 import { MacroPopup } from './ui/popup.js';
 import { clearMarker, flashRegion, pickRegion, showMarker } from './ui/overlay.js';
 
@@ -66,11 +68,14 @@ export default class MacroclickwerkExtension extends Extension {
      */
     private _restarting = new Map<string, string>();
     private _recorder?: Recorder;
+    private _triggers?: TriggerEngine;
     private _popup?: MacroPopup;
     private _indicator?: PanelMenu.Button;
     private _icon?: St.Icon;
     private _boundKeys: string[] = [];
     private _menuOpen = false;
+    /** What the last daemon check complained about, '' when it was healthy. */
+    private _lastDaemonComplaint = '';
     private _settingsChangedId = 0;
     private _storeUnsubscribe?: () => void;
     private _problemsUnsubscribe?: () => void;
@@ -103,6 +108,32 @@ export default class MacroclickwerkExtension extends Extension {
             },
             onBusyChanged: () => this._updateIcon(),
         });
+
+        this._triggers = new TriggerEngine(this._daemon, config.eventSocket, {
+            injectKey: (code, down) => {
+                // Through the daemon's tracked path, so a key held by a trigger
+                // is released by the emergency stop like anything else.
+                void this._daemon?.play([{ dt: 0, type: EV_KEY, code, value: down ? 1 : 0 }])
+                    .catch(error => reportProblem('Daemon',
+                        `a trigger could not press its key: ${(error as Error).message}`));
+            },
+            control: (action, macroId) => {
+                if (macroId !== '') {
+                    this._runOneMacro({ macroId, action });
+                    return;
+                }
+                // No macro named: the trigger drives everything that is
+                // switched on — a physical run/pause toggle or stop-all button.
+                if (action === 'run') {
+                    this._runEnabled();
+                } else if (action === 'pause') {
+                    this._pauseAll();
+                } else {
+                    this._stopAll();
+                }
+            },
+        });
+        this._triggers.setTriggers(parseTriggers(this._settings.get_string('triggers')));
 
         this._buildIndicator();
 
@@ -164,6 +195,7 @@ export default class MacroclickwerkExtension extends Extension {
             runner.stop();
         }
         this._runners.clear();
+        this._triggers?.destroy();
         this._recorder?.destroy();
         this._evaluator?.destroy();
         this._popup?.destroy();
@@ -181,6 +213,7 @@ export default class MacroclickwerkExtension extends Extension {
         clearProblems();
         this._store?.destroy();
 
+        this._triggers = undefined;
         this._recorder = undefined;
         this._evaluator = undefined;
         this._daemon = undefined;
@@ -381,6 +414,7 @@ export default class MacroclickwerkExtension extends Extension {
                 onFinished: (reason, error) => this._onFinished(macroId, reason, error),
                 onMacroControl: (action, target, at) => this._macroControl(action, target, at ?? ''),
                 macroName: id => this._store?.getMacro(id)?.name,
+                waitForInput: source => this._triggers?.waitFor(source),
             });
         this._runners.set(macroId, runner);
         return runner;
@@ -934,6 +968,13 @@ export default class MacroclickwerkExtension extends Extension {
             this._popup?.refresh();
             return;
         }
+        if (key === 'triggers') {
+            this._triggers?.setTriggers(parseTriggers(this._settings?.get_string('triggers') ?? '[]'));
+            return;
+        }
+        if (key === 'expanded-rows') {
+            return; // the editor's own layout memory; nothing runs off it
+        }
         if (key === 'recording') {
             return; // our own state; nothing to redo here
         }
@@ -1011,24 +1052,30 @@ export default class MacroclickwerkExtension extends Extension {
         if (!this._daemon) {
             return;
         }
+        let complaint = '';
+        let hint = '';
         try {
             const status = await this._daemon.status();
             if (status.version < 2) {
-                reportProblem('Daemon', `it speaks protocol v${status.version}, this extension needs v2`, {
-                    hint: 'Rebuild and reinstall it: cd macroclickwerk && ./deploy.sh',
-                });
+                complaint = `it speaks protocol v${status.version}, this extension needs v2`;
+                hint = 'Rebuild and reinstall it: cd macroclickwerk && ./deploy.sh';
             } else if (status.devices.length === 0) {
-                reportProblem('Daemon', 'it captured no input devices', {
-                    hint: 'Nothing can be recorded or replayed. The device names in ' +
-                        '/etc/systemd/system/macroclickwerk.service must match this machine — list them with ' +
-                        "grep '^N: Name' /proc/bus/input/devices",
-                });
+                complaint = 'it captured no input devices';
+                hint = 'Nothing can be recorded or replayed. The device names in ' +
+                    '/etc/systemd/system/macroclickwerk.service must match this machine — list them with ' +
+                    "grep '^N: Name' /proc/bus/input/devices";
             }
         } catch (error) {
-            reportProblem('Daemon', `cannot reach it at ${this._daemon.controlPath}: ${(error as Error).message}`, {
-                hint: 'Nothing can be recorded or replayed until it answers. ' +
-                    'Check it with: systemctl status macroclickwerk',
-            });
+            complaint = `cannot reach it at ${this._daemon.controlPath}: ${(error as Error).message}`;
+            hint = 'Nothing can be recorded or replayed until it answers. ' +
+                'Check it with: systemctl status macroclickwerk';
         }
+        // Checked on every menu open, so only a *change* is news. Repeating an
+        // unchanged complaint would undo Clear the moment the menu reopened —
+        // with the daemon deliberately stopped, Clear could never stick.
+        if (complaint && complaint !== this._lastDaemonComplaint) {
+            reportProblem('Daemon', complaint, { hint });
+        }
+        this._lastDaemonComplaint = complaint;
     }
 }

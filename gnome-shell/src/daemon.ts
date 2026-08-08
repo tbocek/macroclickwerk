@@ -41,6 +41,8 @@ export interface DaemonDevice {
     name: string;
     path: string;
     grabbed: boolean;
+    /** Something besides the daemon is reading the clone, so grabbing is safe. */
+    watched?: boolean;
     keyboard: boolean;
     pointer: boolean;
 }
@@ -261,6 +263,16 @@ export class DaemonClient {
         await this._request('POST', '/record', { on }, 3000);
     }
 
+    /**
+     * Replace the set of evdev codes the daemon consumes as triggers. The
+     * consumed events come back on the event stream tagged `trig` — and only
+     * while that stream has a client, so a crashed listener cannot leave a
+     * button dead.
+     */
+    async setTriggers(codes: number[]): Promise<void> {
+        await this._request('POST', '/triggers', { codes }, 3000);
+    }
+
 }
 
 export interface StreamedEvent {
@@ -271,6 +283,8 @@ export interface StreamedEvent {
     type: number;
     code: number;
     value: number;
+    /** 1 when the daemon consumed this event for a trigger instead of forwarding it. */
+    trig?: number;
 }
 
 /**

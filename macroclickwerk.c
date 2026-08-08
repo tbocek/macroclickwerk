@@ -1,11 +1,21 @@
 // macroclickwerk - generic evdev input service for macro recording and playback.
 //
-// Each device passed with -d is grabbed (EVIOCGRAB), cloned to a uinput device
-// and forwarded event-for-event, exactly as the original autoclicker did. On top
-// of that the daemon exposes a small JSON API over a unix socket so that the
-// GNOME Shell extension can inject arbitrary event trains and observe real input
-// while recording. No macro logic lives here: loops, conditions and timing all
-// live in the extension so that aborting is instant.
+// Each captured device is grabbed (EVIOCGRAB), cloned to a uinput device and
+// forwarded event-for-event. On top of that the daemon exposes a small JSON API
+// over a unix socket so that the GNOME Shell extension can inject arbitrary
+// event trains and observe real input while recording. No macro logic lives
+// here: loops, conditions and timing all live in the extension so that aborting
+// is instant.
+//
+// The grab is held only while something else is reading the clone. Grabbing
+// reroutes a device through this process, so it must never happen on faith:
+// grab a mouse whose clone the compositor has not picked up — a device that
+// appeared mid-hotplug-storm, say — and the pointer is dead until the daemon
+// dies. So the monitor thread checks /proc once a second for readers of each
+// clone, grabs when one appears, and lets go when the last one leaves. The
+// same fail-open rule applies while grabbed: a forward that cannot deliver
+// releases the grab on the spot, because real input flowing twice is an
+// annoyance but real input flowing nowhere is a dead keyboard.
 
 #include <stdio.h>
 #include <string.h>
@@ -45,7 +55,7 @@
 
 struct captured_device {
     char *path;
-    int fdi;              // real device, grabbed (-1 for synthetic or detached)
+    int fdi;              // real device (-1 for synthetic or detached)
     int fdo;              // uinput clone
     pthread_t reader;
     bool grabbed;
@@ -54,7 +64,18 @@ struct captured_device {
     int index;
     char name[64];
     char wanted[256];     // the -n name or -d path that owns this slot
+    char realname[256];   // what the device called itself when it was opened
+    char clone_node[32];  // the clone's /dev/input/eventN node
+    bool watched;         // something other than us is reading the clone
+    int forward_failures; // forwards that failed and forced an ungrab
+    bool grab_denied;     // last grab attempt failed; logged once, retried quietly
 };
+
+// After this many failed forwards the device stays observe-only until it is
+// reattached: a forward path that keeps dying is a forward path input must not
+// depend on, and each failure already cost the user a moment of routed-to-
+// nowhere events.
+#define MAX_FORWARD_FAILURES 3
 
 static struct captured_device devices[MAX_DEVICES];
 static int device_count = 0;
@@ -94,6 +115,16 @@ static int held_fd[KEY_MAX + 1];
 
 static volatile bool recording = false;
 
+// Key and button codes the extension asked to consume (/triggers): a matching
+// event is withheld from the clone and broadcast on the event stream tagged
+// "trig" instead, so the extension can turn it into something else — a side
+// button that presses E, or starts a macro. Consumption needs both the grab
+// (or the desktop sees the original anyway) and a stream client (or the click
+// would vanish into a void nobody is acting for); missing either, the event
+// passes through and the button is just a button again.
+static pthread_mutex_t trigger_mutex = PTHREAD_MUTEX_INITIALIZER;
+static unsigned char trigger_codes[KEY_MAX + 1];
+
 // Event stream clients.
 static pthread_mutex_t stream_mutex = PTHREAD_MUTEX_INITIALIZER;
 static int stream_clients[MAX_STREAM_CLIENTS];
@@ -118,7 +149,11 @@ static int emit(int fd, __u16 type, __u16 code, __s32 value) {
     pthread_mutex_lock(&emit_mutex);
     int result = write(fd, &ev, sizeof(struct input_event));
     if (result < 0) {
-        printf("[ERROR] Failed to emit event: %s\n", strerror(errno));
+        // stderr: stdout goes to /dev/null under the unit, and a failed emit is
+        // precisely the message that must not vanish — it is a key or click
+        // that went nowhere.
+        fprintf(stderr, "macroclickwerk: failed to emit event (type %u code %u): %s\n",
+                type, code, strerror(errno));
     }
     pthread_mutex_unlock(&emit_mutex);
     return result;
@@ -163,15 +198,16 @@ static void release_all_held(void) {
 // Event stream (newline delimited JSON over a second unix socket)
 // ---------------------------------------------------------------------------
 
-static void stream_broadcast(int dev_index, const struct input_event *ev) {
+static void stream_broadcast(int dev_index, const struct input_event *ev, bool trig) {
     char line[192];
     long long t_us = (long long)ev->time.tv_sec * 1000000LL + (long long)ev->time.tv_usec;
 
     pthread_mutex_lock(&stream_mutex);
     unsigned long long seq = ++event_seq;
     int n = snprintf(line, sizeof(line),
-                     "{\"seq\":%llu,\"t\":%lld,\"dev\":%d,\"type\":%u,\"code\":%u,\"value\":%d}\n",
-                     seq, t_us, dev_index, ev->type, ev->code, ev->value);
+                     "{\"seq\":%llu,\"t\":%lld,\"dev\":%d,\"type\":%u,\"code\":%u,\"value\":%d%s}\n",
+                     seq, t_us, dev_index, ev->type, ev->code, ev->value,
+                     trig ? ",\"trig\":1" : "");
     if (n < 0) {
         pthread_mutex_unlock(&stream_mutex);
         return;
@@ -427,6 +463,35 @@ static bool create_clone(struct captured_device *d, const char *name, int forced
         goto fail;
     }
 
+    // Note which /dev/input node the clone got: the monitor thread greps /proc
+    // for readers of exactly this node to decide when grabbing the real device
+    // is safe. Failing to resolve it just means this device is never grabbed,
+    // which errs on the side that keeps input flowing.
+    d->clone_node[0] = '\0';
+    char sysname[64] = "";
+    if (ioctl(d->fdo, UI_GET_SYSNAME(sizeof(sysname)), sysname) >= 0) {
+        char sysdir[128];
+        snprintf(sysdir, sizeof(sysdir), "/sys/devices/virtual/input/%s", sysname);
+        DIR *dir = opendir(sysdir);
+        if (dir) {
+            struct dirent *entry;
+            while ((entry = readdir(dir)) != NULL) {
+                if (strncmp(entry->d_name, "event", 5) == 0) {
+                    // %.15s: an event node name is "event" plus a number; the
+                    // precision only bounds the compiler's worst case.
+                    snprintf(d->clone_node, sizeof(d->clone_node),
+                             "/dev/input/%.15s", entry->d_name);
+                    break;
+                }
+            }
+            closedir(dir);
+        }
+    }
+    if (d->clone_node[0] == '\0') {
+        fprintf(stderr, "Warning: cannot resolve the event node of [%s]; "
+                "its source will stay observe-only.\n", name);
+    }
+
     usleep(200000); // let udev settle before anything writes to it
     return true;
 
@@ -456,14 +521,41 @@ static void* reader_thread(void *arg) {
             break;
         }
 
-        // Always forward. Withholding real input would also withhold it from the
-        // shell, which is what handles the emergency stop.
-        if (d->grabbed) {
-            emit(d->fdo, ev.type, ev.code, ev.value);
+        // A registered trigger code is consumed: withheld from the clone and
+        // handed to the stream for the extension to act on. Only while grabbed
+        // — ungrabbed, the desktop is getting the original directly and acting
+        // on top of it would double it — and only while someone is actually on
+        // the stream, so a dead extension turns the button back into a button
+        // instead of a click-eating hole.
+        bool trig = ev.type == EV_KEY && ev.code <= KEY_MAX && trigger_codes[ev.code];
+        bool consumed = trig && d->grabbed && stream_client_count > 0;
+
+        // Otherwise always forward. Withholding real input would also withhold
+        // it from the shell, which is what handles the emergency stop.
+        //
+        // A forward that fails releases the grab on the spot: while we hold it
+        // the real device is silent to everyone else, so a broken forward path
+        // means this device's input is going nowhere at all. Ungrabbed, events
+        // reach the desktop directly again — duplicated for a moment if the
+        // failure was transient, but present. The monitor re-grabs on its next
+        // pass, and gives up on the device after MAX_FORWARD_FAILURES.
+        if (d->grabbed && !consumed && emit(d->fdo, ev.type, ev.code, ev.value) < 0) {
+            pthread_mutex_lock(&devices_mutex);
+            ioctl(d->fdi, EVIOCGRAB, 0);
+            d->grabbed = false;
+            d->forward_failures++;
+            pthread_mutex_unlock(&devices_mutex);
+            fprintf(stderr, "macroclickwerk: forward to %s failed (%d of %d) — "
+                    "released the grab on %s so its input keeps flowing\n",
+                    d->name, d->forward_failures, MAX_FORWARD_FAILURES,
+                    d->path ? d->path : "?");
         }
 
-        if (recording) {
-            stream_broadcast(d->index, &ev);
+        if (recording || consumed) {
+            // Tagged only when actually swallowed: the recorder skips trig
+            // events (the desktop never saw them), and the extension only acts
+            // on clicks that were really withheld.
+            stream_broadcast(d->index, &ev, consumed);
         }
     }
 
@@ -622,13 +714,14 @@ static enum MHD_Result send_status(struct MHD_Connection *connection) {
     pthread_mutex_lock(&devices_mutex);
     for (int i = 0; i < device_count && off < sizeof(devs) - 1; i++) {
         int n = snprintf(devs + off, sizeof(devs) - off,
-                         "%s{\"index\":%d,\"name\":\"%s\",\"path\":\"%s\",\"grabbed\":%s,\"alive\":%s,\"wanted\":\"%s\",\"keyboard\":%s,\"pointer\":%s}",
+                         "%s{\"index\":%d,\"name\":\"%s\",\"path\":\"%s\",\"grabbed\":%s,\"alive\":%s,\"watched\":%s,\"wanted\":\"%s\",\"keyboard\":%s,\"pointer\":%s}",
                          i ? "," : "",
                          devices[i].index,
                          devices[i].name,
                          devices[i].path ? devices[i].path : "",
                          devices[i].grabbed ? "true" : "false",
                          devices[i].alive ? "true" : "false",
+                         devices[i].watched ? "true" : "false",
                          devices[i].wanted,
                          (devices[i].cls & CLASS_KEYBOARD) ? "true" : "false",
                          (devices[i].cls & CLASS_POINTER) ? "true" : "false");
@@ -727,6 +820,38 @@ static enum MHD_Result handle_post(struct MHD_Connection *connection, const char
             json_object_put(parsed);
         }
         return send_json(connection, MHD_HTTP_OK, "{\"stopped\":true}");
+    }
+
+    if (strcmp(url, "/triggers") == 0) {
+        // Replace the whole set: {"codes":[275, 276]}. An empty array clears
+        // it. Codes arrive as evdev numbers; names live in the extension.
+        if (!parsed || !json_object_object_get_ex(parsed, "codes", &field) ||
+            !json_object_is_type(field, json_type_array)) {
+            if (parsed) {
+                json_object_put(parsed);
+            }
+            return send_json(connection, MHD_HTTP_BAD_REQUEST,
+                             "{\"error\":\"expected {\\\"codes\\\":[…]}\"}");
+        }
+        unsigned char next[KEY_MAX + 1] = {0};
+        int wanted = (int)json_object_array_length(field);
+        int applied = 0;
+        for (int i = 0; i < wanted; i++) {
+            int code = json_object_get_int(json_object_array_get_idx(field, i));
+            if (code > 0 && code <= KEY_MAX) {
+                next[code] = 1;
+                applied++;
+            }
+        }
+        pthread_mutex_lock(&trigger_mutex);
+        memcpy((void *)trigger_codes, next, sizeof(trigger_codes));
+        pthread_mutex_unlock(&trigger_mutex);
+        json_object_put(parsed);
+        fprintf(stderr, "macroclickwerk: %d trigger code%s registered\n",
+                applied, applied == 1 ? "" : "s");
+        char body[64];
+        snprintf(body, sizeof(body), "{\"triggers\":%d}", applied);
+        return send_json(connection, MHD_HTTP_OK, body);
     }
 
     if (strcmp(url, "/record") == 0) {
@@ -920,6 +1045,24 @@ static bool setup_device(const char *path, const char *wanted) {
         return false;
     }
 
+    // The node was matched by a scan a moment ago, and a moment is enough for
+    // the kernel to destroy the device and hand its event number to another —
+    // a Bluetooth mouse does exactly that on every connect, presenting a
+    // transient device first. So ask the device we actually opened what it is,
+    // and if that is not what the scan matched, walk away: the next hotplug
+    // pass will match whatever really lives here now.
+    d->realname[0] = '\0';
+    ioctl(d->fdi, EVIOCGNAME(sizeof(d->realname) - 1), d->realname);
+    if (wanted[0] != '/' && strcasecmp(d->realname, wanted) != 0) {
+        fprintf(stderr, "macroclickwerk: %s is now [%s], not the [%s] the scan saw; "
+                "leaving it for the next pass\n", path, d->realname, wanted);
+        close(d->fdi);
+        d->fdi = -1;
+        free(d->path);
+        d->path = NULL;
+        return false;
+    }
+
     char clone_name[64];
     snprintf(clone_name, sizeof(clone_name), "Macroclickwerk Virtual Device %d", device_count);
     if (!create_clone(d, clone_name, 0)) {
@@ -930,22 +1073,16 @@ static bool setup_device(const char *path, const char *wanted) {
         return false;
     }
 
-    if (ioctl(d->fdi, EVIOCGRAB, 1) < 0) {
-        // Without an exclusive grab, forwarding would duplicate every event, so
-        // fall back to observe-only: recording still works, injection still works.
-        fprintf(stderr, "Warning: Cannot grab [%s]: %s. Running observe-only for this device.\n",
-                path, strerror(errno));
-        d->grabbed = false;
-    } else {
-        d->grabbed = true;
-    }
+    // Not grabbed here: the monitor thread does that, and only once something
+    // is reading the clone. Until then the device is observed, and its events
+    // keep reaching the desktop the direct way.
+    d->grabbed = false;
 
     // stderr, not stdout: the unit sends stdout to /dev/null, and what was
     // actually captured is the first thing you want to see when a device turns
     // out to be missing.
-    fprintf(stderr, "macroclickwerk: captured %s%s%s%s\n",
+    fprintf(stderr, "macroclickwerk: captured %s%s%s\n",
             path,
-            d->grabbed ? "" : " (not grabbed)",
             (d->cls & CLASS_KEYBOARD) ? " [keys]" : "",
             (d->cls & CLASS_POINTER) ? " [pointer]" : "");
 
@@ -979,25 +1116,35 @@ static bool attach_device(const char *path, const char *wanted) {
             return false;
         }
 
+        // Same stale-scan guard as a fresh capture: make sure the node still
+        // holds the device this slot is for before adopting it.
+        char now[256] = "";
+        ioctl(fd, EVIOCGNAME(sizeof(now) - 1), now);
+        if (wanted[0] != '/' && strcasecmp(now, wanted) != 0) {
+            fprintf(stderr, "macroclickwerk: %s is now [%s], not the [%s] the scan saw; "
+                    "leaving it for the next pass\n", path, now, wanted);
+            close(fd);
+            return false;
+        }
+
         free(d->path);
         d->path = strdup(path);
         d->fdi = fd;
+        snprintf(d->realname, sizeof(d->realname), "%s", now);
 
-        if (ioctl(fd, EVIOCGRAB, 1) < 0) {
-            fprintf(stderr, "Warning: Cannot grab [%s]: %s. Running observe-only for this device.\n",
-                    path, strerror(errno));
-            d->grabbed = false;
-        } else {
-            d->grabbed = true;
-        }
+        // A fresh device gets a fresh chance: whatever broke forwarding before
+        // is gone with the fd it broke on. Grabbing itself waits for the
+        // monitor, as at first capture.
+        d->grabbed = false;
+        d->forward_failures = 0;
+        d->grab_denied = false;
 
         // The clone is deliberately not rebuilt. A device returning under the
         // same name reports the same capabilities, and tearing the clone down
         // would make the desktop lose and re-find the input device — and lose
         // any modifier state along with it — on every reconnect.
         d->alive = true;
-        fprintf(stderr, "macroclickwerk: reattached %s as %s%s\n",
-                path, d->name, d->grabbed ? "" : " (not grabbed)");
+        fprintf(stderr, "macroclickwerk: reattached %s as %s\n", path, d->name);
         start_reader(d);
         return true;
     }
@@ -1158,6 +1305,128 @@ static void rescan(bool verbose) {
 }
 
 /**
+ * Mark which clones have a reader other than this process. One pass over
+ * /proc/[pid]/fd for all devices at once: the readlink targets are compared
+ * against every clone node, so the cost is a single walk however many devices
+ * are captured. Root can read every process's fd table, and this daemon is
+ * root.
+ *
+ * The readers that matter are whoever turns clone events into a desktop —
+ * the compositor, or the console's keyboard handler holding none (it taps
+ * clones inside the kernel, invisibly to this scan, which is fine: with no
+ * userspace reader there is no session to protect and no grab to want).
+ */
+static void scan_clone_watchers(void) {
+    bool watched[MAX_DEVICES] = { false };
+    const pid_t self = getpid();
+
+    DIR *proc = opendir("/proc");
+    if (!proc) {
+        return;
+    }
+    struct dirent *entry;
+    while ((entry = readdir(proc)) != NULL) {
+        char *end = NULL;
+        long pid = strtol(entry->d_name, &end, 10);
+        if (end == entry->d_name || *end != '\0' || pid == self) {
+            continue;
+        }
+
+        char fddir[64];
+        snprintf(fddir, sizeof(fddir), "/proc/%ld/fd", pid);
+        DIR *fds = opendir(fddir);
+        if (!fds) {
+            continue;   // gone already, or a kernel thread
+        }
+        struct dirent *fdentry;
+        while ((fdentry = readdir(fds)) != NULL) {
+            char link[320];
+            char target[64];
+            snprintf(link, sizeof(link), "%s/%s", fddir, fdentry->d_name);
+            ssize_t n = readlink(link, target, sizeof(target) - 1);
+            if (n <= 0) {
+                continue;
+            }
+            target[n] = '\0';
+            if (strncmp(target, "/dev/input/event", 16) != 0) {
+                continue;
+            }
+            for (int i = 0; i < device_count; i++) {
+                if (devices[i].clone_node[0] != '\0' &&
+                    strcmp(target, devices[i].clone_node) == 0) {
+                    watched[i] = true;
+                }
+            }
+        }
+        closedir(fds);
+    }
+    closedir(proc);
+
+    pthread_mutex_lock(&devices_mutex);
+    for (int i = 0; i < device_count; i++) {
+        devices[i].watched = watched[i];
+    }
+    pthread_mutex_unlock(&devices_mutex);
+}
+
+/**
+ * Hold each grab exactly as long as it is safe: grabbed while the clone has a
+ * reader to carry the forwarded events onward, released the moment it does
+ * not. A grab reroutes the device through this process, so the questions in
+ * both directions are asked once a second rather than assumed at capture time
+ * — a device grabbed on faith at the wrong moment is a mouse that stops
+ * clicking with nothing in the journal to say why.
+ */
+static void manage_grabs(void) {
+    scan_clone_watchers();
+
+    pthread_mutex_lock(&devices_mutex);
+    for (int i = 0; i < device_count; i++) {
+        struct captured_device *d = &devices[i];
+        if (d->fdi < 0 || !d->alive) {
+            continue;   // synthetic, or waiting for its device to come back
+        }
+
+        if (!d->watched && d->grabbed) {
+            ioctl(d->fdi, EVIOCGRAB, 0);
+            d->grabbed = false;
+            fprintf(stderr, "macroclickwerk: released %s — nothing is reading %s\n",
+                    d->path, d->clone_node);
+            continue;
+        }
+
+        if (!d->watched || d->grabbed || d->forward_failures >= MAX_FORWARD_FAILURES) {
+            continue;
+        }
+
+        // An fd never rebinds, so the only way this fails is the device being
+        // gone — its node possibly already reused by a stranger. The reader
+        // thread is discovering the same thing through read() right now and
+        // will hand the slot back; grabbing a corpse helps nobody, so skip.
+        char now[256] = "";
+        if (ioctl(d->fdi, EVIOCGNAME(sizeof(now) - 1), now) < 0) {
+            continue;
+        }
+
+        if (ioctl(d->fdi, EVIOCGRAB, 1) < 0) {
+            // A remapper or another grabber got there first. Say so once, then
+            // keep asking quietly: grabs are dropped when their holder exits.
+            if (!d->grab_denied) {
+                d->grab_denied = true;
+                fprintf(stderr, "Warning: Cannot grab [%s]: %s. Running observe-only for this device.\n",
+                        d->path, strerror(errno));
+            }
+            continue;
+        }
+        d->grabbed = true;
+        d->grab_denied = false;
+        fprintf(stderr, "macroclickwerk: grabbed %s — %s is being read, forwarding\n",
+                d->path, d->clone_node);
+    }
+    pthread_mutex_unlock(&devices_mutex);
+}
+
+/**
  * Watch /dev/input so a device that turns up later gets captured without
  * restarting the daemon: a wireless mouse that pairs seconds into boot, or a
  * keyboard whose upstream remapper was reconfigured and rebuilt its virtual
@@ -1172,40 +1441,43 @@ static void *monitor_thread(void *arg) {
     if (fd < 0) {
         perror("inotify_init1");
         fprintf(stderr, "Warning: hotplug disabled; devices are captured at startup only.\n");
-        return NULL;
-    }
-
-    // IN_ATTRIB as well as IN_CREATE: udev sets permissions after the node
-    // appears, so an open can lose that race and the chmod is the second chance.
-    if (inotify_add_watch(fd, "/dev/input", IN_CREATE | IN_ATTRIB) < 0) {
+    } else if (inotify_add_watch(fd, "/dev/input", IN_CREATE | IN_ATTRIB) < 0) {
         perror("inotify_add_watch /dev/input");
         close(fd);
-        return NULL;
+        fd = -1;
+        fprintf(stderr, "Warning: hotplug disabled; devices are captured at startup only.\n");
     }
+    // With no inotify the loop still runs for manage_grabs: grabs must follow
+    // the compositor coming and going even on a world with no hotplug.
 
     char buf[4096] __attribute__((aligned(__alignof__(struct inotify_event))));
 
     while (keep_running) {
         struct pollfd pfd = { .fd = fd, .events = POLLIN, .revents = 0 };
         // Poll rather than block, so a quiet /dev/input does not hold up
-        // shutdown for as long as nobody touches a keyboard.
-        if (poll(&pfd, 1, 1000) <= 0) {
-            continue;
+        // shutdown for as long as nobody touches a keyboard — and so the grab
+        // manager gets its once-a-second look either way.
+        int ready = fd >= 0 ? poll(&pfd, 1, 1000) : (usleep(1000000), 0);
+
+        if (ready > 0) {
+            // The queued events are drained but not read: a full rescan costs
+            // one pass over ~30 device nodes and cannot miss anything that
+            // slipped through while the queue was overflowing.
+            while (read(fd, buf, sizeof buf) > 0) {
+            }
+
+            // The node exists before udev has finished with it; grabbing this
+            // early works but the capability mirroring can come up short.
+            usleep(150000);
+            rescan(false);
         }
 
-        // The queued events are drained but not read: a full rescan costs one
-        // pass over ~30 device nodes and cannot miss anything that slipped
-        // through while the queue was overflowing.
-        while (read(fd, buf, sizeof buf) > 0) {
-        }
-
-        // The node exists before udev has finished with it; grabbing this early
-        // works but the capability mirroring can come up short.
-        usleep(150000);
-        rescan(false);
+        manage_grabs();
     }
 
-    close(fd);
+    if (fd >= 0) {
+        close(fd);
+    }
     return NULL;
 }
 

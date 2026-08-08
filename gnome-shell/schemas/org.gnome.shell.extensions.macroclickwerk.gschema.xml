@@ -215,5 +215,17 @@
             <description>Idle gaps longer than this become wait steps; 0 records no pauses</description>
         </key>
 
+        <key name="triggers" type="s">
+            <default>'[]'</default>
+            <summary>Input triggers</summary>
+            <description>JSON list of button/key triggers: the daemon consumes the source event and the extension performs the action</description>
+        </key>
+
+        <key name="expanded-rows" type="s">
+            <default>'{}'</default>
+            <summary>Editor expansion state</summary>
+            <description>Which rows of the macro editor are open or collapsed, so the settings window reopens the way it was left</description>
+        </key>
+
     </schema>
 </schemalist>
