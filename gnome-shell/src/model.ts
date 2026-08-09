@@ -103,6 +103,15 @@ export type ClickStep = StepCommon & {
     mode: 'abs' | 'current' | 'prev';
     x?: number;
     y?: number;
+    /**
+     * 'tap' is the whole click, down then up after holdMs; the split halves
+     * exist for flows where what happens between the down and the up is other
+     * steps. Absent means take it from the event: a click under a split
+     * `onevent` goes down when the person pressed and comes up when they let
+     * go, and falls back to a whole tap when no event woke the run. See
+     * `followsEvent`.
+     */
+    action?: 'tap' | 'down' | 'up';
     holdMs?: number;
 };
 
@@ -130,7 +139,8 @@ export type KeyStep = StepCommon & {
     kind: 'key';
     /** evdev key name, e.g. KEY_E. */
     code: string;
-    action: 'tap' | 'down' | 'up';
+    /** As a click's, including absent meaning "take it from the event". */
+    action?: 'tap' | 'down' | 'up';
     /** Modifier key names held around the key, e.g. ['KEY_LEFTCTRL']. */
     mods?: string[];
     holdMs?: number;
@@ -153,7 +163,8 @@ export type PadStep = StepCommon & {
     kind: 'pad';
     /** evdev name of the button: BTN_SOUTH, BTN_TR, … */
     button: string;
-    action: 'tap' | 'down' | 'up';
+    /** As a click's, including absent meaning "take it from the event". */
+    action?: 'tap' | 'down' | 'up';
     holdMs?: number;
 };
 
@@ -418,6 +429,63 @@ export function pathToStep(list: Step[], id: string): string[] {
         }
     }
     return [];
+}
+
+/** What kind of `onevent` a step is under: one whole click, or one edge of one. */
+export type EventFollow = 'click' | 'split';
+
+const followOf = (step: Step): EventFollow | null =>
+    step.kind !== 'onevent' ? null
+        : (step.edge ?? 'click') === 'click' ? 'click' : 'split';
+
+/**
+ * Which "When …" step, if any, a step runs under — and so where its edge comes
+ * from. A click or key press below an event does not decide for itself: under a
+ * whole click it is a whole click, and under a split event it takes the edge the
+ * event brought, going down when the person pressed and up when they let go.
+ * That is what makes "hold the side button, hold E" a pair of steps rather than
+ * a guess at a duration, and it is why the editor offers those steps no action
+ * to pick — the row above already said it.
+ *
+ * Order is the order steps are written, which is the order they run: an event
+ * covers everything after it, including the insides of a repeat or an if that
+ * comes after it. A repeat also comes back round, so an event anywhere in its
+ * body covers that whole body — on the second pass, every step in there is
+ * below it.
+ */
+export function followsEvent(root: Step[], stepId: string): EventFollow | null {
+    /** The last event in a list, at any depth: what a repeat's body comes back to. */
+    const lastIn = (list: Step[]): EventFollow | null => {
+        let last: EventFollow | null = null;
+        for (const step of list) {
+            for (const child of childLists(step)) {
+                last = lastIn(child.steps) ?? last;
+            }
+            last = followOf(step) ?? last;
+        }
+        return last;
+    };
+
+    let answer: EventFollow | null = null;
+    const scan = (list: Step[], carried: EventFollow | null): boolean => {
+        let armed = carried;
+        for (const step of list) {
+            if (step.id === stepId) {
+                answer = armed;
+                return true;
+            }
+            const wraps = step.kind === 'loop';
+            for (const child of childLists(step)) {
+                if (scan(child.steps, wraps ? lastIn(child.steps) ?? armed : armed)) {
+                    return true;
+                }
+            }
+            armed = followOf(step) ?? armed;
+        }
+        return false;
+    };
+    scan(root, null);
+    return answer;
 }
 
 export function findStep(list: Step[], id: string): StepLocation | null {
@@ -958,6 +1026,23 @@ function migrateGuards(steps: Step[]): Step[] {
     return migrated;
 }
 
+/**
+ * Clear the action from press steps that follow a split `onevent`. Their edge
+ * comes from the event, so a setting of their own is dead weight — and worse,
+ * it would be invisible weight: the editor stops offering the choice there, so
+ * a value left over from before the event was wired in would go on being obeyed
+ * with nothing on screen to say so. That is exactly how a click meant to be
+ * held for as long as a button is down ends up being held for 0.2 s instead.
+ */
+function dropFollowedActions(body: Step[]): void {
+    walk(body, ({ step }) => {
+        if ((step.kind === 'click' || step.kind === 'key' || step.kind === 'pad') &&
+            step.action !== undefined && followsEvent(body, step.id) !== null) {
+            step.action = undefined;
+        }
+    });
+}
+
 export function parseDocument(json: string): MacroDocument {
     if (!json || json.trim() === '') {
         return emptyDocument();
@@ -989,6 +1074,7 @@ export function parseDocument(json: string): MacroDocument {
                 delete (loc.step as { enabled?: boolean }).enabled;
             });
             fixed.body = dropRawSteps(migrateGuards(migrateGates(migrateLoops(fixed.body))));
+            dropFollowedActions(fixed.body);
             return fixed;
         });
         return { version: raw.version ?? DOCUMENT_VERSION, macros };
@@ -1073,6 +1159,11 @@ export function prettySource(
     return `${source.replace(/^KEY_/, '') || '…'} is ${verb}`;
 }
 
+/** How a key or pad step reads. Absent is the follow, and follows just press. */
+function pressVerb(action?: 'tap' | 'down' | 'up'): string {
+    return action === 'down' ? 'Hold down' : action === 'up' ? 'Release' : 'Press';
+}
+
 function formatMs(ms: number): string {
     if (ms >= 1000 && ms % 1000 === 0) {
         return `${ms / 1000}s`;
@@ -1098,10 +1189,16 @@ export function describeStep(
     stepLabel?: (stepId: string) => string | undefined,
 ): string {
     switch (step.kind) {
-        case 'click':
-            return step.mode === 'abs' ? `Click ${step.button} @ ${step.x ?? 0},${step.y ?? 0}`
-                : step.mode === 'prev' ? `Click ${step.button} @ previous`
-                : `Click ${step.button} at pointer`;
+        case 'click': {
+            // Absent is the follow, and a follow reads as the plain word: what
+            // it does is whatever the event did, which the event's own line
+            // above it already says.
+            const verb = step.action === 'down' ? 'Hold down'
+                : step.action === 'up' ? 'Release' : 'Click';
+            return step.mode === 'abs' ? `${verb} ${step.button} @ ${step.x ?? 0},${step.y ?? 0}`
+                : step.mode === 'prev' ? `${verb} ${step.button} @ previous`
+                : `${verb} ${step.button} at pointer`;
+        }
         case 'move':
             return step.mode === 'abs' ? `Move to ${step.x ?? 0},${step.y ?? 0}`
                 : step.mode === 'prev' ? 'Move to previous'
@@ -1113,15 +1210,13 @@ export function describeStep(
             const mods = (step.mods ?? []).map(m => m.replace(/^KEY_/, '').toLowerCase());
             const name = step.code.replace(/^KEY_/, '');
             const combo = [...mods, name].join('+');
-            const verb = step.action === 'tap' ? 'Press' : step.action === 'down' ? 'Hold down' : 'Release';
-            return `${verb} ${combo}`;
+            return `${pressVerb(step.action)} ${combo}`;
         }
         case 'text':
             return `Type "${truncate(step.value)}"`;
         case 'pad': {
             const label = GAMEPAD_BUTTONS[step.button] ?? step.button;
-            const verb = step.action === 'tap' ? 'Press' : step.action === 'down' ? 'Hold down' : 'Release';
-            return `${verb} pad ${label}`;
+            return `${pressVerb(step.action)} pad ${label}`;
         }
         case 'wait':
             return step.jitterMs

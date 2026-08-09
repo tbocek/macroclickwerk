@@ -2,7 +2,9 @@
 // is under test is the pure middle — which triggers arm, and what a tagged
 // event turns into.
 
-import { parseTriggers, isArmed, armedByCode, dispatch, sourceCode, claimWaiters } from '../dist/src/triggers.js';
+import {
+    parseTriggers, isArmed, armedByCode, dispatch, sourceCode, claimWaiters, TriggerEngine,
+} from '../dist/src/triggers.js';
 import { EV_KEY, BUTTON_CODES, GAMEPAD_CODES, KEY_CODES } from '../dist/src/keymap.js';
 
 let failures = 0;
@@ -20,7 +22,7 @@ function recordingActions() {
     const done = [];
     return {
         done,
-        injectKey: (code, down) => done.push(`key ${code} ${down ? 'down' : 'up'}`),
+        injectKeys: (codes, down) => done.push(`key ${codes.join('+')} ${down ? 'down' : 'up'}`),
         control: (action, macroId) => done.push(`${action} ${macroId || '(all)'}`),
     };
 }
@@ -181,6 +183,76 @@ check('the inert ones claim no code',
     }
     check('a parked run outranks a standing remap of the same button',
           actions.done.length === 0, actions.done.join());
+}
+
+// --- the wake says which edge it was -----------------------------------------
+
+// Not just "something happened": the steps after a split event take their own
+// edge from this answer, so a click under one goes down on the press and up on
+// the release. Driven through the engine because that is where the event
+// becomes an answer; the socket underneath is not there, which the engine
+// treats as "the daemon is down" and reports, and is why a complaint about it
+// may follow this line.
+{
+    const asked = [];
+    const engine = new TriggerEngine(
+        { setTriggers: async codes => { asked.push(codes.join('+') || '(none)'); } },
+        '/nonexistent/macroclickwerk-test.sock', recordingActions());
+    const answers = [];
+    engine.waitFor('BTN_SIDE', 'split').promise.then(edge => answers.push(edge));
+    engine.handle(trig(BUTTON_CODES.side, 1));
+
+    // The run is between the two halves here: it has been woken by the press
+    // and has not yet come back to park on the release. Giving the code up now
+    // would hand that release to the desktop and strand whatever the first
+    // half pressed in the down position.
+    check('the button stays claimed between the press and the release',
+          !asked.includes('(none)'), asked.join(' , '));
+
+    engine.waitFor('BTN_SIDE', 'split').promise.then(edge => answers.push(edge));
+    engine.handle(trig(BUTTON_CODES.side, 0));
+    const cancelled = engine.waitFor('BTN_SIDE', 'split');
+    cancelled.promise.then(edge => answers.push(edge));
+    cancelled.cancel();
+
+    check('an unknown source still has no wait to give',
+          engine.waitFor('BTN_NOPE', 'split') === null);
+    check('and once the gesture is over the claim is dropped',
+          asked[asked.length - 1] === '(none)', asked.join(' , '));
+    engine.destroy();
+
+    // The resolutions are microtasks, so they land on the next turn.
+    await Promise.resolve();
+    check('the wake names the edge, and a cancelled wait names none',
+          answers.join(' ') === 'press release ', answers.join(' '));
+}
+
+// A run stopped mid-gesture, with the button still down: the leftover release
+// is swallowed rather than delivered as a lone release the desktop never saw a
+// press for, and the code is given up the moment it lands.
+{
+    const asked = [];
+    const actions = recordingActions();
+    const engine = new TriggerEngine(
+        { setTriggers: async codes => { asked.push(codes.join('+') || '(none)'); } },
+        '/nonexistent/macroclickwerk-test.sock', actions);
+    const parked = engine.waitFor('BTN_SIDE', 'split');
+    let ended = '';
+    parked.promise.then(edge => { ended = String(edge); });
+    engine.handle(trig(BUTTON_CODES.side, 1));
+    // The press already ended that wait; stopping the run afterwards is the
+    // run's own business and has nothing left to call off here.
+    parked.cancel();
+    check('stopping mid-gesture keeps the button claimed until it comes up',
+          asked[asked.length - 1] !== '(none)', asked.join(' , '));
+    engine.handle(trig(BUTTON_CODES.side, 0));
+    check('the stray release goes nowhere', actions.done.length === 0, actions.done.join());
+    check('and the button is handed back', asked[asked.length - 1] === '(none)',
+          asked.join(' , '));
+    engine.destroy();
+    await Promise.resolve();
+    check('and the wait that the press ended still reports the press',
+          ended === 'press', ended);
 }
 
 // --- remaps mirror press and release, whatever the source --------------------

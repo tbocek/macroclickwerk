@@ -31,6 +31,7 @@ import {
     describeStep,
     emptyDocument,
     findStep,
+    followsEvent,
     macroEnabled,
     moveStepNested,
     moveStepTo,
@@ -46,7 +47,8 @@ import {
 } from './src/model.js';
 import { MacroStore } from './src/store.js';
 import { buildInstruction, testConnection } from './src/llm.js';
-import { isArmed, parseTriggers, type Trigger } from './src/triggers.js';
+import { comboCodes, isArmed, parseTriggers, type Trigger } from './src/triggers.js';
+import { keyName } from './src/keymap.js';
 
 const CONDITION_TYPES: ConditionType[] = ['always', 'llm', 'color', 'and', 'or', 'not'];
 
@@ -390,10 +392,32 @@ function bandedDown(value: number): number {
     return (Math.ceil(value / step - 1e-9) - 1) * step;
 }
 
+/** 200 → "0.2s", 20 → "20ms", 2500 → "2.5s": how a time field shows itself. */
+function formatMsUnits(ms: number): string {
+    if (Math.abs(ms) < 100) {
+        return `${ms}ms`;
+    }
+    return `${Number.parseFloat((ms / 1000).toFixed(3))}s`;
+}
+
+/** "0.2s" → 200, "20ms" → 20, and a bare "200" is milliseconds. */
+function parseMsUnits(text: string): number | null {
+    const match = text.trim().match(/^(-?\d+(?:[.,]\d+)?)\s*(ms|s)?$/i);
+    if (!match) {
+        return null;
+    }
+    const number = Number.parseFloat(match[1].replace(',', '.'));
+    if (!Number.isFinite(number)) {
+        return null;
+    }
+    return Math.round(match[2]?.toLowerCase() === 's' ? number * 1000 : number);
+}
+
 /**
  * A number with − and + beside it. Not a GtkSpinButton: the whole point is
  * the banded stepping above, and a spin button's increment is fixed per
- * widget, not per press.
+ * widget, not per press. With `timeUnits` the field speaks human time —
+ * shows 0.2s rather than 200, reads "300ms", "0.5s" and bare milliseconds.
  */
 function spinSuffix(
     value: number,
@@ -401,40 +425,50 @@ function spinSuffix(
     upper: number,
     tooltip: string,
     onChange: (value: number) => void,
+    timeUnits = false,
 ): Gtk.Widget {
     const clamp = (v: number) => Math.max(lower, Math.min(upper, Math.round(v)));
     let current = clamp(value);
+    const show = (v: number) => timeUnits ? formatMsUnits(v) : `${v}`;
+    const parse = (text: string) => {
+        if (timeUnits) {
+            return parseMsUnits(text);
+        }
+        const parsed = Number.parseInt(text.trim(), 10);
+        return Number.isFinite(parsed) ? parsed : null;
+    };
 
     const entry = new Gtk.Entry({
-        text: `${current}`,
+        text: show(current),
         tooltip_text: tooltip,
         valign: Gtk.Align.CENTER,
         xalign: 1,
         input_purpose: Gtk.InputPurpose.DIGITS,
         // Sized to the largest number it can hold, plus a minus sign where
-        // there can be one, but capped at four digits: a wait may run to an
-        // hour, and a field sized for 3600000 is a wide field on every row
-        // that a wait is not. Past the cap it scrolls — the value stays whole,
-        // only its widest end is out of view, and that end is the rare one.
-        width_chars: Math.min(4, Math.max(3, `${upper}`.length + (lower < 0 ? 1 : 0))),
-        max_width_chars: Math.min(4, Math.max(3, `${upper}`.length + (lower < 0 ? 1 : 0))),
+        // there can be one, but capped: a wait may run to an hour, and a field
+        // sized for 3600000 is a wide field on every row that a wait is not.
+        // Past the cap it scrolls — the value stays whole, only its widest end
+        // is out of view, and that end is the rare one. Time fields get one
+        // more, for the unit: "0.25s" is five.
+        width_chars: Math.min(timeUnits ? 5 : 4, Math.max(3, `${upper}`.length + (lower < 0 ? 1 : 0))),
+        max_width_chars: Math.min(timeUnits ? 5 : 4, Math.max(3, `${upper}`.length + (lower < 0 ? 1 : 0))),
     });
 
     /** What the field says right now, for the nudge to step from — the typed
      * text when it parses, the last good value when it does not. */
     const read = () => {
-        const parsed = Number.parseInt(entry.get_text() ?? '', 10);
-        return Number.isFinite(parsed) ? clamp(parsed) : current;
+        const parsed = parse(entry.get_text() ?? '');
+        return parsed !== null ? clamp(parsed) : current;
     };
     const commit = (next: number) => {
         current = clamp(next);
-        entry.set_text(`${current}`);
+        entry.set_text(show(current));
         onChange(current);
     };
     // Typing commits after a pause, so half-typed numbers do not fire.
     const typed = debounce(() => {
-        const parsed = Number.parseInt(entry.get_text() ?? '', 10);
-        if (Number.isFinite(parsed) && clamp(parsed) === parsed && parsed !== current) {
+        const parsed = parse(entry.get_text() ?? '');
+        if (parsed !== null && clamp(parsed) === parsed && parsed !== current) {
             current = parsed;
             onChange(current);
         }
@@ -1844,6 +1878,22 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
         // rewritten in place rather than by rebuilding the page — a rebuild
         // would close the dropdown you are still looking at.
         const retitle = () => row.set_title(this._describe(step));
+
+        // A press step under a "when …" has no edge to choose: under a whole
+        // click it is a whole click, under a split event it goes down when the
+        // person pressed and up when they let go. Either way the choice was
+        // made one row up, so no dropdown here. Hiding it is only half of it —
+        // a setting left over from before the event was wired in would still
+        // be showing in the title while the run ignored it, so it goes as
+        // well, and saves along with the next thing that changes.
+        const follows = followsEvent(macro.body, step.id);
+        if (follows && 'action' in step && step.action !== undefined) {
+            step.action = undefined;
+            retitle();
+        }
+        /** A hold time is a tap's duration, and a split event's halves have none. */
+        const holdApplies = follows !== 'split';
+
         switch (step.kind) {
         // A repeat has exactly one setting, so it lives on the row rather than
         // behind a fold: the count, and a toggle for having no count at all.
@@ -1882,9 +1932,10 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
             break;
         }
 
-        // Same bargain the loop's count makes: a click is a button and a hold,
-        // two small controls that are shorter than the fold they were hiding
-        // behind, and they read as the line they sit on.
+        // Same bargain the loop's count makes: a click is a button, what to do
+        // with it, and — only when it is a whole click — for how long. The
+        // hold field goes with the tap: a bare down or up has no duration,
+        // its other half is another step.
         case 'click':
             suffixes.append(chooser(MOUSE_BUTTONS, mouseButtonLabels(), step.button,
                 _('Which mouse button'), value => {
@@ -1892,27 +1943,41 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
                     retitle();
                     this._save();
                 }));
-            suffixes.append(spinSuffix(step.holdMs ?? 20, 0, 10000,
-                _('How long the button stays down, in milliseconds'), value => {
-                    step.holdMs = value;
-                    this._save();
-                }));
+            if (!follows) {
+                suffixes.append(chooser(KEY_ACTIONS, keyActionLabels(), step.action ?? 'tap',
+                    _('Whether to click, hold down, or release'), value => {
+                        step.action = value;
+                        retitle();
+                        this._saveAndRebuild();   // the hold field comes and goes with tap
+                    }));
+            }
+            if (holdApplies && (step.action ?? 'tap') === 'tap') {
+                suffixes.append(spinSuffix(step.holdMs ?? 20, 0, 10000,
+                    _('How long the button stays down'), value => {
+                        step.holdMs = value;
+                        this._save();
+                    }, true));
+            }
             break;
 
-        // The same two words a click has, for the same reason: which, and for
-        // how long — "Press ctrl+c", "Hold down shift".
+        // The same words a click has, for the same reason: which, what, and
+        // for how long — "Press ctrl+c", "Hold down shift".
         case 'key':
-            suffixes.append(chooser(KEY_ACTIONS, keyActionLabels(), step.action,
-                _('Whether to press, hold down, or release'), value => {
-                    step.action = value;
-                    retitle();
-                    this._save();
-                }));
-            suffixes.append(spinSuffix(step.holdMs ?? 20, 0, 10000,
-                _('How long the key stays down, in milliseconds'), value => {
-                    step.holdMs = value;
-                    this._save();
-                }));
+            if (!follows) {
+                suffixes.append(chooser(KEY_ACTIONS, keyActionLabels(), step.action ?? 'tap',
+                    _('Whether to press, hold down, or release'), value => {
+                        step.action = value;
+                        retitle();
+                        this._saveAndRebuild();   // the hold field comes and goes with tap
+                    }));
+            }
+            if (holdApplies && (step.action ?? 'tap') === 'tap') {
+                suffixes.append(spinSuffix(step.holdMs ?? 20, 0, 10000,
+                    _('How long the key stays down'), value => {
+                        step.holdMs = value;
+                        this._save();
+                    }, true));
+            }
             break;
 
         case 'text':
@@ -1920,7 +1985,7 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
                 _('Delay between keys, in milliseconds'), value => {
                     step.delayMs = value;
                     this._save();
-                }));
+                }, true));
             break;
 
         // The pad's click: which button, what to do with it, for how long —
@@ -1932,17 +1997,21 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
                     retitle();
                     this._save();
                 }, 10));
-            suffixes.append(chooser(KEY_ACTIONS, keyActionLabels(), step.action,
-                _('Whether to press, hold down, or release'), value => {
-                    step.action = value;
-                    retitle();
-                    this._save();
-                }));
-            suffixes.append(spinSuffix(step.holdMs ?? 20, 0, 10000,
-                _('How long the button stays down, in milliseconds'), value => {
-                    step.holdMs = value;
-                    this._save();
-                }));
+            if (!follows) {
+                suffixes.append(chooser(KEY_ACTIONS, keyActionLabels(), step.action ?? 'tap',
+                    _('Whether to press, hold down, or release'), value => {
+                        step.action = value;
+                        retitle();
+                        this._saveAndRebuild();   // the hold field comes and goes with tap
+                    }));
+            }
+            if (holdApplies && (step.action ?? 'tap') === 'tap') {
+                suffixes.append(spinSuffix(step.holdMs ?? 20, 0, 10000,
+                    _('How long the button stays down'), value => {
+                        step.holdMs = value;
+                        this._save();
+                    }, true));
+            }
             break;
 
         // Both numbers, and the line already reads "Wait 1s ±200ms", so the
@@ -1953,13 +2022,13 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
                     step.ms = value;
                     retitle();
                     this._save();
-                }));
+                }, true));
             suffixes.append(spinSuffix(step.jitterMs ?? 0, 0, 600000,
                 _('Vary each wait by up to this much, either way, in milliseconds'), value => {
                     step.jitterMs = value;
                     retitle();
                     this._save();
-                }));
+                }, true));
             break;
         case 'onevent': {
             const isButton = (TRIGGER_SOURCES as readonly string[]).includes(step.source);
@@ -1995,7 +2064,10 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
             split.connect('toggled', () => {
                 step.edge = split.get_active() ? 'split' : 'click';
                 retitle();
-                this._save();
+                // Every press step below this one gains or loses its own
+                // action along with the toggle, so the page is redrawn rather
+                // than just this row.
+                this._saveAndRebuild();
             });
             suffixes.append(split);
             break;
@@ -3123,12 +3195,23 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
             }, 14));
 
         if (trigger.action === 'key') {
-            row.add_suffix(suffixEntry(trigger.key ?? '', 'KEY_E',
-                _('The key pressed in its place, by evdev name'), text => {
+            const keyEntry = suffixEntry(trigger.key ?? '', 'KEY_E',
+                _('What is pressed in its place, by evdev name: KEY_E, BTN_LEFT — or ' +
+                    'several, space separated, like KEY_LEFTMETA BTN_LEFT for a ' +
+                    'Super+left drag. Careful: "LEFT" alone is the arrow key.'), text => {
                     trigger.key = text.trim().toUpperCase();
                     this._saveTriggers(triggers);
                     retitle();
-                }));
+                    // Red until every name resolves — the title above shows
+                    // what the names resolve *to*, which is the safety net
+                    // against LEFT quietly being an arrow key.
+                    if (comboCodes(trigger.key) === null && trigger.key !== '') {
+                        keyEntry.add_css_class('error');
+                    } else {
+                        keyEntry.remove_css_class('error');
+                    }
+                });
+            row.add_suffix(keyEntry);
         } else if (trigger.action !== 'none') {
             const macros = this._store.macros;
             const options = ['', ...macros.map(macro => macro.id)];
@@ -3155,7 +3238,14 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
         const labels = triggerSourceLabels();
         const source = labels[trigger.source] ?? (trigger.source || _('Pick a key'));
         switch (trigger.action) {
-            case 'key': return `${source} → ${trigger.key || '…'}`;
+            case 'key': {
+                // The canonical names, so what you typed shows as what it
+                // *means*: "left" comes back as KEY_LEFT, the arrow key —
+                // visibly not the mouse button someone probably wanted.
+                const codes = comboCodes(trigger.key);
+                const resolved = codes ? codes.map(code => keyName(code)).join(' + ') : trigger.key;
+                return `${source} → ${resolved || '…'}`;
+            }
             case 'run': return `${source} ${_('starts')} ${this._triggerMacroName(trigger)}`;
             case 'pause': return `${source} ${_('pauses')} ${this._triggerMacroName(trigger)}`;
             case 'stop': return `${source} ${_('stops')} ${this._triggerMacroName(trigger)}`;

@@ -72,15 +72,18 @@ export interface RunnerCallbacks {
     macroName?: (macroId: string) => string | undefined;
     /**
      * Park until the chosen edge of a button or key — its press, or its
-     * release — consuming the event. Resolves true on the edge, false if
-     * cancelled; null for a source that names no real input, undefined when
+     * release — consuming the event. Resolves with the edge that woke it, null
+     * if cancelled; null for a source that names no real input, undefined when
      * nothing here can wait at all — either way the step fails rather than
      * hangs.
      */
     waitForInput?: (
         source: string,
         edge: 'click' | 'split' | 'press' | 'release',
-    ) => { promise: Promise<boolean>; cancel: () => void } | null | undefined;
+    ) => {
+        promise: Promise<'press' | 'release' | null>;
+        cancel: () => void;
+    } | null | undefined;
 }
 
 // A warp lands exactly, so a couple of passes only cover the pointer being
@@ -104,6 +107,15 @@ export class MacroRunner {
     private _wakeSleep: (() => void) | null = null;
     /** Calls off the onevent wait this run is parked on, if it is on one. */
     private _waitCancel: (() => void) | null = null;
+    /**
+     * The edge of the last split `onevent` this run woke on, and null when the
+     * run is not inside one. Clicks and key presses after such an event take
+     * their edge from here rather than from a setting of their own — pressing
+     * the button puts them down, letting go lifts them — which is the whole of
+     * "hold the side button, hold E". See `followsEvent`, which is how the
+     * editor knows to stop offering the choice.
+     */
+    private _inputEdge: 'press' | 'release' | null = null;
     private _warnedAboutMotion = false;
     private _paused = false;
     private _path: RunningStep[] = [];
@@ -216,6 +228,7 @@ export class MacroRunner {
         this._macroId = macro.id;
         this._prevPointer = null;
         this._prevPinned = false;
+        this._inputEdge = null;
         this._warnedEmptyLoops.clear();
         this._resume = resumeAt ? pathToStep(macro.body, resumeAt) : [];
         this._callbacks.onRunningChanged?.(true);
@@ -280,6 +293,7 @@ export class MacroRunner {
         // left over from whichever full run happened to finish last.
         this._prevPointer = null;
         this._prevPinned = false;
+        this._inputEdge = null;
         this._warnedEmptyLoops.clear();
         this._callbacks.onRunningChanged?.(true);
         let result: { ok: boolean; message: string };
@@ -551,13 +565,32 @@ export class MacroRunner {
         }
     }
 
+    /**
+     * What a click or key press does, given what it asked for. An explicit
+     * tap/down/up is itself. Absent follows the split `onevent` the run is
+     * inside — down on the press, up on the release, so the button mirrors the
+     * finger — and is a whole tap when no event woke the run.
+     */
+    private _pressAction(explicit?: 'tap' | 'down' | 'up'): 'tap' | 'down' | 'up' {
+        if (explicit) {
+            return explicit;
+        }
+        return this._inputEdge === 'press' ? 'down'
+            : this._inputEdge === 'release' ? 'up'
+            : 'tap';
+    }
+
     private async _doClick(step: ClickStep): Promise<void> {
         const code = BUTTON_CODES[step.button] ?? BUTTON_CODES.left;
         const hold = Math.max(0, step.holdMs ?? 20) * 1000;
-        const press = (via?: Playback) => this._play([
-            { dt: 0, type: EV_KEY, code, value: 1 },
-            { dt: hold, type: EV_KEY, code, value: 0 },
-        ], via);
+        const action = this._pressAction(step.action);
+        const press = (via?: Playback) => this._play(
+            action === 'tap' ? [
+                { dt: 0, type: EV_KEY, code, value: 1 },
+                { dt: hold, type: EV_KEY, code, value: 0 },
+            ] : [
+                { dt: 0, type: EV_KEY, code, value: action === 'down' ? 1 : 0 },
+            ], via);
 
         if (step.mode === 'current') {
             await press();
@@ -712,22 +745,23 @@ export class MacroRunner {
             .map(name => keyCode(name))
             .filter((value): value is number => value !== null);
         const hold = Math.max(0, step.holdMs ?? 20) * 1000;
+        const action = this._pressAction(step.action);
         const events: RawEvent[] = [];
 
-        if (step.action !== 'up') {
+        if (action !== 'up') {
             for (const mod of mods) {
                 events.push({ dt: 0, type: EV_KEY, code: mod, value: 1 });
             }
         }
 
-        if (step.action === 'tap') {
+        if (action === 'tap') {
             events.push({ dt: 0, type: EV_KEY, code, value: 1 });
             events.push({ dt: hold, type: EV_KEY, code, value: 0 });
         } else {
-            events.push({ dt: 0, type: EV_KEY, code, value: step.action === 'down' ? 1 : 0 });
+            events.push({ dt: 0, type: EV_KEY, code, value: action === 'down' ? 1 : 0 });
         }
 
-        if (step.action !== 'down') {
+        if (action !== 'down') {
             for (const mod of [...mods].reverse()) {
                 events.push({ dt: 0, type: EV_KEY, code: mod, value: 0 });
             }
@@ -747,7 +781,8 @@ export class MacroRunner {
     }
 
     private async _doOnEvent(step: OnEventStep): Promise<void> {
-        const wait = this._callbacks.waitForInput?.(step.source, step.edge ?? 'click');
+        const edge = step.edge ?? 'click';
+        const wait = this._callbacks.waitForInput?.(step.source, edge);
         if (wait === undefined) {
             throw new Error('waiting for a click is not available here');
         }
@@ -757,9 +792,15 @@ export class MacroRunner {
         this._status(`Waiting until ${prettySource(step.source, step.edge)}`);
         this._waitCancel = wait.cancel;
         try {
-            // Resolves false when cancelled — a stopped run, not a failure; the
+            // Resolves null when cancelled — a stopped run, not a failure; the
             // interpreter's own cancellation check unwinds from here.
-            await wait.promise;
+            const woken = await wait.promise;
+            // A whole click is over by the time the run moves on: the button is
+            // already back up, so nothing after it is inside a gesture. The
+            // split halves are the opposite — the steps after them happen while
+            // the finger is still down, or just after it came off — so they are
+            // what the steps below follow.
+            this._inputEdge = edge === 'click' ? null : woken;
         } finally {
             this._waitCancel = null;
         }

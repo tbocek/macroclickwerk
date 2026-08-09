@@ -110,12 +110,14 @@ export default class MacroclickwerkExtension extends Extension {
         });
 
         this._triggers = new TriggerEngine(this._daemon, config.eventSocket, {
-            injectKey: (code, down) => {
-                // Through the daemon's tracked path, so a key held by a trigger
-                // is released by the emergency stop like anything else.
-                void this._daemon?.play([{ dt: 0, type: EV_KEY, code, value: down ? 1 : 0 }])
+            injectKeys: (codes, down) => {
+                // One train, through the daemon's tracked path: order inside a
+                // combo holds, and keys held by a trigger are released by the
+                // emergency stop like anything else.
+                void this._daemon?.play(codes.map(code =>
+                    ({ dt: 0, type: EV_KEY, code, value: down ? 1 : 0 })))
                     .catch(error => reportProblem('Daemon',
-                        `a trigger could not press its key: ${(error as Error).message}`));
+                        `a trigger could not press its keys: ${(error as Error).message}`));
             },
             control: (action, macroId) => {
                 if (macroId !== '') {

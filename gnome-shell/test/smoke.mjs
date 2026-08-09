@@ -366,6 +366,38 @@ check('gate retry becomes a loop that breaks when ready',
       && retryBody[0].body[0].then[0].kind === 'break');
 check('gate retry waits inside the loop', retryBody[0].body[1].kind === 'wait' && retryBody[0].body[1].ms === 500);
 
+// a press step under a split event loses the action it used to carry: the
+// event decides now, and a leftover setting would be obeyed with nothing on
+// screen to say so — which is how a click meant to be held for as long as a
+// button is down ends up held for 0.2s instead.
+const heldDoc = JSON.stringify({ version: 1, macros: [{ id: 'm', name: 'h', body: [
+    { id: 'c0', kind: 'click', button: 'left', mode: 'current', action: 'down', holdMs: 200 },
+    { id: 'e1', kind: 'onevent', source: 'BTN_RIGHT', edge: 'split' },
+    { id: 'c1', kind: 'click', button: 'left', mode: 'current', action: 'down', holdMs: 200 },
+    { id: 'k1', kind: 'key', code: 'KEY_E', action: 'up' },
+    { id: 'p1', kind: 'pad', button: 'BTN_SOUTH', action: 'down' },
+] }] });
+const held = parseDocument(heldDoc).macros[0].body;
+check('a click above the event keeps its action', held[0].action === 'down');
+check('every press step below it gives its action up',
+      held[2].action === undefined && held[3].action === undefined
+      && held[4].action === undefined,
+      JSON.stringify(held.slice(2).map(s => s.action)));
+check('the hold time is left alone, for if the event goes away', held[2].holdMs === 200);
+check('and the freed click reads as a plain click',
+      describeStep(held[2]) === 'Click left at pointer', describeStep(held[2]));
+
+// A whole-click event decides too — it says "one whole click", which is the
+// only thing a step under it can be.
+const wholeDoc = JSON.stringify({ version: 1, macros: [{ id: 'm', name: 'w', body: [
+    { id: 'e', kind: 'onevent', source: 'BTN_RIGHT', edge: 'click' },
+    { id: 'c', kind: 'click', button: 'left', mode: 'current', action: 'down', holdMs: 900 },
+] }] });
+const whole = parseDocument(wholeDoc).macros[0].body;
+check('a click under a whole-click event gives its action up too',
+      whole[1].action === undefined && whole[1].holdMs === 900,
+      JSON.stringify(whole[1]));
+
 // pixel and regionColor fold onto one colour condition
 const colDoc = JSON.stringify({ version: 1, macros: [{ id: 'm', name: 'c', body: [
     { id: 'a', kind: 'if', cond: { type: 'pixel', x: 5, y: 6, color: '#abcdef', tolerance: 9 }, then: [], else: [] },

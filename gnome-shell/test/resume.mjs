@@ -5,7 +5,8 @@
 import GLib from 'gi://GLib';
 
 import { MacroRunner } from '../dist/src/runner.js';
-import { moveStepTo, newMacro, newStep, pathToStep } from '../dist/src/model.js';
+import { followsEvent, moveStepTo, newMacro, newStep, pathToStep } from '../dist/src/model.js';
+import { BUTTON_CODES } from '../dist/src/keymap.js';
 import { clearProblems, listProblems } from '../dist/src/problems.js';
 
 let failures = 0;
@@ -29,6 +30,20 @@ const evaluator = {
         return condition;
     },
 };
+
+const BTN_LEFT = BUTTON_CODES.left;
+
+/** Spin the main loop until the condition holds, or give up after two seconds. */
+const until = cond => new Promise(resolve => {
+    let tries = 0;
+    GLib.timeout_add(GLib.PRIORITY_DEFAULT, 5, () => {
+        if (cond() || ++tries > 400) {
+            resolve();
+            return GLib.SOURCE_REMOVE;
+        }
+        return GLib.SOURCE_CONTINUE;
+    });
+});
 
 /** A step that does nothing but be identifiable in the trace. */
 function named(kind, name) {
@@ -400,26 +415,15 @@ check('pathToStep of a missing step is empty', pathToStep(flat.body, 'gone').len
 // a stub, so what is under test is the runner's half of the bargain — parking,
 // continuing on the press, and being stoppable while parked.
 {
-    const until = cond => new Promise(resolve => {
-        let tries = 0;
-        GLib.timeout_add(GLib.PRIORITY_DEFAULT, 5, () => {
-            if (cond() || ++tries > 400) {
-                resolve();
-                return GLib.SOURCE_REMOVE;
-            }
-            return GLib.SOURCE_CONTINUE;
-        });
-    });
-
     const waiters = [];
     const waitForInput = (_source, edge) => {
         let resolver;
         const promise = new Promise(resolve => { resolver = resolve; });
-        const waiter = { edge, fire: () => resolver(true), cancelled: false };
+        const waiter = { edge, fire: (on = 'press') => resolver(on), cancelled: false };
         waiters.push(waiter);
         return {
             promise,
-            cancel: () => { waiter.cancelled = true; resolver(false); },
+            cancel: () => { waiter.cancelled = true; resolver(null); },
         };
     };
 
@@ -472,6 +476,191 @@ check('pathToStep of a missing step is empty', pathToStep(flat.body, 'gone').len
     await failing.run(askew);
     check('a source that names nothing fails the run instead of hanging',
           reason === 'error', reason);
+}
+
+// --- a click under a split event follows that event's edge -------------------
+
+// The long click: press the side button and the left button goes down, let go
+// and it comes up. Neither click step says which — they take it from the event
+// above them, which is why the editor stops offering the choice.
+{
+    const played = [];
+    const watching = {
+        play: async events => { played.push(...events); return { aborted: false }; },
+        stop: async () => {},
+    };
+
+    const waiters = [];
+    const waitForInput = (_source, edge) => {
+        let resolver;
+        const promise = new Promise(resolve => { resolver = resolve; });
+        waiters.push({ edge, fire: on => resolver(on) });
+        return { promise, cancel: () => resolver(null) };
+    };
+
+    const hold = newMacro('hold');
+    const down = named('onevent', 'down');
+    down.source = 'BTN_SIDE';
+    down.edge = 'split';
+    const up = named('onevent', 'up');
+    up.source = 'BTN_SIDE';
+    up.edge = 'split';
+    const clickA = named('click', 'clickA');
+    const clickB = named('click', 'clickB');
+    // Left, where the pointer is, and no action of their own: the follow.
+    for (const click of [clickA, clickB]) {
+        click.button = 'left';
+        click.mode = 'current';
+        delete click.action;
+    }
+    hold.body.push(down, clickA, up, clickB);
+
+    check('the editor knows both clicks follow the split event',
+          followsEvent(hold.body, clickA.id) === 'split'
+          && followsEvent(hold.body, clickB.id) === 'split');
+    check('and that the first event itself follows nothing',
+          followsEvent(hold.body, down.id) === null);
+
+    const running = new MacroRunner(watching, evaluator, {}, {}, { waitForInput }).run(hold);
+    await until(() => waiters.length === 1);
+    waiters[0].fire('press');
+    await until(() => waiters.length === 2);
+    check('the press puts the button down and leaves it there',
+          played.length === 1 && played[0].value === 1 && played[0].code === BTN_LEFT,
+          JSON.stringify(played));
+    waiters[1].fire('release');
+    await running;
+    check('and letting go brings it up',
+          played.length === 2 && played[1].value === 0 && played[1].code === BTN_LEFT,
+          JSON.stringify(played));
+}
+
+// The shape a repeat gives you for free: one event and one click going round
+// alternate on their own — the first pass catches the press and holds the
+// button, the second catches the release and lets go. Two steps for a long
+// click of any length, which is what the four-step version was.
+{
+    const played = [];
+    const waiters = [];
+    const macro = newMacro('round');
+    const on = named('onevent', 'round-on');
+    on.source = 'BTN_RIGHT';
+    on.edge = 'split';
+    const click = named('click', 'round-click');
+    click.button = 'left';
+    click.mode = 'current';
+    delete click.action;
+    const loop = named('loop', 'round-loop');
+    loop.count = 'forever';
+    loop.body = [on, click];
+    macro.body.push(loop);
+
+    const runner = new MacroRunner({
+        play: async events => { played.push(...events); return { aborted: false }; },
+        stop: async () => {},
+    }, evaluator, {}, {}, {
+        waitForInput: () => {
+            let resolver;
+            const promise = new Promise(resolve => { resolver = resolve; });
+            waiters.push({ fire: edge => resolver(edge) });
+            return { promise, cancel: () => resolver(null) };
+        },
+    });
+    const running = runner.run(macro);
+    for (const edge of ['press', 'release', 'press', 'release']) {
+        await until(() => waiters.length > 0);
+        waiters.shift().fire(edge);
+        await until(() => waiters.length > 0);
+    }
+    runner.stop();
+    await running;
+    check('a repeat over one event and one click alternates down and up',
+          played.slice(0, 4).map(e => e.value).join('') === '1010',
+          JSON.stringify(played.map(e => e.value)));
+}
+
+// A click with nothing waking it is still a whole click: down, then up after
+// the hold. Only a run inside an event follows one.
+{
+    const played = [];
+    const alone = newMacro('alone');
+    const click = named('click', 'solo');
+    click.button = 'left';
+    click.mode = 'current';
+    delete click.action;
+    alone.body.push(click);
+    await new MacroRunner({
+        play: async events => { played.push(...events); return { aborted: false }; },
+        stop: async () => {},
+    }, evaluator, {}, {}, {}).run(alone);
+    check('a click with no event above it is a whole click',
+          played.length === 2 && played[0].value === 1 && played[1].value === 0,
+          JSON.stringify(played));
+}
+
+// A whole-click event is over by the time the run moves on, so what follows it
+// is not inside a gesture and clicks normally.
+{
+    const played = [];
+    const waiters = [];
+    const macro = newMacro('whole');
+    const on = named('onevent', 'whole-on');
+    on.source = 'BTN_SIDE';
+    on.edge = 'click';
+    const click = named('click', 'after');
+    click.button = 'left';
+    click.mode = 'current';
+    delete click.action;
+    macro.body.push(on, click);
+
+    check('a step under a whole-click event follows a whole click',
+          followsEvent(macro.body, click.id) === 'click');
+
+    const running = new MacroRunner({
+        play: async events => { played.push(...events); return { aborted: false }; },
+        stop: async () => {},
+    }, evaluator, {}, {}, {
+        waitForInput: () => {
+            let resolver;
+            const promise = new Promise(resolve => { resolver = resolve; });
+            waiters.push({ fire: on2 => resolver(on2) });
+            return { promise, cancel: () => resolver(null) };
+        },
+    }).run(macro);
+    await until(() => waiters.length === 1);
+    waiters[0].fire('press');
+    await running;
+    check('and clicks whole rather than sticking down',
+          played.length === 2 && played[0].value === 1 && played[1].value === 0,
+          JSON.stringify(played));
+}
+
+// Where the follow reaches: after the event, into what comes after it, and
+// round a repeat — an event in a loop body is before every step in that body
+// from the second pass on.
+{
+    const nested = newMacro('nested');
+    const before = named('click', 'before');
+    const ev = named('onevent', 'ev');
+    ev.edge = 'split';
+    const inIf = named('click', 'inIf');
+    const iff = named('if', 'iff');
+    iff.then = [inIf];
+    nested.body.push(before, ev, iff);
+    check('a click above the event decides for itself',
+          followsEvent(nested.body, before.id) === null);
+    check('a click inside a branch below the event follows',
+          followsEvent(nested.body, inIf.id) === 'split');
+
+    const looped = newMacro('looped');
+    const first = named('click', 'first');
+    const wrapped = named('onevent', 'wrapped');
+    wrapped.edge = 'split';
+    const loop = named('loop', 'loop');
+    loop.body = [first, wrapped];
+    looped.body.push(loop);
+    check('a repeat comes back round, so its whole body follows',
+          followsEvent(looped.body, first.id) === 'split');
 }
 
 // --- a pad step is a key press in the gamepad range --------------------------
