@@ -203,6 +203,17 @@ const BRANCH_STYLE: Record<BranchKind, { icon: string; title: string; hint: stri
  * painted inside the box it already had, so nothing moves. It also means the
  * state rails simply overwrite the branch rail instead of stacking beside it.
  */
+/**
+ * How wide the macro editor may get. `AdwPreferencesPage` wraps its groups in a
+ * clamp of 600, which is the right measure for a settings row — a label on the
+ * left, a value on the right, and nothing that suffers from a short line. A
+ * step row is not that: it carries a title, a chooser, a spin and five buttons
+ * on one line, and at 600 the title wraps to two lines while the chooser
+ * truncates to “Right cl…”. The clamp is not a property of the page, so the
+ * only way to say otherwise is to reach in for it — see `_widen`.
+ */
+const EDITOR_MAX_WIDTH = 900;
+
 const EDITOR_CSS = `
 .macroclickwerk-branch {
     box-shadow: inset 4px 0 0 alpha(@accent_bg_color, 0.85);
@@ -1062,6 +1073,24 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
         }
     }
 
+    /**
+     * Raise the clamp libadwaita puts inside a preferences page. It is internal
+     * to the page, so this walks down to it rather than setting a property; if a
+     * future libadwaita builds the page some other way there is simply no clamp
+     * to find, and the page keeps whatever width it came with.
+     */
+    private _widen(widget: Gtk.Widget, max: number): number {
+        let found = 0;
+        for (let child = widget.get_first_child(); child; child = child.get_next_sibling()) {
+            if (child instanceof Adw.Clamp) {
+                child.maximum_size = max;
+                found++;
+            }
+            found += this._widen(child, max);
+        }
+        return found;
+    }
+
     async fillPreferencesWindow(window: Adw.PreferencesWindow): Promise<void> {
         this._window = window;
         this._settings = this.getSettings();
@@ -1073,6 +1102,16 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
             title: _('Macros'),
             iconName: 'view-list-symbolic',
         });
+        // Only this page: the settings pages beside it are ordinary rows, and
+        // 600 is what those are meant to be. Done once here — a rebuild swaps
+        // the groups out, not the page, so the clamp outlives it.
+        if (this._widen(this._macrosPage, EDITOR_MAX_WIDTH) === 0) {
+            // Nothing to widen means libadwaita stopped building the page the
+            // way this expects. Cosmetic, so it is a line in the journal rather
+            // than a failure — but a silent narrow editor is hard to tell from a
+            // stale build, and this says which it is.
+            log('macroclickwerk: no clamp in the macros page, editor stays at its default width');
+        }
         window.add(this._macrosPage);
         this._addSettingsPages();
 
@@ -1089,7 +1128,10 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
         // Where the shell's runner currently is. Only style classes change, so
         // this can arrive several times a second without disturbing an edit.
         this._runningChangedId = this._settings.connect(
-            'changed::running-steps', () => this._applyRunningHighlight());
+            'changed::running-steps', () => {
+                this._reportEditedStops();
+                this._applyRunningHighlight();
+            });
         // Both are painted by the same pass: the target only reads as a target
         // once you can see whether it is live.
         this._targetChangedId = this._settings.connect(
@@ -1551,6 +1593,32 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
 
     private _runningMacroIds(): string[] {
         return this._runningPaths().map(entry => entry.macro);
+    }
+
+    /**
+     * The shell stops a macro that is edited while it runs, because the run is
+     * walking the steps it started with and cannot be handed new ones. Say so:
+     * on its own, the highlight simply going out reads as a crash.
+     */
+    private _reportEditedStops(): void {
+        let edited: unknown;
+        try {
+            edited = (JSON.parse(this._settings.get_string('running-steps') || '{}') as
+                { edited?: unknown }).edited;
+        } catch {
+            return;
+        }
+        if (!Array.isArray(edited)) {
+            return;
+        }
+        for (const id of edited) {
+            if (typeof id !== 'string') {
+                continue;
+            }
+            const name = this._store.getMacro(id)?.name;
+            this._toast(`Stopped “${name ?? 'macro'}” — it changed while running. ` +
+                'Press play to run the new version.');
+        }
     }
 
     private _setRunState(entry: StepRow, state: 'idle' | 'active' | 'ancestor'): void {

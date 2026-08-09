@@ -67,6 +67,12 @@ export default class MacroclickwerkExtension extends Extension {
      * that run reports itself finished.
      */
     private _restarting = new Map<string, string>();
+    /**
+     * Macros just stopped because they were edited mid-run, waiting to be named
+     * in the next publish so the editor can say why rather than letting the
+     * highlight vanish on its own, which reads as a crash.
+     */
+    private _stoppedByEdit = new Set<string>();
     private _recorder?: Recorder;
     private _triggers?: TriggerEngine;
     private _popup?: MacroPopup;
@@ -144,7 +150,10 @@ export default class MacroclickwerkExtension extends Extension {
         this._problemsUnsubscribe = onProblemsChanged(() => this._updateIcon());
         this._updateIcon();
 
-        this._storeUnsubscribe = this._store.onChanged(() => {
+        this._storeUnsubscribe = this._store.onChanged((external, changed) => {
+            if (external) {
+                this._stopEditedRuns(changed);
+            }
             this._forgetDeletedRunners();
             this._popup?.refresh();
         });
@@ -393,7 +402,11 @@ export default class MacroclickwerkExtension extends Extension {
                 macro,
                 steps: path.map(entry => entry.id),
             })),
+            // Named once, on the first publish after the edit, so the editor
+            // can say why the highlight went out. See `_stopEditedRuns`.
+            edited: [...this._stoppedByEdit],
         }));
+        this._stoppedByEdit.clear();
     }
 
     // --- actions -----------------------------------------------------------
@@ -464,6 +477,33 @@ export default class MacroclickwerkExtension extends Extension {
     }
 
     /** Runners for macros that have since been deleted, gone with them. */
+    /**
+     * A run is a walk through the very step objects it started with, so an edit
+     * made in the settings window cannot reach it: the runner is holding the old
+     * document and would keep going by it to the end, which is why changing a
+     * step appeared to do nothing until the macro was restarted. Stopping is the
+     * honest answer, and it is the safe one — it also releases whatever the run
+     * was holding down, which is the part that matters when the edit lands
+     * between the two halves of a press. Press play to run the new version.
+     */
+    private _stopEditedRuns(changed: Set<string>): void {
+        let stopped = false;
+        for (const [id, runner] of this._runningMacros()) {
+            if (!changed.has(id)) {
+                continue;
+            }
+            runner.stop();
+            this._stoppedByEdit.add(id);
+            stopped = true;
+            this._onStatus(`Stopped “${this._store?.getMacro(id)?.name ?? 'macro'}” — it changed while running`);
+        }
+        if (stopped) {
+            // Ahead of the run unwinding: the toast belongs next to the edit
+            // that caused it, not a moment later.
+            this._publishRunningPaths();
+        }
+    }
+
     private _forgetDeletedRunners(): void {
         for (const [id, runner] of [...this._runners]) {
             if (!runner.running && !this._store?.getMacro(id)) {

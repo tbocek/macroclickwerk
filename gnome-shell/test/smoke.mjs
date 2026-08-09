@@ -4,6 +4,7 @@ import {
     resolveRecordTarget,
     resolveRunStart,
     macroEnabled,
+    changedDefinitions,
     STEP_KIND_LABELS, parseNumbers, reachesEnd, lastPointerEndpoint,
     AUTHORABLE_STEP_KINDS,
 } from '../dist/src/model.js';
@@ -448,6 +449,54 @@ check('objects-only ignores a stray yes', verdictFromObjects('yes, that is true'
 check('loopback localhost', isLoopbackEndpoint('http://localhost:11434/v1/chat/completions'));
 check('loopback 127', isLoopbackEndpoint('http://127.0.0.1:8080/v1/chat/completions'));
 check('not loopback', !isLoopbackEndpoint('http://192.168.1.5:11434/v1/chat/completions'));
+
+// --- what counts as editing a macro out from under its own run ---------------
+
+// The shell stops a run whose macro changed while it was going. The line
+// between "changed" and "someone touched the document" is what this draws:
+// too eager and renaming a macro kills a run in another one, too lax and the
+// edit still appears to do nothing until a restart.
+{
+    // One baseline, deep-copied per case: `newStep` mints a fresh id every call,
+    // so building the "same" document twice would differ in every step.
+    const base = [
+        { id: 'a', name: 'A', enabled: true, body: [newStep('click'), newStep('wait')] },
+        { id: 'b', name: 'B', enabled: true, body: [newStep('key')] },
+    ];
+    const doc = () => JSON.parse(JSON.stringify(base));
+
+    const same = changedDefinitions(doc(), doc());
+    check('an untouched document changes nobody', same.size === 0, [...same].join());
+
+    const renamed = doc();
+    renamed[0].name = 'A renamed';
+    renamed[1].enabled = false;
+    const cosmetic = changedDefinitions(doc(), renamed);
+    check('renaming and switching off leave the steps alone',
+          cosmetic.size === 0, [...cosmetic].join());
+
+    const edited = doc();
+    edited[0].body[0].holdMs = 900;
+    const one = changedDefinitions(doc(), edited);
+    check('an edited step names its own macro', one.has('a') && one.size === 1, [...one].join());
+
+    const deeper = doc();
+    deeper[1].body[0].code = 'KEY_Z';
+    const other = changedDefinitions(doc(), deeper);
+    check('and only its own — the macro beside it is untouched',
+          other.has('b') && !other.has('a'), [...other].join());
+
+    const shorter = doc();
+    shorter[0].body.pop();
+    check('losing a step counts', changedDefinitions(doc(), shorter).has('a'));
+
+    const gone = changedDefinitions(doc(), [doc()[1]]);
+    check('and so does the whole macro going', gone.has('a') && !gone.has('b'), [...gone].join());
+
+    const added = [...doc(), newMacro('C')];
+    check('a new macro disturbs nothing that was already running',
+          changedDefinitions(doc(), added).size === 0);
+}
 
 // problem log
 clearProblems();

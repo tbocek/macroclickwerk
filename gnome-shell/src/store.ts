@@ -7,6 +7,7 @@ import Gio from 'gi://Gio';
 import {
     Macro,
     MacroDocument,
+    changedDefinitions,
     macroEnabled,
     parseDocument,
     stringifyDocument,
@@ -30,7 +31,7 @@ export class MacroStore {
     private _doc: MacroDocument;
     private _changedId: number;
     private _writing = false;
-    private _listeners = new Set<(external: boolean) => void>();
+    private _listeners = new Set<(external: boolean, changed: Set<string>) => void>();
 
     constructor(settings: Gio.Settings) {
         this._settings = settings;
@@ -43,8 +44,9 @@ export class MacroStore {
             }
             // Written by the other process: every step object we handed out is
             // now stale, so listeners have to rebuild rather than refresh.
+            const before = this._doc.macros;
             this._doc = parseDocument(this._settings.get_string('macros'));
-            this._notify(true);
+            this._notify(true, changedDefinitions(before, this._doc.macros));
         });
     }
 
@@ -92,17 +94,21 @@ export class MacroStore {
 
     /**
      * Called whenever the document changes. `external` is true when the other
-     * process wrote it, which means the in-memory objects were replaced.
+     * process wrote it, which means the in-memory objects were replaced;
+     * `changed` then names the macros whose steps differ from the ones we had.
+     * Our own writes name nobody: we already know what we just did, and the
+     * recorder writing into a macro must not read as that macro being edited
+     * out from under itself.
      */
-    onChanged(listener: (external: boolean) => void): () => void {
+    onChanged(listener: (external: boolean, changed: Set<string>) => void): () => void {
         this._listeners.add(listener);
         return () => this._listeners.delete(listener);
     }
 
-    private _notify(external: boolean): void {
+    private _notify(external: boolean, changed = new Set<string>()): void {
         for (const listener of [...this._listeners]) {
             try {
-                listener(external);
+                listener(external, changed);
             } catch (error) {
                 reportProblem('Settings', `a change listener failed: ${(error as Error).message}`, {
                     error: error as Error,

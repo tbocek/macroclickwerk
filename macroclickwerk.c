@@ -287,7 +287,6 @@ static int classify(const unsigned int key_bits[], const unsigned int rel_bits[]
 
 static bool setup_event_type(int fdi, int fdo, unsigned long event_type, int max_val, const unsigned int array_bit[]) {
     struct uinput_abs_setup abs_setup = {};
-    bool abs_init_once = false;
 
     for (int i = 0; i < max_val; i++) {
         if (!(array_bit[i / 32] & (1U << (i % 32)))) {
@@ -314,22 +313,24 @@ static bool setup_event_type(int fdi, int fdo, unsigned long event_type, int max
                 }
                 break;
             case UI_SET_ABSBIT:
-                if (!abs_init_once) {
-                    abs_setup.code = i;
-                    if (ioctl(fdi, EVIOCGABS(i), &abs_setup.absinfo) < 0) {
-                        fprintf(stderr, "Failed to get ABS info for axis %d: %s\n", i, strerror(errno));
-                        continue;
-                    }
-                    if (ioctl(fdo, UI_ABS_SETUP, &abs_setup) < 0) {
-                        fprintf(stderr, "Failed to setup ABS axis %d: %s\n", i, strerror(errno));
-                        continue;
-                    }
-                    abs_init_once = true;
-                }
-
                 if (ioctl(fdo, UI_SET_ABSBIT, i) < 0) {
                     fprintf(stderr, "Cannot set ABS bit %d: %s\n", i, strerror(errno));
                     return false;
+                }
+                // Every axis carries its own range, so every axis needs its own
+                // copy of it. One copy for the whole device leaves the rest at
+                // the uinput default of 0..0, and a stick whose clone says
+                // 0..0 reads as centred however far it is actually pushed —
+                // the events arrive, and everything downstream divides them by
+                // a range of nothing.
+                abs_setup.code = i;
+                if (ioctl(fdi, EVIOCGABS(i), &abs_setup.absinfo) < 0) {
+                    fprintf(stderr, "Failed to get ABS info for axis %d: %s\n", i, strerror(errno));
+                    continue;
+                }
+                if (ioctl(fdo, UI_ABS_SETUP, &abs_setup) < 0) {
+                    fprintf(stderr, "Failed to setup ABS axis %d: %s\n", i, strerror(errno));
+                    continue;
                 }
                 break;
             case UI_SET_MSCBIT:

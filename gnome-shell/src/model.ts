@@ -282,6 +282,24 @@ export function macroEnabled(macro: Macro): boolean {
     return macro.enabled !== false;
 }
 
+/**
+ * Ids whose steps are no longer what they were, counting a macro that has gone
+ * from the document. Name and on/off are deliberately not in it: renaming a
+ * macro, or switching a different one off, says nothing about what this one is
+ * doing right now, and a run should survive both.
+ */
+export function changedDefinitions(before: Macro[], after: Macro[]): Set<string> {
+    const now = new Map(after.map(macro => [macro.id, JSON.stringify(macro.body)]));
+    const changed = new Set<string>();
+    for (const macro of before) {
+        // An id that is gone reads as `undefined` here, which no body matches.
+        if (now.get(macro.id) !== JSON.stringify(macro.body)) {
+            changed.add(macro.id);
+        }
+    }
+    return changed;
+}
+
 export interface MacroDocument {
     version: number;
     macros: Macro[];
