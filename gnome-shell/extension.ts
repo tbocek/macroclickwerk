@@ -414,7 +414,7 @@ export default class MacroclickwerkExtension extends Extension {
                 onFinished: (reason, error) => this._onFinished(macroId, reason, error),
                 onMacroControl: (action, target, at) => this._macroControl(action, target, at ?? ''),
                 macroName: id => this._store?.getMacro(id)?.name,
-                waitForInput: source => this._triggers?.waitFor(source),
+                waitForInput: (source, edge) => this._triggers?.waitFor(source, edge),
             });
         this._runners.set(macroId, runner);
         return runner;

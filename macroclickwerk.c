@@ -52,6 +52,7 @@
 
 #define CLASS_KEYBOARD 1
 #define CLASS_POINTER  2
+#define CLASS_GAMEPAD  4
 
 struct captured_device {
     char *path;
@@ -66,6 +67,7 @@ struct captured_device {
     char wanted[256];     // the -n name or -d path that owns this slot
     char realname[256];   // what the device called itself when it was opened
     char clone_node[32];  // the clone's /dev/input/eventN node
+    char clone_js[32];    // the clone's /dev/input/jsN node, gamepads only
     bool watched;         // something other than us is reading the clone
     int forward_failures; // forwards that failed and forced an ungrab
     bool grab_denied;     // last grab attempt failed; logged once, retried quietly
@@ -263,7 +265,8 @@ static bool has_bit(const unsigned int array[], int bit) {
 }
 
 // What a device is, judged by what it can say: something that types, something
-// that points, or neither — power buttons, lid switches and gamepads are 0.
+// that points, something with game buttons — or none of them: power buttons
+// and lid switches stay 0 and are left alone.
 static int classify(const unsigned int key_bits[], const unsigned int rel_bits[]) {
     int cls = 0;
     if (has_bit(key_bits, KEY_A) || has_bit(key_bits, KEY_ESC) || has_bit(key_bits, KEY_SPACE)) {
@@ -271,6 +274,13 @@ static int classify(const unsigned int key_bits[], const unsigned int rel_bits[]
     }
     if (has_bit(key_bits, BTN_LEFT) || has_bit(rel_bits, REL_X)) {
         cls |= CLASS_POINTER;
+    }
+    // BTN_SOUTH is the gamepad face button (A on an Xbox layout); BTN_TRIGGER
+    // marks the older joystick range. Either makes it a pad worth capturing —
+    // the clone mirrors its axes with their real ranges, so sticks and
+    // triggers pass through faithfully while grabbed.
+    if (has_bit(key_bits, BTN_SOUTH) || has_bit(key_bits, BTN_TRIGGER)) {
+        cls |= CLASS_GAMEPAD;
     }
     return cls;
 }
@@ -381,8 +391,10 @@ static bool mirror_capabilities(struct captured_device *d, int *cls_out) {
 
 // On top of the mirrored capabilities, enable everything we might ever inject
 // into a device of this class. Without this, injecting KEY_E into a mouse clone
-// silently does nothing.
-static bool add_injection_capabilities(int fdo, int cls) {
+// silently does nothing. `synthetic` marks a clone with no real device behind
+// it: only that one gets made-up axis ranges — a real pad's clone already
+// mirrored its own, and overwriting them would misreport every stick.
+static bool add_injection_capabilities(int fdo, int cls, bool synthetic) {
     if (ioctl(fdo, UI_SET_EVBIT, EV_SYN) < 0) {
         return false;
     }
@@ -391,10 +403,14 @@ static bool add_injection_capabilities(int fdo, int cls) {
         if (ioctl(fdo, UI_SET_EVBIT, EV_KEY) < 0) {
             return false;
         }
-        // All normal keys, skipping the BTN_* range so libinput keeps seeing a
-        // keyboard rather than some keyboard/pointer chimera.
+        // All normal keys, skipping both button ranges: the BTN_* block so
+        // libinput keeps seeing a keyboard rather than some keyboard/pointer
+        // chimera, and BTN_TRIGGER_HAPPY so joydev does not hang a js node on
+        // every keyboard clone — which had games listing the keyboards as
+        // phantom controllers.
         for (int code = KEY_ESC; code <= KEY_MAX; code++) {
-            if (code >= BTN_MISC && code < KEY_OK) {
+            if ((code >= BTN_MISC && code < KEY_OK) ||
+                (code >= BTN_TRIGGER_HAPPY && code <= BTN_TRIGGER_HAPPY40)) {
                 continue;
             }
             ioctl(fdo, UI_SET_KEYBIT, code);
@@ -416,6 +432,43 @@ static bool add_injection_capabilities(int fdo, int cls) {
         }
         for (size_t i = 0; i < sizeof(axes) / sizeof(axes[0]); i++) {
             ioctl(fdo, UI_SET_RELBIT, axes[i]);
+        }
+    }
+
+    if (cls & CLASS_GAMEPAD) {
+        if (ioctl(fdo, UI_SET_EVBIT, EV_KEY) < 0) {
+            return false;
+        }
+        // The whole joystick and gamepad button range: face buttons,
+        // shoulders, triggers, select/start/mode, stick clicks.
+        for (int code = BTN_JOYSTICK; code <= BTN_THUMBR; code++) {
+            ioctl(fdo, UI_SET_KEYBIT, code);
+        }
+        if (synthetic) {
+            // Sticks and the dpad hat, so the fallback pad reads as a whole
+            // gamepad and not a button box; same shape gamepad-emu builds.
+            if (ioctl(fdo, UI_SET_EVBIT, EV_ABS) < 0) {
+                return false;
+            }
+            struct uinput_abs_setup abs_setup = {};
+            for (int axis = ABS_X; axis <= ABS_RY; axis++) {
+                ioctl(fdo, UI_SET_ABSBIT, axis);
+                abs_setup.code = axis;
+                abs_setup.absinfo.minimum = -32768;
+                abs_setup.absinfo.maximum = 32767;
+                abs_setup.absinfo.fuzz = 16;
+                abs_setup.absinfo.flat = 128;
+                ioctl(fdo, UI_ABS_SETUP, &abs_setup);
+            }
+            for (int axis = ABS_HAT0X; axis <= ABS_HAT0Y; axis++) {
+                ioctl(fdo, UI_SET_ABSBIT, axis);
+                abs_setup.code = axis;
+                abs_setup.absinfo.minimum = -1;
+                abs_setup.absinfo.maximum = 1;
+                abs_setup.absinfo.fuzz = 0;
+                abs_setup.absinfo.flat = 0;
+                ioctl(fdo, UI_ABS_SETUP, &abs_setup);
+            }
         }
     }
     return true;
@@ -453,7 +506,7 @@ static bool create_clone(struct captured_device *d, const char *name, int forced
     }
     d->cls = cls;
 
-    if (!add_injection_capabilities(d->fdo, cls)) {
+    if (!add_injection_capabilities(d->fdo, cls, d->fdi < 0)) {
         fprintf(stderr, "Error: Failed to add injection capabilities to [%s]: %s.\n", name, strerror(errno));
         goto fail;
     }
@@ -468,6 +521,7 @@ static bool create_clone(struct captured_device *d, const char *name, int forced
     // is safe. Failing to resolve it just means this device is never grabbed,
     // which errs on the side that keeps input flowing.
     d->clone_node[0] = '\0';
+    d->clone_js[0] = '\0';
     char sysname[64] = "";
     if (ioctl(d->fdo, UI_GET_SYSNAME(sizeof(sysname)), sysname) >= 0) {
         char sysdir[128];
@@ -476,12 +530,17 @@ static bool create_clone(struct captured_device *d, const char *name, int forced
         if (dir) {
             struct dirent *entry;
             while ((entry = readdir(dir)) != NULL) {
+                // %.15s: a node name is "event"/"js" plus a number; the
+                // precision only bounds the compiler's worst case.
                 if (strncmp(entry->d_name, "event", 5) == 0) {
-                    // %.15s: an event node name is "event" plus a number; the
-                    // precision only bounds the compiler's worst case.
                     snprintf(d->clone_node, sizeof(d->clone_node),
                              "/dev/input/%.15s", entry->d_name);
-                    break;
+                } else if (entry->d_name[0] == 'j' && entry->d_name[1] == 's') {
+                    // A pad clone also gets a joydev node, and older games
+                    // read that one; a reader there wants the grab just as
+                    // much as a reader on the event node.
+                    snprintf(d->clone_js, sizeof(d->clone_js),
+                             "/dev/input/%.15s", entry->d_name);
                 }
             }
             closedir(dir);
@@ -594,6 +653,10 @@ static struct captured_device *device_for(unsigned int type, unsigned int code) 
     int want;
     if (type == EV_REL || type == EV_ABS) {
         want = CLASS_POINTER;
+    } else if (type == EV_KEY && code >= BTN_JOYSTICK && code <= BTN_THUMBR) {
+        // Checked before the pointer range, which contains it: BTN_SOUTH and
+        // friends belong to the pad, not to a mouse that happens to exist.
+        want = CLASS_GAMEPAD;
     } else if (type == EV_KEY && code >= BTN_MISC && code < KEY_OK) {
         want = CLASS_POINTER;
     } else if (type == EV_KEY) {
@@ -714,7 +777,7 @@ static enum MHD_Result send_status(struct MHD_Connection *connection) {
     pthread_mutex_lock(&devices_mutex);
     for (int i = 0; i < device_count && off < sizeof(devs) - 1; i++) {
         int n = snprintf(devs + off, sizeof(devs) - off,
-                         "%s{\"index\":%d,\"name\":\"%s\",\"path\":\"%s\",\"grabbed\":%s,\"alive\":%s,\"watched\":%s,\"wanted\":\"%s\",\"keyboard\":%s,\"pointer\":%s}",
+                         "%s{\"index\":%d,\"name\":\"%s\",\"path\":\"%s\",\"grabbed\":%s,\"alive\":%s,\"watched\":%s,\"wanted\":\"%s\",\"keyboard\":%s,\"pointer\":%s,\"gamepad\":%s}",
                          i ? "," : "",
                          devices[i].index,
                          devices[i].name,
@@ -724,7 +787,8 @@ static enum MHD_Result send_status(struct MHD_Connection *connection) {
                          devices[i].watched ? "true" : "false",
                          devices[i].wanted,
                          (devices[i].cls & CLASS_KEYBOARD) ? "true" : "false",
-                         (devices[i].cls & CLASS_POINTER) ? "true" : "false");
+                         (devices[i].cls & CLASS_POINTER) ? "true" : "false",
+                         (devices[i].cls & CLASS_GAMEPAD) ? "true" : "false");
         if (n < 0) {
             break;
         }
@@ -1081,10 +1145,11 @@ static bool setup_device(const char *path, const char *wanted) {
     // stderr, not stdout: the unit sends stdout to /dev/null, and what was
     // actually captured is the first thing you want to see when a device turns
     // out to be missing.
-    fprintf(stderr, "macroclickwerk: captured %s%s%s\n",
+    fprintf(stderr, "macroclickwerk: captured %s%s%s%s\n",
             path,
             (d->cls & CLASS_KEYBOARD) ? " [keys]" : "",
-            (d->cls & CLASS_POINTER) ? " [pointer]" : "");
+            (d->cls & CLASS_POINTER) ? " [pointer]" : "",
+            (d->cls & CLASS_GAMEPAD) ? " [pad]" : "");
 
     d->alive = true;
     device_count++;
@@ -1348,12 +1413,14 @@ static void scan_clone_watchers(void) {
                 continue;
             }
             target[n] = '\0';
-            if (strncmp(target, "/dev/input/event", 16) != 0) {
+            if (strncmp(target, "/dev/input/", 11) != 0) {
                 continue;
             }
             for (int i = 0; i < device_count; i++) {
-                if (devices[i].clone_node[0] != '\0' &&
-                    strcmp(target, devices[i].clone_node) == 0) {
+                if ((devices[i].clone_node[0] != '\0' &&
+                     strcmp(target, devices[i].clone_node) == 0) ||
+                    (devices[i].clone_js[0] != '\0' &&
+                     strcmp(target, devices[i].clone_js) == 0)) {
                     watched[i] = true;
                 }
             }
@@ -1564,7 +1631,8 @@ int main(int argc, char *argv[]) {
     }
 
     if (!ensure_class(CLASS_KEYBOARD, "Macroclickwerk Virtual Keyboard") ||
-        !ensure_class(CLASS_POINTER, "Macroclickwerk Virtual Mouse")) {
+        !ensure_class(CLASS_POINTER, "Macroclickwerk Virtual Mouse") ||
+        !ensure_class(CLASS_GAMEPAD, "Macroclickwerk Virtual Gamepad")) {
         release_devices();
         return EXIT_FAILURE;
     }

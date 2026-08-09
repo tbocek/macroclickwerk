@@ -120,29 +120,42 @@ export function dispatch(
     }
 }
 
-/** A run parked on an `onevent` step, waiting for its code to be pressed. */
+/** A run parked on an `onevent` step, waiting for its code. */
 export interface Waiter {
     code: number;
-    /** Fired with true on the press, false when the wait was called off. */
+    /**
+     * What wakes this waiter. 'click' wakes on the press and the engine then
+     * swallows the release as part of the gesture. 'split' wakes on the next
+     * edge whichever it is — which is what lets two split steps in a row
+     * bracket one hold: the first catches the press, the second the release.
+     * 'press' and 'release' are the fixed halves, kept for older documents.
+     */
+    edge: 'click' | 'split' | 'press' | 'release';
+    /** Fired with true on the wake, false when the wait was called off. */
     resolve: (fired: boolean) => void;
 }
 
 /**
- * Remove and return every waiter the event wakes. Waiters outrank configured
- * triggers for the same code: a run that is explicitly parked on this click is
- * more specific than a standing remap, and firing both would act twice on one
- * press. Releases (value 0) and autorepeat wake nobody.
+ * Remove and return every waiter the event wakes: click and press waiters on
+ * value 1, release waiters on value 0, split waiters on either edge, and
+ * autorepeat wakes nobody. Waiters outrank configured triggers for the same
+ * code — a run explicitly parked on this click is more specific than a
+ * standing remap, and firing both would act twice on one press.
  */
 export function claimWaiters(waiters: Waiter[], event: StreamedEvent): Waiter[] {
-    if (!event.trig || event.type !== EV_KEY || event.value !== 1) {
+    if (!event.trig || event.type !== EV_KEY ||
+        (event.value !== 0 && event.value !== 1)) {
         return [];
     }
-    const claimed = waiters.filter(waiter => waiter.code === event.code);
+    const wakes = (waiter: Waiter) => waiter.code === event.code &&
+        (waiter.edge === 'split' ||
+            (event.value === 0 ? waiter.edge === 'release' : waiter.edge !== 'release'));
+    const claimed = waiters.filter(wakes);
     if (claimed.length > 0) {
-        // Every run waiting on this code wakes: two macros parked on the same
-        // button are both asking "when it is clicked", and it was.
+        // Every run waiting on this edge wakes: two macros parked on the same
+        // button are both asking the same question, and it was answered.
         for (let i = waiters.length - 1; i >= 0; i--) {
-            if (waiters[i].code === event.code) {
+            if (wakes(waiters[i])) {
                 waiters.splice(i, 1);
             }
         }
@@ -159,6 +172,8 @@ export class TriggerEngine {
     private _actions: TriggerActions;
     private _byCode = new Map<number, Trigger>();
     private _waiters: Waiter[] = [];
+    /** Codes whose release is still owed to a click-mode wake. */
+    private _draining = new Set<number>();
     private _retryId = 0;
     private _destroyed = false;
 
@@ -175,19 +190,26 @@ export class TriggerEngine {
     }
 
     /**
-     * Park a run until `source` is pressed; the press is consumed. The promise
-     * resolves true on the press and false when cancelled, and never rejects —
-     * being woken for nothing is a normal way for a wait to end (the run was
-     * stopped). Returns null for a source that names no real button or key.
+     * Park a run until the chosen edge of `source` — pressed, or released.
+     * While anything waits on a code, the daemon consumes both of its edges:
+     * the button belongs to the macro for the duration, so a run waiting on
+     * the release is not surprised by the press doing its normal job first.
+     * The promise resolves true on the edge and false when cancelled, and
+     * never rejects — being woken for nothing is a normal way for a wait to
+     * end (the run was stopped). Returns null for a source that names no real
+     * button or key.
      */
-    waitFor(source: string): { promise: Promise<boolean>; cancel: () => void } | null {
+    waitFor(
+        source: string,
+        edge: 'click' | 'split' | 'press' | 'release' = 'click',
+    ): { promise: Promise<boolean>; cancel: () => void } | null {
         const code = sourceCode(source);
         if (code === null) {
             return null;
         }
         let waiter!: Waiter;
         const promise = new Promise<boolean>(resolve => {
-            waiter = { code, resolve };
+            waiter = { code, edge, resolve };
             this._waiters.push(waiter);
         });
         this._refresh();
@@ -205,12 +227,43 @@ export class TriggerEngine {
     }
 
     handle(event: StreamedEvent): void {
+        // A click-mode wake left its release in flight: it belongs to that
+        // click, so it is swallowed here and the code freed once it arrives —
+        // unless a run has since parked on exactly that release, in which
+        // case the event is its wake-up, not litter.
+        if (event.type === EV_KEY && this._draining.has(event.code)) {
+            const claimedByWaiter = event.value === 0 &&
+                this._waiters.some(waiter => waiter.code === event.code &&
+                    (waiter.edge === 'release' || waiter.edge === 'split'));
+            if (event.value === 0) {
+                this._draining.delete(event.code);
+            }
+            if (!claimedByWaiter) {
+                if (event.value === 0) {
+                    this._refresh();
+                }
+                return;
+            }
+            // Fall through: claimWaiters below hands it to the parked run.
+        }
         const woken = claimWaiters(this._waiters, event);
         if (woken.length > 0) {
+            // A click is the press plus its release; a woken click waiter
+            // leaves the release to be drained rather than delivered.
+            if (woken.some(waiter => waiter.edge === 'click')) {
+                this._draining.add(event.code);
+            }
             for (const waiter of woken) {
                 waiter.resolve(true);
             }
             this._refresh();
+            return;
+        }
+        // A waiter on either edge of this code owns the whole button: the
+        // other edge must not fall through to a standing trigger while a
+        // macro is in the middle of a press-and-release conversation with it.
+        if (event.type === EV_KEY &&
+            this._waiters.some(waiter => waiter.code === event.code)) {
             return;
         }
         dispatch(this._byCode, event, this._actions);
@@ -219,6 +272,7 @@ export class TriggerEngine {
     destroy(): void {
         this._destroyed = true;
         this._byCode.clear();
+        this._draining.clear();
         for (const waiter of this._waiters.splice(0)) {
             waiter.resolve(false);
         }
@@ -244,9 +298,14 @@ export class TriggerEngine {
         void this._connect();
     }
 
-    /** Everything currently worth consuming: standing triggers and parked runs. */
+    /** Everything currently worth consuming: standing triggers, parked runs,
+     * and clicks whose release has not landed yet. */
     private _codes(): number[] {
-        return [...new Set([...this._byCode.keys(), ...this._waiters.map(waiter => waiter.code)])];
+        return [...new Set([
+            ...this._byCode.keys(),
+            ...this._waiters.map(waiter => waiter.code),
+            ...this._draining,
+        ])];
     }
 
     private async _connect(): Promise<void> {

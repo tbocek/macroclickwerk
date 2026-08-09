@@ -27,6 +27,18 @@ export const BUTTON_CODES: Record<MouseButton, number> = {
     extra: BTN_EXTRA,
 };
 
+/**
+ * Gamepad buttons, evdev names to codes. Kernel names, not layout names: on
+ * an Xbox layout BTN_SOUTH is A but BTN_NORTH is Y — the labels the editor
+ * shows carry both spellings so nobody has to know that.
+ */
+export const GAMEPAD_CODES: Record<string, number> = {
+    BTN_SOUTH: 0x130, BTN_EAST: 0x131, BTN_C: 0x132, BTN_NORTH: 0x133,
+    BTN_WEST: 0x134, BTN_Z: 0x135, BTN_TL: 0x136, BTN_TR: 0x137,
+    BTN_TL2: 0x138, BTN_TR2: 0x139, BTN_SELECT: 0x13a, BTN_START: 0x13b,
+    BTN_MODE: 0x13c, BTN_THUMBL: 0x13d, BTN_THUMBR: 0x13e,
+};
+
 export const KEY_CODES: Record<string, number> = {
     KEY_ESC: 1,
     KEY_1: 2, KEY_2: 3, KEY_3: 4, KEY_4: 5, KEY_5: 6,
@@ -72,6 +84,9 @@ for (const [name, code] of Object.entries(KEY_CODES)) {
 for (const [button, code] of Object.entries(BUTTON_CODES)) {
     CODE_TO_NAME.set(code, `BTN_${button.toUpperCase()}`);
 }
+for (const [name, code] of Object.entries(GAMEPAD_CODES)) {
+    CODE_TO_NAME.set(code, name);
+}
 
 export function keyName(code: number): string {
     return CODE_TO_NAME.get(code) ?? `CODE_${code}`;
@@ -80,6 +95,9 @@ export function keyName(code: number): string {
 export function keyCode(name: string): number | null {
     if (name in KEY_CODES) {
         return KEY_CODES[name];
+    }
+    if (name in GAMEPAD_CODES) {
+        return GAMEPAD_CODES[name];
     }
     const upper = `KEY_${name.toUpperCase()}`;
     return upper in KEY_CODES ? KEY_CODES[upper] : null;

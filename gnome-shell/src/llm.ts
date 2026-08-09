@@ -28,6 +28,25 @@ export interface Verdict {
 export class LlmError extends Error {}
 
 /**
+ * The server's own words when it sent any, not the whole JSON envelope: an
+ * OpenAI-style error arrives as {"error":{"message":"model 'X' not found"}},
+ * and repeating that raw in every problem row buried the one line that says
+ * what is wrong.
+ */
+function httpErrorText(status: number, body: string): string {
+    try {
+        const parsed = JSON.parse(body) as { error?: { message?: string } | string };
+        const message = typeof parsed.error === 'string' ? parsed.error : parsed.error?.message;
+        if (message) {
+            return `HTTP ${status}: ${message.slice(0, 200)}`;
+        }
+    } catch {
+        // Not JSON — the raw slice is all there is.
+    }
+    return `HTTP ${status}: ${body.slice(0, 200)}`;
+}
+
+/**
  * Deliberately blunt and repetitive. Small local vision models drift away from
  * a loose format immediately: they answer in prose, wrap JSON in a code fence,
  * or put the string "yes" where a boolean belongs. Spelling out the exact shape
@@ -328,7 +347,7 @@ export class LlmClient {
                     this._jsonMode = false;
                     return this.ask(prompt, image, settings);
                 }
-                throw new LlmError(`HTTP ${status}: ${text.slice(0, 200)}`);
+                throw new LlmError(httpErrorText(status, text));
             }
 
             let content = '';

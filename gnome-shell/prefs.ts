@@ -5,6 +5,7 @@ import Adw from 'gi://Adw';
 import Gdk from 'gi://Gdk';
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
+import GObject from 'gi://GObject';
 import Gtk from 'gi://Gtk';
 import Pango from 'gi://Pango';
 
@@ -12,6 +13,7 @@ import { ExtensionPreferences, gettext as _ } from 'resource:///org/gnome/Shell/
 
 import {
     CONDITION_TYPE_LABELS,
+    GAMEPAD_BUTTONS,
     AUTHORABLE_STEP_KINDS as STEP_KINDS,
     STEP_KIND_LABELS,
     type ClickStep,
@@ -31,6 +33,7 @@ import {
     findStep,
     macroEnabled,
     moveStepNested,
+    moveStepTo,
     newCondition,
     newId,
     newMacro,
@@ -110,6 +113,7 @@ const STEP_ICONS: Record<StepKind, string> = {
     scroll: 'view-sort-descending-symbolic',
     key: 'input-keyboard-symbolic',
     text: 'insert-text-symbolic',
+    pad: 'input-gaming-symbolic',
     wait: 'alarm-symbolic',
     onevent: 'input-touchpad-symbolic',   // a press coming *in*: the step that waits for one
     loop: 'media-playlist-repeat-symbolic',
@@ -157,7 +161,7 @@ const keyActionLabels = (): Record<string, string> => ({
  * drag the session with it — from a window that has no Stop. `break` and the
  * rest only mean something inside a run, so on their own they do nothing.
  */
-const RUNNABLE_ALONE: StepKind[] = ['click', 'move', 'scroll', 'key', 'text', 'wait'];
+const RUNNABLE_ALONE: StepKind[] = ['click', 'move', 'scroll', 'key', 'text', 'pad', 'wait'];
 
 /**
  * Only `then` and `else` get a header row of their own — a loop has one body
@@ -233,7 +237,32 @@ const EDITOR_CSS = `
     box-shadow: inset 4px 0 0 @error_color;
 }
 .macroclickwerk-recording-now-block { box-shadow: inset 4px 0 0 @error_color; }
+
+/* The two nudge arrows stack into one button's footprint. */
+.macroclickwerk-nudge button { min-height: 14px; min-width: 24px; padding: 0 4px; }
+
+/* − and + as slim as a spin button's own, which is what they stand in for. */
+.macroclickwerk-spin > button { min-width: 20px; padding-left: 5px; padding-right: 5px; }
+
+/* The grip whispers until the pointer is near it. */
+.macroclickwerk-grip { opacity: 0.4; }
+row:hover .macroclickwerk-grip { opacity: 1; }
+
+/* Where a drag would land: a line above or below, or the container filled. */
+.macroclickwerk-drop-above { box-shadow: inset 0 3px 0 @accent_bg_color; }
+.macroclickwerk-drop-below { box-shadow: inset 0 -3px 0 @accent_bg_color; }
+.macroclickwerk-drop-into  { background-color: alpha(@accent_bg_color, 0.25); }
 `;
+
+/** Hovering a drag over a folded container this long springs it open. */
+const SPRING_OPEN_MS = 600;
+
+/** Where a drop would land, relative to the row under the pointer. */
+type DropZone = 'before' | 'after' | 'into';
+
+const DROP_CLASSES = [
+    'macroclickwerk-drop-above', 'macroclickwerk-drop-below', 'macroclickwerk-drop-into',
+];
 
 /** How far a step inside a body sits in from the rail of that body. */
 const INDENT_PX = 12;
@@ -326,30 +355,106 @@ function comboRow<T extends string>(
  * another setting instead of on a line of its own. Whole numbers only — every
  * one of these counts something: milliseconds, pixels, how far off a colour is.
  */
+/** 10^(digits before the point − 1): the size of one leading-digit step. */
+function magnitudeOf(value: number): number {
+    return Math.pow(10, Math.floor(Math.log10(value) + 1e-9));
+}
+
+/**
+ * One leading digit at the current size is what a nudge moves by: 1 ms steps
+ * under 10 ms, 10 ms steps to 90 ms, 100 ms steps under a second, whole
+ * seconds to 9 s, tens to 90 s, and so on for as long as the range runs —
+ * the finer the value, the finer the nudge. Off-band values round onto the
+ * band in the direction pressed, and crossing a boundary lands exactly on it:
+ * down from 100 is 90, not 0.
+ */
+function bandedUp(value: number): number {
+    if (value < 0) {
+        return -bandedDown(-value);
+    }
+    if (value === 0) {
+        return 1;
+    }
+    const step = magnitudeOf(value);
+    return (Math.floor(value / step + 1e-9) + 1) * step;
+}
+
+function bandedDown(value: number): number {
+    if (value < 0) {
+        return -bandedUp(-value);
+    }
+    if (value <= 1) {
+        return 0;
+    }
+    const step = magnitudeOf(Math.max(value - 1, 1));
+    return (Math.ceil(value / step - 1e-9) - 1) * step;
+}
+
+/**
+ * A number with − and + beside it. Not a GtkSpinButton: the whole point is
+ * the banded stepping above, and a spin button's increment is fixed per
+ * widget, not per press.
+ */
 function spinSuffix(
     value: number,
     lower: number,
     upper: number,
-    step: number,
     tooltip: string,
     onChange: (value: number) => void,
-): Gtk.SpinButton {
-    const spin = new Gtk.SpinButton({
-        adjustment: new Gtk.Adjustment({
-            lower, upper, stepIncrement: step, pageIncrement: step * 10, value,
-        }),
+): Gtk.Widget {
+    const clamp = (v: number) => Math.max(lower, Math.min(upper, Math.round(v)));
+    let current = clamp(value);
+
+    const entry = new Gtk.Entry({
+        text: `${current}`,
         tooltip_text: tooltip,
         valign: Gtk.Align.CENTER,
-        numeric: true,
+        xalign: 1,
+        input_purpose: Gtk.InputPurpose.DIGITS,
         // Sized to the largest number it can hold, plus a minus sign where
-        // there can be one, but capped: a wait may run to an hour, and a field
-        // sized for 3600000 is a wide field on every row that a wait is not.
-        // Past the cap it scrolls — the value stays whole, only its widest end
-        // is out of view, and that end is the rare one.
-        width_chars: Math.min(5, Math.max(3, `${upper}`.length + (lower < 0 ? 1 : 0))),
+        // there can be one, but capped at four digits: a wait may run to an
+        // hour, and a field sized for 3600000 is a wide field on every row
+        // that a wait is not. Past the cap it scrolls — the value stays whole,
+        // only its widest end is out of view, and that end is the rare one.
+        width_chars: Math.min(4, Math.max(3, `${upper}`.length + (lower < 0 ? 1 : 0))),
+        max_width_chars: Math.min(4, Math.max(3, `${upper}`.length + (lower < 0 ? 1 : 0))),
     });
-    spin.connect('value-changed', () => onChange(spin.get_value_as_int()));
-    return spin;
+
+    /** What the field says right now, for the nudge to step from — the typed
+     * text when it parses, the last good value when it does not. */
+    const read = () => {
+        const parsed = Number.parseInt(entry.get_text() ?? '', 10);
+        return Number.isFinite(parsed) ? clamp(parsed) : current;
+    };
+    const commit = (next: number) => {
+        current = clamp(next);
+        entry.set_text(`${current}`);
+        onChange(current);
+    };
+    // Typing commits after a pause, so half-typed numbers do not fire.
+    const typed = debounce(() => {
+        const parsed = Number.parseInt(entry.get_text() ?? '', 10);
+        if (Number.isFinite(parsed) && clamp(parsed) === parsed && parsed !== current) {
+            current = parsed;
+            onChange(current);
+        }
+    });
+    entry.connect('changed', typed);
+    entry.connect('activate', () => commit(read()));
+
+    const minus = new Gtk.Button({ label: '−', tooltip_text: tooltip });
+    const plus = new Gtk.Button({ label: '+', tooltip_text: tooltip });
+    minus.connect('clicked', () => commit(bandedDown(read())));
+    plus.connect('clicked', () => commit(bandedUp(read())));
+
+    const box = new Gtk.Box({
+        valign: Gtk.Align.CENTER,
+        css_classes: ['linked', 'macroclickwerk-spin'],
+    });
+    box.append(entry);
+    box.append(minus);
+    box.append(plus);
+    return box;
 }
 
 /**
@@ -612,6 +717,11 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
     private _settingsPages: Adw.PreferencesPage[] = [];
     private _triggersGroup!: Adw.PreferencesGroup;
     private _triggerRows: Adw.ActionRow[] = [];
+    // Drag state: the row currently painted as the drop spot, and the folded
+    // container a hovering drag is about to spring open.
+    private _dropHighlight: Gtk.Widget | null = null;
+    private _springId = 0;
+    private _springRow: Adw.ExpanderRow | null = null;
 
     /**
      * One text field for a group of related numbers — a point, an offset, a
@@ -1241,22 +1351,130 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
         return !!row && row.get_visible() && row.get_expanded();
     }
 
+    // --- drag and drop ------------------------------------------------------
+
     /**
-     * Clicking a row selects it, and a recording goes there: after a step, or
-     * into a body. The click is watched on the way down rather than on the way
-     * up, and the sequence is never claimed, so the row still does whatever it
-     * did before — a step still folds open, a button still fires. Rows nest, and
-     * capture order runs outermost first, so the innermost row you actually
-     * clicked is the one that has the last word.
-     *
-     * There is one selection across every macro, so selecting here also says
-     * which macro is the one being worked on — the shell records into that one.
+     * The GNOME grip: drag it and the whole step comes along, subtree and all
+     * — an `if` moves with both its branches, which is the only thing moving
+     * an `if` can mean. The grip is the one drag handle so nothing else on a
+     * row ever starts a drag by accident, and rows without one (Yes/No
+     * headers, add rows) are visibly places rather than things.
      */
-    private _selectable(row: Gtk.Widget, target: string, macroId: string): void {
-        const click = new Gtk.GestureClick();
-        click.set_propagation_phase(Gtk.PropagationPhase.CAPTURE);
-        click.connect('pressed', () => this._selectTarget(macroId, target));
-        row.add_controller(click);
+    private _grip(macro: Macro, step: Step, row: Gtk.Widget): Gtk.Widget {
+        const grip = new Gtk.Image({
+            icon_name: 'list-drag-handle-symbolic',
+            valign: Gtk.Align.CENTER,
+            css_classes: ['macroclickwerk-grip'],
+            tooltip_text: _('Drag to move this step; what is inside moves with it'),
+        });
+        grip.set_cursor_from_name('grab');
+        const source = new Gtk.DragSource({ actions: Gdk.DragAction.MOVE });
+        source.connect('prepare', () =>
+            Gdk.ContentProvider.new_for_value(`${macro.id} ${step.id}`));
+        source.connect('drag-begin', () => {
+            // The row itself as the drag image, so what floats under the
+            // pointer is what was picked up.
+            source.set_icon(new Gtk.WidgetPaintable({ widget: row }), 12, 12);
+        });
+        grip.add_controller(source);
+        return grip;
+    }
+
+    /**
+     * Accept step drops on a row. `zone` maps where the pointer is (0 top … 1
+     * bottom) to what a drop there means; `place` turns that into a spot in
+     * the document, resolved at drop time so it is read against the current
+     * tree, not the one from when the row was built. A `springRow` folds open
+     * after a moment of hovering, so a drop can reach into closed containers.
+     */
+    private _droppable(
+        row: Gtk.Widget,
+        macro: Macro,
+        zone: (fraction: number) => DropZone | null,
+        place: (where: DropZone) => { list: Step[]; at: number } | null,
+        springRow?: Adw.ExpanderRow,
+    ): void {
+        const target = Gtk.DropTarget.new(GObject.TYPE_STRING, Gdk.DragAction.MOVE);
+        target.connect('motion', (_target, _x, y) => {
+            const where = zone(y / Math.max(1, row.get_height()));
+            this._paintDrop(row, where);
+            if (springRow && !springRow.get_expanded()) {
+                this._armSpring(springRow);
+            }
+            return where ? Gdk.DragAction.MOVE : 0;
+        });
+        target.connect('leave', () => {
+            this._paintDrop(row, null);
+            this._disarmSpring();
+        });
+        target.connect('drop', (_target, value, _x, y) => {
+            this._paintDrop(row, null);
+            this._disarmSpring();
+            const [macroId, stepId] = String(value).split(' ');
+            if (macroId !== macro.id) {
+                return false;   // each card is one document; no reaching across
+            }
+            const where = zone(y / Math.max(1, row.get_height()));
+            const dest = where ? place(where) : null;
+            if (!dest || !moveStepTo(macro.body, stepId, dest.list, dest.at)) {
+                return false;   // e.g. a loop dropped into its own body
+            }
+            this._saveAndRebuild();
+            return true;
+        });
+        row.add_controller(target);
+    }
+
+    private _paintDrop(row: Gtk.Widget, where: DropZone | null): void {
+        if (this._dropHighlight && this._dropHighlight !== row) {
+            for (const cls of DROP_CLASSES) {
+                this._dropHighlight.remove_css_class(cls);
+            }
+        }
+        for (const cls of DROP_CLASSES) {
+            row.remove_css_class(cls);
+        }
+        if (where) {
+            row.add_css_class(where === 'before' ? 'macroclickwerk-drop-above'
+                : where === 'after' ? 'macroclickwerk-drop-below'
+                    : 'macroclickwerk-drop-into');
+            this._dropHighlight = row;
+        } else {
+            this._dropHighlight = null;
+        }
+    }
+
+    private _armSpring(row: Adw.ExpanderRow): void {
+        if (this._springRow === row) {
+            return;
+        }
+        this._disarmSpring();
+        this._springRow = row;
+        this._springId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, SPRING_OPEN_MS, () => {
+            this._springId = 0;
+            this._springRow = null;
+            row.set_expanded(true);
+            return GLib.SOURCE_REMOVE;
+        });
+    }
+
+    private _disarmSpring(): void {
+        if (this._springId) {
+            GLib.source_remove(this._springId);
+            this._springId = 0;
+        }
+        this._springRow = null;
+    }
+
+    /**
+     * Rows are not clicked into a selection any more — placing things is what
+     * dragging is for, and the roaming red mark repainted the rails on every
+     * click. But the mark itself still has moments: a paused run writes where
+     * it continues, a recording lands somewhere, and both are shown on the row
+     * in question. So rows only register under their target names here, for
+     * the painter to find.
+     */
+    private _selectable(row: Gtk.Widget, target: string, _macroId: string): void {
         this._targetRows.set(target, row);
     }
 
@@ -1460,6 +1678,9 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
 
         const addRow = this._addStepRow(macro.body, macro.id, null, null);
         this._selectable(addRow, `end:${macro.id}`, macro.id);
+        this._droppable(addRow, macro,
+            () => 'into',
+            () => ({ list: macro.body, at: macro.body.length }));
 
         for (const step of macro.body) {
             for (const widget of this._buildStepWidgets(macro, step)) {
@@ -1527,9 +1748,10 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
                 ? `${_('empty — this repeat is skipped')} — ${_(BRANCH_STYLE.body.hint)}`
                 : `${this._countLabel(step.body.length)} — ${_(BRANCH_STYLE.body.hint)}`);
         } else if (step.kind === 'if') {
-            // No first, in the order the two blocks are drawn below it.
-            parts.push(`${this._countLabel((step.else ?? []).length)} ${_('else')}, ` +
-                `${this._countLabel(step.then.length)} ${_('then')}`);
+            // No first, in the order the two blocks are drawn below it — and
+            // in the blocks' own words, which say Yes and No, not then/else.
+            parts.push(`${this._countLabel((step.else ?? []).length)} ${_('if no')}, ` +
+                `${this._countLabel(step.then.length)} ${_('if yes')}`);
         }
         return parts.join(' — ');
     }
@@ -1579,9 +1801,31 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
         // whether the step had settings to fold open.
         const prefixes = new Gtk.Box({ spacing: 6, valign: Gtk.Align.CENTER });
         const suffixes = new Gtk.Box({ spacing: 0, valign: Gtk.Align.CENTER });
+        prefixes.append(this._grip(macro, step, row));
         prefixes.append(icon);
         row.add_prefix(prefixes);
         row.add_suffix(suffixes);
+
+        // Dropping on a step: the top half means before it, the bottom half
+        // after it — or, for a loop holding its own body, into that body,
+        // since its steps render directly beneath this row anyway.
+        this._droppable(row, macro,
+            fraction => {
+                if (inline) {
+                    return fraction < 0.5 ? 'before' : 'into';
+                }
+                return fraction < 0.5 ? 'before' : 'after';
+            },
+            where => {
+                if (where === 'into') {
+                    return children.length > 0 ? { list: children[0].steps, at: 0 } : null;
+                }
+                const loc = findStep(macro.body, step.id);
+                return loc
+                    ? { list: loc.list, at: loc.index + (where === 'after' ? 1 : 0) }
+                    : null;
+            },
+            inline && row instanceof Adw.ExpanderRow ? row : undefined);
         this._stepRows.set(step.id, {
             row,
             icon,
@@ -1648,7 +1892,7 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
                     retitle();
                     this._save();
                 }));
-            suffixes.append(spinSuffix(step.holdMs ?? 20, 0, 10000, 5,
+            suffixes.append(spinSuffix(step.holdMs ?? 20, 0, 10000,
                 _('How long the button stays down, in milliseconds'), value => {
                     step.holdMs = value;
                     this._save();
@@ -1664,7 +1908,7 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
                     retitle();
                     this._save();
                 }));
-            suffixes.append(spinSuffix(step.holdMs ?? 20, 0, 10000, 5,
+            suffixes.append(spinSuffix(step.holdMs ?? 20, 0, 10000,
                 _('How long the key stays down, in milliseconds'), value => {
                     step.holdMs = value;
                     this._save();
@@ -1672,9 +1916,31 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
             break;
 
         case 'text':
-            suffixes.append(spinSuffix(step.delayMs ?? 12, 0, 1000, 1,
+            suffixes.append(spinSuffix(step.delayMs ?? 12, 0, 1000,
                 _('Delay between keys, in milliseconds'), value => {
                     step.delayMs = value;
+                    this._save();
+                }));
+            break;
+
+        // The pad's click: which button, what to do with it, for how long —
+        // the same three words a key press has.
+        case 'pad':
+            suffixes.append(chooser(Object.keys(GAMEPAD_BUTTONS), GAMEPAD_BUTTONS, step.button,
+                _('Which gamepad button'), value => {
+                    step.button = value;
+                    retitle();
+                    this._save();
+                }, 10));
+            suffixes.append(chooser(KEY_ACTIONS, keyActionLabels(), step.action,
+                _('Whether to press, hold down, or release'), value => {
+                    step.action = value;
+                    retitle();
+                    this._save();
+                }));
+            suffixes.append(spinSuffix(step.holdMs ?? 20, 0, 10000,
+                _('How long the button stays down, in milliseconds'), value => {
+                    step.holdMs = value;
                     this._save();
                 }));
             break;
@@ -1682,13 +1948,13 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
         // Both numbers, and the line already reads "Wait 1s ±200ms", so the
         // card had nothing left to open onto.
         case 'wait':
-            suffixes.append(spinSuffix(step.ms, 0, 3600000, 100,
+            suffixes.append(spinSuffix(step.ms, 0, 3600000,
                 _('How long to wait, in milliseconds'), value => {
                     step.ms = value;
                     retitle();
                     this._save();
                 }));
-            suffixes.append(spinSuffix(step.jitterMs ?? 0, 0, 600000, 50,
+            suffixes.append(spinSuffix(step.jitterMs ?? 0, 0, 600000,
                 _('Vary each wait by up to this much, either way, in milliseconds'), value => {
                     step.jitterMs = value;
                     retitle();
@@ -1699,7 +1965,7 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
             const isButton = (TRIGGER_SOURCES as readonly string[]).includes(step.source);
             suffixes.append(chooser([...TRIGGER_SOURCES, 'custom'], triggerSourceLabels(),
                 isButton ? step.source : 'custom',
-                _('Which button or key this step waits for — the press is swallowed'),
+                _('Which button or key this step waits for — the event is swallowed'),
                 value => {
                     step.source = value === 'custom' ? '' : value;
                     retitle();
@@ -1713,6 +1979,25 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
                         this._save();
                     }));
             }
+            // One toggle. Off: the step reacts to the whole click. On: it
+            // reacts to each edge separately — it wakes on the next edge,
+            // whichever that is, so the first such step in the flow catches
+            // the press and the next one the release. A long click is two of
+            // them around whatever the hold should do.
+            const split = new Gtk.ToggleButton({
+                label: _('Press/release'),
+                active: step.edge === 'split' || step.edge === 'press' || step.edge === 'release',
+                valign: Gtk.Align.CENTER,
+                tooltip_text: _('React to press and release separately: this step wakes on ' +
+                    'the next one of the two. Two such steps bracket a hold — press E on ' +
+                    'the press, release it on the release. Off: one whole click.'),
+            });
+            split.connect('toggled', () => {
+                step.edge = split.get_active() ? 'split' : 'click';
+                retitle();
+                this._save();
+            });
+            suffixes.append(split);
             break;
         }
 
@@ -1724,13 +2009,13 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
             break;
 
         case 'scroll':
-            suffixes.append(spinSuffix(step.dx, -1000, 1000, 1,
+            suffixes.append(spinSuffix(step.dx, -1000, 1000,
                 _('Horizontal scroll clicks'), value => {
                     step.dx = value;
                     retitle();
                     this._save();
                 }));
-            suffixes.append(spinSuffix(step.dy, -1000, 1000, 1,
+            suffixes.append(spinSuffix(step.dy, -1000, 1000,
                 _('Vertical scroll clicks'), value => {
                     step.dy = value;
                     retitle();
@@ -1748,22 +2033,31 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
                 () => this._runStepNow(macro.id, step)));
         }
 
+        // The arrows are the keyboard's way to move a step, one place at a
+        // time; dragging the row is the mouse's. Stacked into one slim column
+        // so the row spends one button's width on them, not two.
         // Folded loops and ifs are passed over; open ones are moved into. What
         // you see is what a press does, which is why the editor decides and the
         // model only asks.
         const open = (stepId: string, listKey: string) => this._isBranchOpen(stepId, listKey);
-        suffixes.append(iconButton('go-up-symbolic',
+        const nudge = new Gtk.Box({
+            orientation: Gtk.Orientation.VERTICAL,
+            valign: Gtk.Align.CENTER,
+            css_classes: ['macroclickwerk-nudge'],
+        });
+        nudge.append(iconButton('go-up-symbolic',
             _('Move up — into an open body above, or past a folded one'), () => {
                 if (moveStepNested(macro.body, step.id, -1, open)) {
                     this._saveAndRebuild();
                 }
             }));
-        suffixes.append(iconButton('go-down-symbolic',
+        nudge.append(iconButton('go-down-symbolic',
             _('Move down — into an open body below, or past a folded one'), () => {
                 if (moveStepNested(macro.body, step.id, 1, open)) {
                     this._saveAndRebuild();
                 }
             }));
+        suffixes.append(nudge);
         suffixes.append(iconButton('user-trash-symbolic', _('Delete'), () => {
             removeStep(macro.body, step.id);
             this._saveAndRebuild();
@@ -1803,6 +2097,12 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
                 // The step row is already selectable as "after this step"; a
                 // block of its own gets a selection of its own.
                 this._selectable(nested, `in:${step.id}:${list.key}`, macro.id);
+                // A branch header is a place: dropping on it puts the step
+                // first in that branch, and hovering springs a folded one open.
+                this._droppable(nested, macro,
+                    () => 'into',
+                    () => ({ list: list.steps, at: 0 }),
+                    nested);
             }
             nested.add_css_class('macroclickwerk-branch');
             nested.add_css_class(`macroclickwerk-branch-${kind}`);
@@ -1814,6 +2114,11 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
                 icon_name: 'list-add-symbolic',
                 valign: Gtk.Align.CENTER,
             }));
+            // The add row sits at the end of the list, so a drop on it goes
+            // there — the counterpart to the branch header meaning "first".
+            this._droppable(addNested, macro,
+                () => 'into',
+                () => ({ list: list.steps, at: list.steps.length }));
             if (inline) {
                 this._selectable(addNested, `in:${step.id}:${list.key}`, macro.id);
             }
@@ -2149,7 +2454,7 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
                         condition.color = text.trim();
                         save();
                     });
-                    colourRow.add_suffix(spinSuffix(condition.tolerance, 0, 442, 1,
+                    colourRow.add_suffix(spinSuffix(condition.tolerance, 0, 442,
                         _('Tolerance: how far off this colour a pixel may be and still count'),
                         value => {
                             condition.tolerance = value;

@@ -71,12 +71,16 @@ export interface RunnerCallbacks {
     /** Names a macro for `describeStep`, so those steps read as what they poke. */
     macroName?: (macroId: string) => string | undefined;
     /**
-     * Park until a button or key is pressed, consuming the press. Resolves
-     * true on the press, false if cancelled; null for a source that names no
-     * real input, undefined when nothing here can wait at all — either way the
-     * step fails rather than hangs.
+     * Park until the chosen edge of a button or key — its press, or its
+     * release — consuming the event. Resolves true on the edge, false if
+     * cancelled; null for a source that names no real input, undefined when
+     * nothing here can wait at all — either way the step fails rather than
+     * hangs.
      */
-    waitForInput?: (source: string) => { promise: Promise<boolean>; cancel: () => void } | null | undefined;
+    waitForInput?: (
+        source: string,
+        edge: 'click' | 'split' | 'press' | 'release',
+    ) => { promise: Promise<boolean>; cancel: () => void } | null | undefined;
 }
 
 // A warp lands exactly, so a couple of passes only cover the pointer being
@@ -412,6 +416,15 @@ export class MacroRunner {
             case 'key':
                 await this._doKey(step);
                 return 'normal';
+            case 'pad':
+                // A pad button is a key press whose code lives in the gamepad
+                // range; the daemon routes it to the gamepad clone from the
+                // code alone, so the key machinery carries it as-is.
+                await this._doKey({
+                    id: step.id, kind: 'key', code: step.button,
+                    action: step.action, mods: [], holdMs: step.holdMs,
+                });
+                return 'normal';
             case 'text':
                 await this._doText(step);
                 return 'normal';
@@ -436,8 +449,8 @@ export class MacroRunner {
                         this._status('Skipped a repeat with nothing in it');
                         reportProblem('Step', 'a repeat has nothing in it, so it was skipped', {
                             where: this._where(),
-                            hint: 'Steps go inside a repeat by being added under it — use the ' +
-                                'arrows to move a step into an open body. A repeat that stays ' +
+                            hint: 'Steps go inside a repeat by being added under it, or by ' +
+                                'dragging them in by the grip. A repeat that stays ' +
                                 'empty runs nothing, and forever would never end.',
                         });
                     }
@@ -734,14 +747,14 @@ export class MacroRunner {
     }
 
     private async _doOnEvent(step: OnEventStep): Promise<void> {
-        const wait = this._callbacks.waitForInput?.(step.source);
+        const wait = this._callbacks.waitForInput?.(step.source, step.edge ?? 'click');
         if (wait === undefined) {
             throw new Error('waiting for a click is not available here');
         }
         if (wait === null) {
             throw new Error(`“${step.source}” names no button or key`);
         }
-        this._status(`Waiting until ${prettySource(step.source)}`);
+        this._status(`Waiting until ${prettySource(step.source, step.edge)}`);
         this._waitCancel = wait.cancel;
         try {
             // Resolves false when cancelled — a stopped run, not a failure; the

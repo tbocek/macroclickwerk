@@ -7,8 +7,10 @@ conditions that can look at the screen.
 
 A macro is a tree of steps: clicks, key presses, typed text, scrolls, waits,
 recorded event trains — and `on event`, which parks the run until a button or
-key of your choosing is pressed and swallows that press, so a side button can
-mean "do the next steps" instead of what it normally does. Around them you can put `loop` and `if` blocks. A loop
+key of your choosing is pressed (or, if you say so, released) and swallows
+that event, so a side button can mean "do the next steps" instead of what it
+normally does. Two of them on the two edges of one button make a hold: on
+left press → hold E, on left release → release E. Around them you can put `loop` and `if` blocks. A loop
 only counts — forever, or a fixed number of times; you leave it with `break`
 inside an `if`, which keeps every condition in one place:
 
@@ -55,6 +57,13 @@ repeat forever:
   draws a green outline over the checked area for a second every time it runs,
   taken just after the screenshot so it is never in the picture the model sees.
 - **Emergency stop** that aborts mid-macro and releases every held key.
+- **Gamepads** — a pad (Bluetooth or USB) is captured like any keyboard or
+  mouse: sticks and triggers pass through with their real axis ranges, pad
+  buttons can be recorded, remapped by a trigger, waited on by an `on event`
+  step, and pressed by the **Gamepad button** step — the pad's answer to click
+  and key press. With no pad connected, the synthetic *Macroclickwerk Virtual
+  Gamepad* carries injected buttons, so pad macros work on a machine that has
+  never seen a controller.
 - **Triggers** — a mouse button or key the daemon takes over, and what happens
   in its place: press another key (side button becomes E), or start, pause or
   stop a macro — one of them, or everything switched on, which turns a spare

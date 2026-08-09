@@ -5,7 +5,7 @@
 import GLib from 'gi://GLib';
 
 import { MacroRunner } from '../dist/src/runner.js';
-import { newMacro, newStep, pathToStep } from '../dist/src/model.js';
+import { moveStepTo, newMacro, newStep, pathToStep } from '../dist/src/model.js';
 import { clearProblems, listProblems } from '../dist/src/problems.js';
 
 let failures = 0;
@@ -366,6 +366,34 @@ check('pathToStep of a missing step is empty', pathToStep(flat.body, 'gone').len
           `count ${counted?.count}`);
 }
 
+// --- dragging a step to an exact spot ----------------------------------------
+
+// What a drop calls: `moveStepTo` places a step at a precise list+index. The
+// cases that matter are the ones a drag can physically produce.
+{
+    const doc = newMacro('dnd');
+    const spin = named('loop', 'spin');
+    spin.count = 2;
+    const [a, b, c] = [named('key', 'a'), named('key', 'b'), named('key', 'c')];
+    doc.body.push(a, spin, c);
+    spin.body.push(b);
+
+    check('a drop lands exactly where it points',
+          moveStepTo(doc.body, c.id, spin.body, 0) && spin.body[0].id === c.id
+          && doc.body.length === 2, JSON.stringify(spin.body.map(s => NAMES.get(s.id))));
+    check('a container refuses its own body',
+          moveStepTo(doc.body, spin.id, spin.body, 0) === false);
+    check('and stays where it was', doc.body[1].id === spin.id);
+    check('moving forward in the same list lands past the gap it left',
+          moveStepTo(doc.body, a.id, doc.body, 2) && doc.body.map(s => NAMES.get(s.id)).join('') === 'spina'
+          || doc.body[doc.body.length - 1].id === a.id,
+          doc.body.map(s => NAMES.get(s.id)).join(' '));
+    check('a drop out of a body works too',
+          moveStepTo(doc.body, b.id, doc.body, 0) && doc.body[0].id === b.id
+          && spin.body.length === 1);
+    check('a step that is gone moves nothing', moveStepTo(doc.body, 'gone', doc.body, 0) === false);
+}
+
 // --- a run parked on a click -----------------------------------------------
 
 // The onevent step hands the waiting to the trigger engine; here that engine is
@@ -384,10 +412,10 @@ check('pathToStep of a missing step is empty', pathToStep(flat.body, 'gone').len
     });
 
     const waiters = [];
-    const waitForInput = () => {
+    const waitForInput = (_source, edge) => {
         let resolver;
         const promise = new Promise(resolve => { resolver = resolve; });
-        const waiter = { fire: () => resolver(true), cancelled: false };
+        const waiter = { edge, fire: () => resolver(true), cancelled: false };
         waiters.push(waiter);
         return {
             promise,
@@ -417,6 +445,7 @@ check('pathToStep of a missing step is empty', pathToStep(flat.body, 'gone').len
     await until(() => waiters.length === 1);
     check('the run parks on the onevent step', waiters.length === 1 && seen.join(' ') === 'on',
           seen.join(' '));
+    check('and asks for the edge the step names', waiters[0].edge === 'click', waiters[0].edge);
     waiters[0].fire();
     await run;
     check('the press lets it continue', seen.join(' ') === 'on then', seen.join(' '));
@@ -443,6 +472,64 @@ check('pathToStep of a missing step is empty', pathToStep(flat.body, 'gone').len
     await failing.run(askew);
     check('a source that names nothing fails the run instead of hanging',
           reason === 'error', reason);
+}
+
+// --- a pad step is a key press in the gamepad range --------------------------
+
+{
+    const played = [];
+    const padDaemon = {
+        play: async events => { played.push(...events); return { aborted: false }; },
+        stop: async () => {},
+    };
+    const macro = newMacro('paddy');
+    macro.body.push(named('pad', 'a'));   // BTN_SOUTH, tap
+    await new MacroRunner(padDaemon, evaluator, {}, {}, {}).run(macro);
+    const keys = played.filter(e => e.type === 1);
+    check('a pad step presses and releases its button',
+          keys.length === 2 && keys[0].code === 0x130 && keys[0].value === 1
+          && keys[1].code === 0x130 && keys[1].value === 0,
+          JSON.stringify(keys));
+}
+
+// --- a dead model stops only the macros that ask it --------------------------
+
+// The model being unreachable is a fact about one macro's conditions, not
+// about the session: a macro with no LLM checks keeps running to the end
+// while its neighbour dies. This is the isolation the problems popup implies
+// when it says which macro stopped.
+{
+    const modelDown = {
+        evaluate: async () => {
+            throw new Error("the model could not answer: HTTP 400: model 'X' not found");
+        },
+    };
+    const asks = newMacro('asks');
+    asks.body.push(named('if', 'iff'), named('key', 'never'));
+    const plain = newMacro('plain');
+    plain.body.push(named('key', 'p1'), named('key', 'p2'));
+
+    const outcomes = {};
+    const seen = [];
+    const runOne = (macro, evalr, name) => new MacroRunner(daemon, evalr, {}, {}, {
+        onStepsChanged: path => {
+            if (path.length > 0) {
+                seen.push(NAMES.get(path[path.length - 1].id) ?? '?');
+            }
+        },
+        onFinished: reason => { outcomes[name] = reason; },
+    }).run(macro);
+
+    print('--- the JS ERROR below is this test working: the model is meant to be down ---');
+    await Promise.all([runOne(asks, modelDown, 'asks'), runOne(plain, evaluator, 'plain')]);
+    check('the asking macro stops with the error', outcomes.asks === 'error', outcomes.asks);
+    check('and never reaches what came after the check', !seen.includes('never'), seen.join(' '));
+    check('the macro without LLM checks runs to the end untouched',
+          outcomes.plain === 'done' && seen.includes('p2'),
+          `${outcomes.plain}: ${seen.join(' ')}`);
+    const told = listProblems().find(p => p.message.includes('“asks” stopped'));
+    check('and the stop is logged, naming the macro', told !== undefined,
+          JSON.stringify(listProblems().slice(0, 3).map(p => p.message)));
 }
 
 print(failures === 0 ? '\nALL PASSED' : `\n${failures} FAILURES`);

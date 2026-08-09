@@ -3,7 +3,7 @@
 // event turns into.
 
 import { parseTriggers, isArmed, armedByCode, dispatch, sourceCode, claimWaiters } from '../dist/src/triggers.js';
-import { EV_KEY, BUTTON_CODES, KEY_CODES } from '../dist/src/keymap.js';
+import { EV_KEY, BUTTON_CODES, GAMEPAD_CODES, KEY_CODES } from '../dist/src/keymap.js';
 
 let failures = 0;
 const check = (name, cond, extra = '') => {
@@ -100,20 +100,72 @@ check('the inert ones claim no code',
 
 {
     const woken = [];
-    const waiter = code => ({ code, resolve: fired => woken.push(`${code}:${fired}`) });
+    const waiter = (code, edge = 'press') =>
+        ({ code, edge, resolve: fired => woken.push(`${code}:${edge}:${fired}`) });
     const waiters = [waiter(BUTTON_CODES.side), waiter(BUTTON_CODES.side), waiter(BUTTON_CODES.extra)];
 
     let claimed = claimWaiters(waiters, trig(BUTTON_CODES.side, 1));
     claimed.forEach(w => w.resolve(true));
     check('a press wakes every run parked on that code',
-          woken.join(' ') === `${BUTTON_CODES.side}:true ${BUTTON_CODES.side}:true`,
+          woken.join(' ') === `${BUTTON_CODES.side}:press:true ${BUTTON_CODES.side}:press:true`,
           woken.join(' '));
     check('and removes exactly them', waiters.length === 1 && waiters[0].code === BUTTON_CODES.extra);
 
     claimed = claimWaiters(waiters, trig(BUTTON_CODES.extra, 0));
-    check('a release wakes nobody', claimed.length === 0 && waiters.length === 1);
+    check('a release wakes no press waiter', claimed.length === 0 && waiters.length === 1);
     claimed = claimWaiters(waiters, trig(BUTTON_CODES.extra, 1, { trig: undefined }));
     check('an unconsumed press wakes nobody', claimed.length === 0 && waiters.length === 1);
+}
+
+// The two edges are separate waits: a run parked on the release sleeps
+// through the press, and the other way round — which is what turns two
+// onevent steps into "hold E while I hold the button".
+{
+    const woken = [];
+    const waiters = [
+        { code: BUTTON_CODES.left, edge: 'press', resolve: f => woken.push(`press:${f}`) },
+        { code: BUTTON_CODES.left, edge: 'release', resolve: f => woken.push(`release:${f}`) },
+    ];
+    claimWaiters(waiters, trig(BUTTON_CODES.left, 1)).forEach(w => w.resolve(true));
+    check('the press wakes only the press waiter',
+          woken.join(' ') === 'press:true' && waiters.length === 1, woken.join(' '));
+    claimWaiters(waiters, trig(BUTTON_CODES.left, 2)).forEach(w => w.resolve(true));
+    check('autorepeat wakes neither edge', woken.join(' ') === 'press:true');
+    claimWaiters(waiters, trig(BUTTON_CODES.left, 0)).forEach(w => w.resolve(true));
+    check('the release wakes the release waiter',
+          woken.join(' ') === 'press:true release:true' && waiters.length === 0,
+          woken.join(' '));
+}
+
+// The default: a click waiter (toggle off) wakes on the press — the
+// release-swallowing that sets it apart happens in the engine's drain,
+// after the wake.
+{
+    const woken = [];
+    const waiters = [{ code: BUTTON_CODES.side, edge: 'click', resolve: f => woken.push(f) }];
+    check('a release does not wake a click waiter',
+          claimWaiters(waiters, trig(BUTTON_CODES.side, 0)).length === 0 && waiters.length === 1);
+    claimWaiters(waiters, trig(BUTTON_CODES.side, 1)).forEach(w => w.resolve(true));
+    check('the press wakes a click waiter', woken.join() === 'true' && waiters.length === 0,
+          woken.join());
+}
+
+// The toggle: a split waiter wakes on the next edge, whichever it is. Two in
+// sequence bracket one hold — first the press, then the release — which is
+// the long click.
+{
+    const woken = [];
+    const splitWaiter = () =>
+        ({ code: BUTTON_CODES.left, edge: 'split', resolve: f => woken.push(f) });
+    const waiters = [splitWaiter()];
+    claimWaiters(waiters, trig(BUTTON_CODES.left, 1)).forEach(w => w.resolve(true));
+    check('a split waiter wakes on the press', woken.length === 1 && waiters.length === 0);
+    waiters.push(splitWaiter());
+    claimWaiters(waiters, trig(BUTTON_CODES.left, 2)).forEach(w => w.resolve(true));
+    check('autorepeat does not wake a split waiter', woken.length === 1);
+    claimWaiters(waiters, trig(BUTTON_CODES.left, 0)).forEach(w => w.resolve(true));
+    check('the next split waiter wakes on the release',
+          woken.length === 2 && waiters.length === 0, `${woken.length}`);
 }
 
 // A waiter and a configured trigger on the same code: the waiter wins, the
@@ -122,7 +174,7 @@ check('the inert ones claim no code',
 {
     const actions = recordingActions();
     const map = armedByCode([{ id: 'r', source: 'BTN_SIDE', action: 'key', key: 'KEY_E' }]);
-    const waiters = [{ code: BUTTON_CODES.side, resolve: () => {} }];
+    const waiters = [{ code: BUTTON_CODES.side, edge: 'press', resolve: () => {} }];
     const event = trig(BUTTON_CODES.side, 1);
     if (claimWaiters(waiters, event).length === 0) {
         dispatch(map, event, actions);
@@ -130,6 +182,45 @@ check('the inert ones claim no code',
     check('a parked run outranks a standing remap of the same button',
           actions.done.length === 0, actions.done.join());
 }
+
+// --- remaps mirror press and release, whatever the source --------------------
+
+// A remap is a hold-follow on any EV_KEY source: mouse button to key, key to
+// key, key to mouse button, gamepad button to key. Down mirrors down, up
+// mirrors up, and the held source's autorepeat is left to the kernel.
+{
+    const map = armedByCode([
+        { id: 'k', source: 'KEY_F13', action: 'key', key: 'KEY_E' },
+        { id: 'b', source: 'BTN_LEFT', action: 'key', key: 'BTN_RIGHT' },
+        { id: 'g', source: 'BTN_SOUTH', action: 'key', key: 'KEY_SPACE' },
+    ]);
+
+    let actions = recordingActions();
+    dispatch(map, trig(KEY_CODES.KEY_F13, 1), actions);
+    dispatch(map, trig(KEY_CODES.KEY_F13, 2), actions);
+    dispatch(map, trig(KEY_CODES.KEY_F13, 0), actions);
+    check('a key source mirrors press and release onto its key',
+          actions.done.join(' | ') === `key ${KEY_CODES.KEY_E} down | key ${KEY_CODES.KEY_E} up`,
+          actions.done.join(' | '));
+
+    actions = recordingActions();
+    dispatch(map, trig(BUTTON_CODES.left, 1), actions);
+    dispatch(map, trig(BUTTON_CODES.left, 0), actions);
+    check('a mouse button remaps to another button, both edges',
+          actions.done.join(' | ') === `key ${BUTTON_CODES.right} down | key ${BUTTON_CODES.right} up`,
+          actions.done.join(' | '));
+
+    actions = recordingActions();
+    dispatch(map, trig(GAMEPAD_CODES.BTN_SOUTH, 1), actions);
+    dispatch(map, trig(GAMEPAD_CODES.BTN_SOUTH, 0), actions);
+    check('a gamepad button works as a source, both edges',
+          actions.done.join(' | ') === `key ${KEY_CODES.KEY_SPACE} down | key ${KEY_CODES.KEY_SPACE} up`,
+          actions.done.join(' | '));
+}
+
+check('gamepad names resolve like any other source',
+      sourceCode('BTN_SOUTH') === 0x130 && sourceCode('btn_tr') === 0x137
+      && sourceCode('BTN_THUMBR') === 0x13e);
 
 // --- the stored form -------------------------------------------------------
 

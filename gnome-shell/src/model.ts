@@ -143,6 +143,29 @@ export type TextStep = StepCommon & {
     delayMs?: number;
 };
 
+/**
+ * A gamepad button, the pad's answer to click and key press. Injected into
+ * the gamepad clone — the real pad's when one is captured, the synthetic
+ * "Macroclickwerk Virtual Gamepad" otherwise, so pad macros work with no pad
+ * plugged in at all.
+ */
+export type PadStep = StepCommon & {
+    kind: 'pad';
+    /** evdev name of the button: BTN_SOUTH, BTN_TR, … */
+    button: string;
+    action: 'tap' | 'down' | 'up';
+    holdMs?: number;
+};
+
+/** The pad buttons the editor offers, friendly name beside the kernel's. */
+export const GAMEPAD_BUTTONS: Record<string, string> = {
+    BTN_SOUTH: 'A (south)', BTN_EAST: 'B (east)',
+    BTN_WEST: 'X (west)', BTN_NORTH: 'Y (north)',
+    BTN_TL: 'LB', BTN_TR: 'RB', BTN_TL2: 'LT', BTN_TR2: 'RT',
+    BTN_SELECT: 'Select', BTN_START: 'Start', BTN_MODE: 'Guide',
+    BTN_THUMBL: 'L3', BTN_THUMBR: 'R3',
+};
+
 export type WaitStep = StepCommon & {
     kind: 'wait';
     ms: number;
@@ -158,6 +181,16 @@ export type OnEventStep = StepCommon & {
     kind: 'onevent';
     /** evdev name of what is waited for: BTN_SIDE, KEY_F13, … */
     source: string;
+    /**
+     * What wakes the run. 'click' (the default, and what absent means) is the
+     * plain case: the press wakes it and the matching release is swallowed
+     * along with it, one gesture. 'split' reacts to each edge separately —
+     * the step wakes on the next edge, whichever it is, so the first split
+     * step in a flow catches the press and the next one the release: a long
+     * click is two of them around whatever the hold should do. 'press' and
+     * 'release' are older spellings of the halves, still honoured.
+     */
+    edge?: 'click' | 'split' | 'press' | 'release';
 };
 
 /**
@@ -210,6 +243,7 @@ export type Step =
     | ScrollStep
     | KeyStep
     | TextStep
+    | PadStep
     | WaitStep
     | OnEventStep
     | LoopStep
@@ -298,10 +332,12 @@ export function newStep(kind: StepKind): Step {
             return { id, kind: 'key', code: 'KEY_E', action: 'tap', mods: [], holdMs: 20 };
         case 'text':
             return { id, kind: 'text', value: '', delayMs: 12 };
+        case 'pad':
+            return { id, kind: 'pad', button: 'BTN_SOUTH', action: 'tap', holdMs: 20 };
         case 'wait':
             return { id, kind: 'wait', ms: 1000, jitterMs: 0 };
         case 'onevent':
-            return { id, kind: 'onevent', source: 'BTN_SIDE' };
+            return { id, kind: 'onevent', source: 'BTN_SIDE', edge: 'click' };
         case 'loop':
             return { id, kind: 'loop', count: 'forever', body: [] };
         case 'if':
@@ -454,6 +490,38 @@ export function removeStep(list: Step[], id: string): Step | null {
         return null;
     }
     return loc.list.splice(loc.index, 1)[0] ?? null;
+}
+
+/**
+ * Move a step — subtree and all — to an exact place: `into` is the destination
+ * list, `at` the index in it. Refused when the destination sits inside the
+ * step being moved: a loop dropped into its own body would detach from the
+ * document and vanish, taking everything inside it along.
+ */
+export function moveStepTo(root: Step[], id: string, into: Step[], at: number): boolean {
+    const loc = findStep(root, id);
+    if (!loc) {
+        return false;
+    }
+    let insideItself = false;
+    walk([loc.step], inner => {
+        for (const child of childLists(inner.step)) {
+            if (child.steps === into) {
+                insideItself = true;
+            }
+        }
+    });
+    if (insideItself) {
+        return false;
+    }
+    // Same-list moves: taking the step out shifts everything after it left, so
+    // a target index past the old spot is off by the one just removed.
+    if (loc.list === into && loc.index < at) {
+        at--;
+    }
+    loc.list.splice(loc.index, 1);
+    into.splice(Math.max(0, Math.min(at, into.length)), 0, loc.step);
+    return true;
 }
 
 /** Move a step within its own list only, so reordering never changes nesting. */
@@ -984,13 +1052,25 @@ export function describeCondition(cond: Condition | null | undefined): string {
     }
 }
 
-/** BTN_SIDE → "the side button is clicked", KEY_F13 → "F13 is pressed". */
-export function prettySource(source: string): string {
-    const button = source.match(/^BTN_(\w+)$/);
-    if (button) {
-        return `the ${button[1].toLowerCase()} button is clicked`;
+/** BTN_SIDE → "the side button is clicked", KEY_F13 → "F13 is released". */
+export function prettySource(
+    source: string,
+    edge: 'click' | 'split' | 'press' | 'release' = 'click',
+): string {
+    const pad = GAMEPAD_BUTTONS[source];
+    const button = !pad && source.match(/^BTN_(\w+)$/);
+    const verb = edge === 'split' ? 'pressed or released'
+        : edge === 'release' ? 'released'
+            : edge === 'press' ? 'pressed'
+                // The whole-click case: buttons click, keys press.
+                : button ? 'clicked' : 'pressed';
+    if (pad) {
+        return `pad ${pad} is ${verb}`;
     }
-    return `${source.replace(/^KEY_/, '') || '…'} is pressed`;
+    if (button) {
+        return `the ${button[1].toLowerCase()} button is ${verb}`;
+    }
+    return `${source.replace(/^KEY_/, '') || '…'} is ${verb}`;
 }
 
 function formatMs(ms: number): string {
@@ -1038,12 +1118,17 @@ export function describeStep(
         }
         case 'text':
             return `Type "${truncate(step.value)}"`;
+        case 'pad': {
+            const label = GAMEPAD_BUTTONS[step.button] ?? step.button;
+            const verb = step.action === 'tap' ? 'Press' : step.action === 'down' ? 'Hold down' : 'Release';
+            return `${verb} pad ${label}`;
+        }
         case 'wait':
             return step.jitterMs
                 ? `Wait ${formatMs(step.ms)} ±${formatMs(step.jitterMs)}`
                 : `Wait ${formatMs(step.ms)}`;
         case 'onevent':
-            return `When ${prettySource(step.source)}`;
+            return `When ${prettySource(step.source, step.edge)}`;
         case 'loop':
             return step.count === 'forever' ? 'Repeat forever' : `Repeat ${step.count}×`;
         case 'if':
@@ -1074,7 +1159,7 @@ export function describeStep(
  * recording is gone, is all of them.
  */
 export const AUTHORABLE_STEP_KINDS: StepKind[] = [
-    'click', 'move', 'scroll', 'key', 'text', 'wait', 'onevent',
+    'click', 'move', 'scroll', 'key', 'text', 'pad', 'wait', 'onevent',
     'loop', 'if', 'break', 'continue', 'start', 'stop',
 ];
 
@@ -1084,6 +1169,7 @@ export const STEP_KIND_LABELS: Record<StepKind, string> = {
     scroll: 'Scroll',
     key: 'Key press',
     text: 'Type text',
+    pad: 'Gamepad button',
     wait: 'Wait',
     onevent: 'On event',
     loop: 'Loop',
