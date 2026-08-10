@@ -15,7 +15,7 @@ sudo make install
 
 echo
 echo "==> extension"
-(cd gnome-shell && npm run build && ./run.sh -i)
+(cd gnome-shell && pnpm install --frozen-lockfile && pnpm run build && ./run.sh -i)
 
 echo
 echo "==> daemon status"
