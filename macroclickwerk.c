@@ -72,6 +72,13 @@ struct captured_device {
     bool watched;         // something other than us is reading the clone
     int forward_failures; // forwards that failed and forced an ungrab
     bool grab_denied;     // last grab attempt failed; logged once, retried quietly
+    bool grab_deferred;   // waiting for a held key before grabbing; logged once
+    // Keys and buttons this clone is holding down because we forwarded the
+    // press. Atomic per code rather than locked: the reader thread writes one
+    // byte of it per event, and a lock taken that often is a lock the whole
+    // input path queues on. Read when a grab ends, to lift what would otherwise
+    // stay down forever.
+    _Atomic unsigned char clone_down[KEY_MAX + 1];
 };
 
 // After this many failed forwards the device stays observe-only until it is
@@ -287,6 +294,55 @@ static void* stream_accept_thread(void *arg) {
 
 static bool has_bit(const unsigned int array[], int bit) {
     return (array[bit / 32] & (1U << (bit % 32))) != 0;
+}
+
+// Bits for every EV_KEY code, in the layout has_bit() reads.
+#define KEY_WORDS (KEY_MAX / 32 + 1)
+
+/**
+ * Whether the device is holding nothing down, asked of the kernel rather than
+ * assembled from the events we happened to see — so it is right about presses
+ * that started before this daemon did. Unanswerable counts as quiet: the grab
+ * is what makes the device useful, and refusing it on a failed ioctl would
+ * trade a rare stuck button for a permanently deaf device.
+ */
+static bool device_is_quiet(int fd) {
+    unsigned int down[KEY_WORDS] = {0};
+    if (ioctl(fd, EVIOCGKEY(sizeof down), down) < 0) {
+        return true;
+    }
+    for (int i = 0; i < KEY_WORDS; i++) {
+        if (down[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/**
+ * Lift whatever the clone is still holding down. Forwarding stops the instant
+ * the grab does, so a button pressed while grabbed has its release delivered to
+ * the real device instead, and the clone would go on holding a button nothing
+ * can ever lift. That matters even when nobody is reading the clone right now:
+ * a reader asks for the key state as it opens the node, so the stale press is
+ * waiting for whoever comes next.
+ */
+static void release_clone_keys(struct captured_device *d) {
+    if (d->fdo < 0) {
+        return;
+    }
+    bool any = false;
+    for (int code = 0; code <= KEY_MAX; code++) {
+        if (!d->clone_down[code]) {
+            continue;
+        }
+        d->clone_down[code] = 0;
+        emit(d->fdo, EV_KEY, code, 0);
+        any = true;
+    }
+    if (any) {
+        emit(d->fdo, EV_SYN, SYN_REPORT, 0);
+    }
 }
 
 // What a device is, judged by what it can say: something that types, something
@@ -607,8 +663,11 @@ static void* reader_thread(void *arg) {
         // reach the desktop directly again — duplicated for a moment if the
         // failure was transient, but present. The monitor re-grabs on its next
         // pass, and gives up on the device after MAX_FORWARD_FAILURES.
-        if (d->grabbed && !consumed && emit(d->fdo, ev.type, ev.code, ev.value) < 0) {
+        bool forwarded = d->grabbed && !consumed;
+        if (forwarded && emit(d->fdo, ev.type, ev.code, ev.value) < 0) {
+            forwarded = false;
             pthread_mutex_lock(&devices_mutex);
+            release_clone_keys(d);
             ioctl(d->fdi, EVIOCGRAB, 0);
             d->grabbed = false;
             d->forward_failures++;
@@ -617,6 +676,12 @@ static void* reader_thread(void *arg) {
                     "released the grab on %s so its input keeps flowing\n",
                     d->name, d->forward_failures, MAX_FORWARD_FAILURES,
                     d->path ? d->path : "?");
+        }
+
+        // What the clone is now holding down on the user's behalf, so ending
+        // the grab can hand it back rather than leave it pressed.
+        if (forwarded && ev.type == EV_KEY && ev.code <= KEY_MAX) {
+            d->clone_down[ev.code] = ev.value != 0;
         }
 
         if (recording || consumed) {
@@ -641,6 +706,10 @@ static void* reader_thread(void *arg) {
     }
 
     pthread_mutex_lock(&devices_mutex);
+    // The clone outlives the device, so anything it was holding down on the
+    // device's behalf has to come up here — a mouse unplugged mid-click would
+    // otherwise leave the desktop dragging until the daemon exits.
+    release_clone_keys(d);
     if (d->fdi >= 0) {
         ioctl(d->fdi, EVIOCGRAB, 0);
         close(d->fdi);
@@ -1214,6 +1283,7 @@ static bool attach_device(const char *path, const char *wanted) {
         d->grabbed = false;
         d->forward_failures = 0;
         d->grab_denied = false;
+        d->grab_deferred = false;
 
         // The clone is deliberately not rebuilt. A device returning under the
         // same name reports the same capabilities, and tearing the clone down
@@ -1454,6 +1524,10 @@ static void scan_clone_watchers(void) {
  * both directions are asked once a second rather than assumed at capture time
  * — a device grabbed on faith at the wrong moment is a mouse that stops
  * clicking with nothing in the journal to say why.
+ *
+ * Either edge is taken only when the device is holding nothing down, because
+ * the edge is where a press and its release can end up on different nodes, and
+ * a half-delivered click is exactly the stuck mouse this is meant to avoid.
  */
 static void manage_grabs(void) {
     scan_clone_watchers();
@@ -1466,6 +1540,7 @@ static void manage_grabs(void) {
         }
 
         if (!d->watched && d->grabbed) {
+            release_clone_keys(d);
             ioctl(d->fdi, EVIOCGRAB, 0);
             d->grabbed = false;
             fprintf(stderr, "macroclickwerk: released %s — nothing is reading %s\n",
@@ -1486,6 +1561,21 @@ static void manage_grabs(void) {
             continue;
         }
 
+        // Never grab mid-press. A grab moves the device from its own node to the
+        // clone, and the desktop tracks a button per node: press the left button
+        // an instant before this and the release arrives on a node the desktop
+        // never saw press, so it drops it and the pointer stays stuck in a drag
+        // that only killing the daemon ends. Waiting for the hand to come off
+        // costs a second and keeps every press with its release.
+        if (!device_is_quiet(d->fdi)) {
+            if (!d->grab_deferred) {
+                d->grab_deferred = true;
+                fprintf(stderr, "macroclickwerk: not grabbing %s yet — a key or button is held down\n",
+                        d->path);
+            }
+            continue;
+        }
+
         if (ioctl(d->fdi, EVIOCGRAB, 1) < 0) {
             // A remapper or another grabber got there first. Say so once, then
             // keep asking quietly: grabs are dropped when their holder exits.
@@ -1498,6 +1588,7 @@ static void manage_grabs(void) {
         }
         d->grabbed = true;
         d->grab_denied = false;
+        d->grab_deferred = false;
         fprintf(stderr, "macroclickwerk: grabbed %s — %s is being read, forwarding\n",
                 d->path, d->clone_node);
     }
