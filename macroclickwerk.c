@@ -29,6 +29,8 @@
 #include <sys/time.h>
 #include <pthread.h>
 #include <stdbool.h>
+#include <stdarg.h>
+#include <stdatomic.h>
 #include <signal.h>
 #include <microhttpd.h>
 #include <json-c/json.h>
@@ -37,7 +39,6 @@
 #include <sys/stat.h>
 #include <dirent.h>
 #include <strings.h>
-#include <limits.h>
 #include <limits.h>
 #include <sys/inotify.h>
 #include <poll.h>
@@ -124,16 +125,40 @@ static volatile bool recording = false;
 // (or the desktop sees the original anyway) and a stream client (or the click
 // would vanish into a void nobody is acting for); missing either, the event
 // passes through and the button is just a button again.
-static pthread_mutex_t trigger_mutex = PTHREAD_MUTEX_INITIALIZER;
-static unsigned char trigger_codes[KEY_MAX + 1];
+//
+// Atomic per code rather than locked as a set: every event on every reader
+// thread asks whether its code is a trigger, and a lock taken that often to
+// read one byte is a lock the whole input path queues on. The set is replaced
+// code by code, so a reader can catch the change half-applied — which costs at
+// worst one event routed by the old list, on a button the user has just this
+// moment reassigned.
+static _Atomic unsigned char trigger_codes[KEY_MAX + 1];
 
 // Event stream clients.
 static pthread_mutex_t stream_mutex = PTHREAD_MUTEX_INITIALIZER;
 static int stream_clients[MAX_STREAM_CLIENTS];
-static int stream_client_count = 0;
+// Atomic because the reader threads read it without the lock — "is anyone
+// listening?" is asked of every event, and the answer only decides whether a
+// trigger is consumed. The array beside it still needs the mutex.
+static _Atomic int stream_client_count = 0;
 static unsigned long long event_seq = 0;
 static int event_listen_fd = -1;
 static int control_listen_fd = -1;
+
+/**
+ * The running commentary: what was connected, what was read, what was asked
+ * for. It goes to stdout on purpose, which the unit sends to /dev/null — under
+ * systemd this is silent, and run by hand in a terminal it is the trace you
+ * wanted. Anything that must survive either way goes to stderr instead.
+ */
+__attribute__((format(printf, 1, 2)))
+static void debug(const char *fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    fputs("[DEBUG] ", stdout);
+    vprintf(fmt, args);
+    va_end(args);
+}
 
 // ---------------------------------------------------------------------------
 // Event emission
@@ -187,7 +212,7 @@ static void release_all_held(void) {
         held[code] = 0;
         pthread_mutex_unlock(&held_mutex);
 
-        printf("[DEBUG] Releasing stuck code %d\n", code);
+        debug("Releasing stuck code %d\n", code);
         emit(fd, EV_KEY, code, 0);
         emit(fd, EV_SYN, SYN_REPORT, 0);
 
@@ -221,7 +246,7 @@ static void stream_broadcast(int dev_index, const struct input_event *ev, bool t
     for (int i = 0; i < stream_client_count;) {
         ssize_t written = send(stream_clients[i], line, (size_t)n, MSG_NOSIGNAL | MSG_DONTWAIT);
         if (written < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
-            printf("[DEBUG] Event stream client %d disconnected\n", stream_clients[i]);
+            debug("Event stream client %d disconnected\n", stream_clients[i]);
             close(stream_clients[i]);
             stream_clients[i] = stream_clients[--stream_client_count];
             continue;
@@ -245,13 +270,13 @@ static void* stream_accept_thread(void *arg) {
         pthread_mutex_lock(&stream_mutex);
         if (stream_client_count >= MAX_STREAM_CLIENTS) {
             pthread_mutex_unlock(&stream_mutex);
-            printf("[DEBUG] Too many event stream clients, rejecting\n");
+            debug("Too many event stream clients, rejecting\n");
             close(fd);
             continue;
         }
         stream_clients[stream_client_count++] = fd;
         pthread_mutex_unlock(&stream_mutex);
-        printf("[DEBUG] Event stream client connected (fd %d)\n", fd);
+        debug("Event stream client connected (fd %d)\n", fd);
     }
     return NULL;
 }
@@ -285,60 +310,35 @@ static int classify(const unsigned int key_bits[], const unsigned int rel_bits[]
     return cls;
 }
 
-static bool setup_event_type(int fdi, int fdo, unsigned long event_type, int max_val, const unsigned int array_bit[]) {
-    struct uinput_abs_setup abs_setup = {};
-
+// One ioctl per capability bit the real device has. ABS is the only kind that
+// carries more than a bit, and it is handled here rather than in a pass of its
+// own because the bit and the range belong to the same axis.
+static bool setup_event_type(int fdi, int fdo, unsigned long request, int max_val,
+                             const unsigned int array_bit[], const char *label) {
     for (int i = 0; i < max_val; i++) {
-        if (!(array_bit[i / 32] & (1U << (i % 32)))) {
+        if (!has_bit(array_bit, i)) {
             continue;
         }
-
-        switch(event_type) {
-            case UI_SET_EVBIT:
-                if (ioctl(fdo, UI_SET_EVBIT, i) < 0) {
-                    fprintf(stderr, "Cannot set EV bit %d: %s\n", i, strerror(errno));
-                    return false;
-                }
-                break;
-            case UI_SET_KEYBIT:
-                if (ioctl(fdo, UI_SET_KEYBIT, i) < 0) {
-                    fprintf(stderr, "Cannot set KEY bit %d: %s\n", i, strerror(errno));
-                    return false;
-                }
-                break;
-            case UI_SET_RELBIT:
-                if (ioctl(fdo, UI_SET_RELBIT, i) < 0) {
-                    fprintf(stderr, "Cannot set REL bit %d: %s\n", i, strerror(errno));
-                    return false;
-                }
-                break;
-            case UI_SET_ABSBIT:
-                if (ioctl(fdo, UI_SET_ABSBIT, i) < 0) {
-                    fprintf(stderr, "Cannot set ABS bit %d: %s\n", i, strerror(errno));
-                    return false;
-                }
-                // Every axis carries its own range, so every axis needs its own
-                // copy of it. One copy for the whole device leaves the rest at
-                // the uinput default of 0..0, and a stick whose clone says
-                // 0..0 reads as centred however far it is actually pushed —
-                // the events arrive, and everything downstream divides them by
-                // a range of nothing.
-                abs_setup.code = i;
-                if (ioctl(fdi, EVIOCGABS(i), &abs_setup.absinfo) < 0) {
-                    fprintf(stderr, "Failed to get ABS info for axis %d: %s\n", i, strerror(errno));
-                    continue;
-                }
-                if (ioctl(fdo, UI_ABS_SETUP, &abs_setup) < 0) {
-                    fprintf(stderr, "Failed to setup ABS axis %d: %s\n", i, strerror(errno));
-                    continue;
-                }
-                break;
-            case UI_SET_MSCBIT:
-                if (ioctl(fdo, UI_SET_MSCBIT, i) < 0) {
-                    fprintf(stderr, "Cannot set MSC bit %d: %s\n", i, strerror(errno));
-                    return false;
-                }
-                break;
+        if (ioctl(fdo, request, i) < 0) {
+            fprintf(stderr, "Cannot set %s bit %d: %s\n", label, i, strerror(errno));
+            return false;
+        }
+        if (request != UI_SET_ABSBIT) {
+            continue;
+        }
+        // Every axis carries its own range, so every axis needs its own copy of
+        // it. One copy for the whole device leaves the rest at the uinput
+        // default of 0..0, and a stick whose clone says 0..0 reads as centred
+        // however far it is actually pushed — the events arrive, and everything
+        // downstream divides them by a range of nothing.
+        struct uinput_abs_setup abs_setup = {};
+        abs_setup.code = i;
+        if (ioctl(fdi, EVIOCGABS(i), &abs_setup.absinfo) < 0) {
+            fprintf(stderr, "Failed to get ABS info for axis %d: %s\n", i, strerror(errno));
+            continue;
+        }
+        if (ioctl(fdo, UI_ABS_SETUP, &abs_setup) < 0) {
+            fprintf(stderr, "Failed to setup ABS axis %d: %s\n", i, strerror(errno));
         }
     }
     return true;
@@ -352,40 +352,48 @@ static bool mirror_capabilities(struct captured_device *d, int *cls_out) {
                  array_bit_abs[ABS_MAX/32 + 1] = {0},
                  array_bit_msc[MSC_MAX/32 + 1] = {0};
 
+    // Every kind of event the clone must be able to repeat: which bits to ask
+    // the device for, how many of them there are, and the ioctl that turns one
+    // on. EV itself is not in the table — it says which of these rows apply, so
+    // it has to be read before them.
+    const struct {
+        int type;
+        unsigned long request;
+        int max_val;
+        unsigned int *bits;
+        size_t size;
+        const char *label;
+    } kinds[] = {
+        { EV_KEY, UI_SET_KEYBIT, KEY_MAX, array_bit_key, sizeof array_bit_key, "KEY" },
+        { EV_REL, UI_SET_RELBIT, REL_MAX, array_bit_rel, sizeof array_bit_rel, "REL" },
+        { EV_ABS, UI_SET_ABSBIT, ABS_MAX, array_bit_abs, sizeof array_bit_abs, "ABS" },
+        { EV_MSC, UI_SET_MSCBIT, MSC_MAX, array_bit_msc, sizeof array_bit_msc, "MSC" },
+    };
+
     if (ioctl(d->fdi, EVIOCGBIT(0, sizeof(array_bit_ev)), &array_bit_ev) < 0) {
         fprintf(stderr, "Error: Failed to retrieve event capabilities for [%s]: %s.\n", d->path, strerror(errno));
         return false;
     }
-    if (has_bit(array_bit_ev, EV_KEY) &&
-        ioctl(d->fdi, EVIOCGBIT(EV_KEY, sizeof(array_bit_key)), &array_bit_key) < 0) {
-        fprintf(stderr, "Error: Failed to retrieve EV_KEY capabilities for [%s]: %s.\n", d->path, strerror(errno));
-        return false;
-    }
-    if (has_bit(array_bit_ev, EV_REL) &&
-        ioctl(d->fdi, EVIOCGBIT(EV_REL, sizeof(array_bit_rel)), &array_bit_rel) < 0) {
-        fprintf(stderr, "Error: Failed to retrieve EV_REL capabilities for [%s]: %s.\n", d->path, strerror(errno));
-        return false;
-    }
-    if (has_bit(array_bit_ev, EV_ABS) &&
-        ioctl(d->fdi, EVIOCGBIT(EV_ABS, sizeof(array_bit_abs)), &array_bit_abs) < 0) {
-        fprintf(stderr, "Error: Failed to retrieve EV_ABS capabilities for [%s]: %s.\n", d->path, strerror(errno));
-        return false;
-    }
-    if (has_bit(array_bit_ev, EV_MSC) &&
-        ioctl(d->fdi, EVIOCGBIT(EV_MSC, sizeof(array_bit_msc)), &array_bit_msc) < 0) {
-        fprintf(stderr, "Error: Failed to retrieve EV_MSC capabilities for [%s]: %s.\n", d->path, strerror(errno));
-        return false;
+    for (size_t k = 0; k < sizeof(kinds) / sizeof(kinds[0]); k++) {
+        if (has_bit(array_bit_ev, kinds[k].type) &&
+            ioctl(d->fdi, EVIOCGBIT(kinds[k].type, kinds[k].size), kinds[k].bits) < 0) {
+            fprintf(stderr, "Error: Failed to retrieve EV_%s capabilities for [%s]: %s.\n",
+                    kinds[k].label, d->path, strerror(errno));
+            return false;
+        }
     }
 
     // Classify: what can we sensibly inject into this device?
     *cls_out = classify(array_bit_key, array_bit_rel);
 
-    if (!setup_event_type(d->fdi, d->fdo, UI_SET_EVBIT, EV_SW, array_bit_ev) ||
-        !setup_event_type(d->fdi, d->fdo, UI_SET_KEYBIT, KEY_MAX, array_bit_key) ||
-        !setup_event_type(d->fdi, d->fdo, UI_SET_RELBIT, REL_MAX, array_bit_rel) ||
-        !setup_event_type(d->fdi, d->fdo, UI_SET_ABSBIT, ABS_MAX, array_bit_abs) ||
-        !setup_event_type(d->fdi, d->fdo, UI_SET_MSCBIT, MSC_MAX, array_bit_msc)) {
+    if (!setup_event_type(d->fdi, d->fdo, UI_SET_EVBIT, EV_SW, array_bit_ev, "EV")) {
         return false;
+    }
+    for (size_t k = 0; k < sizeof(kinds) / sizeof(kinds[0]); k++) {
+        if (!setup_event_type(d->fdi, d->fdo, kinds[k].request, kinds[k].max_val,
+                              kinds[k].bits, kinds[k].label)) {
+            return false;
+        }
     }
     return true;
 }
@@ -447,7 +455,7 @@ static bool add_injection_capabilities(int fdo, int cls, bool synthetic) {
         }
         if (synthetic) {
             // Sticks and the dpad hat, so the fallback pad reads as a whole
-            // gamepad and not a button box; same shape gamepad-emu builds.
+            // gamepad and not a button box.
             if (ioctl(fdo, UI_SET_EVBIT, EV_ABS) < 0) {
                 return false;
             }
@@ -565,7 +573,7 @@ static void* reader_thread(void *arg) {
     struct captured_device *d = arg;
     struct input_event ev = {0};
 
-    printf("[DEBUG] Reader thread started for %s (fd %d -> %d)\n", d->path, d->fdi, d->fdo);
+    debug("Reader thread started for %s (fd %d -> %d)\n", d->path, d->fdi, d->fdo);
 
     while (keep_running) {
         ssize_t n = read(d->fdi, &ev, sizeof ev);
@@ -668,27 +676,26 @@ static struct captured_device *device_for(unsigned int type, unsigned int code) 
 
     // Injection goes to the clone, which outlives the real device, so a slot
     // whose source is currently unplugged is still a perfectly good target.
+    //
+    // Best of one pass, ties going to the first slot: a device that is only
+    // this class beats one that merely covers it, which beats anything at all.
+    // Preferring the dedicated one matters for combined receivers — a Logitech
+    // unifying mouse advertises KEY_ESC and so on, and would otherwise swallow
+    // every keystroke into the mouse clone just because it comes first. With
+    // nothing in particular wanted, the first device is as good as any.
     struct captured_device *found = NULL;
+    int best = 0;
     pthread_mutex_lock(&devices_mutex);
 
-    if (want == 0) {
-        found = device_count > 0 ? &devices[0] : NULL;
-    }
-    // Prefer a device dedicated to this class. Combined receivers (a Logitech
-    // unifying mouse advertises KEY_ESC and so on) otherwise swallow every
-    // keystroke into the mouse clone just because they come first.
-    for (int i = 0; !found && i < device_count; i++) {
-        if (devices[i].cls == want) {
+    for (int i = 0; i < device_count; i++) {
+        int score = want == 0 ? 1
+                  : devices[i].cls == want ? 3
+                  : (devices[i].cls & want) ? 2
+                  : 1;
+        if (score > best) {
+            best = score;
             found = &devices[i];
         }
-    }
-    for (int i = 0; !found && i < device_count; i++) {
-        if (devices[i].cls & want) {
-            found = &devices[i];
-        }
-    }
-    if (!found && device_count > 0) {
-        found = &devices[0];
     }
 
     pthread_mutex_unlock(&devices_mutex);
@@ -768,43 +775,44 @@ static enum MHD_Result send_json(struct MHD_Connection *connection, unsigned int
 }
 
 static enum MHD_Result send_status(struct MHD_Connection *connection) {
-    // Sized for MAX_DEVICES entries at their longest: a truncated object here
-    // would be invalid JSON at the other end, not merely a shortened list.
-    char body[3072];
-    char devs[2560];
-    size_t off = 0;
+    // Built with json-c rather than printed into a buffer. A device names
+    // itself, and a name holding a quote or a backslash pasted straight into a
+    // string literal is a reply the extension cannot parse — and the buffer it
+    // was printed into had to be sized for the longest status there could ever
+    // be, because a status truncated mid-object is not a shorter list, it is
+    // broken JSON.
+    struct json_object *devs = json_object_new_array();
 
-    devs[0] = '\0';
     pthread_mutex_lock(&devices_mutex);
-    for (int i = 0; i < device_count && off < sizeof(devs) - 1; i++) {
-        int n = snprintf(devs + off, sizeof(devs) - off,
-                         "%s{\"index\":%d,\"name\":\"%s\",\"path\":\"%s\",\"grabbed\":%s,\"alive\":%s,\"watched\":%s,\"wanted\":\"%s\",\"keyboard\":%s,\"pointer\":%s,\"gamepad\":%s}",
-                         i ? "," : "",
-                         devices[i].index,
-                         devices[i].name,
-                         devices[i].path ? devices[i].path : "",
-                         devices[i].grabbed ? "true" : "false",
-                         devices[i].alive ? "true" : "false",
-                         devices[i].watched ? "true" : "false",
-                         devices[i].wanted,
-                         (devices[i].cls & CLASS_KEYBOARD) ? "true" : "false",
-                         (devices[i].cls & CLASS_POINTER) ? "true" : "false",
-                         (devices[i].cls & CLASS_GAMEPAD) ? "true" : "false");
-        if (n < 0) {
-            break;
-        }
-        off += (size_t)n;
+    for (int i = 0; i < device_count; i++) {
+        struct json_object *dev = json_object_new_object();
+        json_object_object_add(dev, "index", json_object_new_int(devices[i].index));
+        json_object_object_add(dev, "name", json_object_new_string(devices[i].name));
+        json_object_object_add(dev, "path", json_object_new_string(devices[i].path ? devices[i].path : ""));
+        json_object_object_add(dev, "grabbed", json_object_new_boolean(devices[i].grabbed));
+        json_object_object_add(dev, "alive", json_object_new_boolean(devices[i].alive));
+        json_object_object_add(dev, "watched", json_object_new_boolean(devices[i].watched));
+        json_object_object_add(dev, "wanted", json_object_new_string(devices[i].wanted));
+        json_object_object_add(dev, "keyboard", json_object_new_boolean(devices[i].cls & CLASS_KEYBOARD));
+        json_object_object_add(dev, "pointer", json_object_new_boolean(devices[i].cls & CLASS_POINTER));
+        json_object_object_add(dev, "gamepad", json_object_new_boolean(devices[i].cls & CLASS_GAMEPAD));
+        json_object_array_add(devs, dev);
     }
     pthread_mutex_unlock(&devices_mutex);
 
-    snprintf(body, sizeof(body),
-             "{\"version\":%d,\"recording\":%s,\"playing\":%s,\"devices\":[%s]}",
-             API_VERSION,
-             recording ? "true" : "false",
-             playing ? "true" : "false",
-             devs);
+    struct json_object *status = json_object_new_object();
+    json_object_object_add(status, "version", json_object_new_int(API_VERSION));
+    json_object_object_add(status, "recording", json_object_new_boolean(recording));
+    json_object_object_add(status, "playing", json_object_new_boolean(playing));
+    json_object_object_add(status, "devices", devs);
 
-    return send_json(connection, MHD_HTTP_OK, body);
+    // NOSLASHESCAPE: device paths are mostly slashes, and \/ is valid JSON but
+    // unreadable in a log.
+    const char *body = json_object_to_json_string_ext(
+        status, JSON_C_TO_STRING_PLAIN | JSON_C_TO_STRING_NOSLASHESCAPE);
+    enum MHD_Result ret = send_json(connection, MHD_HTTP_OK, body ? body : "{}");
+    json_object_put(status);
+    return ret;
 }
 
 static enum MHD_Result handle_play(struct MHD_Connection *connection, struct json_object *parsed) {
@@ -867,72 +875,62 @@ static enum MHD_Result handle_play(struct MHD_Connection *connection, struct jso
 static enum MHD_Result handle_post(struct MHD_Connection *connection, const char *url, const char *data) {
     struct json_object *parsed = data ? json_tokener_parse(data) : NULL;
     struct json_object *field;
+    // Every endpoint answers into `ret` and leaves through the one release at
+    // the bottom: the parsed body belongs to this function, and an endpoint
+    // that forgot to drop it leaked a request's worth of memory per call.
     enum MHD_Result ret;
 
     if (strcmp(url, "/play") == 0) {
-        if (!parsed) {
-            return send_json(connection, MHD_HTTP_BAD_REQUEST, "{\"error\":\"invalid json\"}");
-        }
-        ret = handle_play(connection, parsed);
-        json_object_put(parsed);
-        return ret;
-    }
+        ret = parsed ? handle_play(connection, parsed)
+                     : send_json(connection, MHD_HTTP_BAD_REQUEST, "{\"error\":\"invalid json\"}");
 
-    if (strcmp(url, "/stop") == 0) {
+    } else if (strcmp(url, "/stop") == 0) {
         play_abort = 1;
         release_all_held();
-        if (parsed) {
-            json_object_put(parsed);
-        }
-        return send_json(connection, MHD_HTTP_OK, "{\"stopped\":true}");
-    }
+        ret = send_json(connection, MHD_HTTP_OK, "{\"stopped\":true}");
 
-    if (strcmp(url, "/triggers") == 0) {
+    } else if (strcmp(url, "/triggers") == 0) {
         // Replace the whole set: {"codes":[275, 276]}. An empty array clears
         // it. Codes arrive as evdev numbers; names live in the extension.
         if (!parsed || !json_object_object_get_ex(parsed, "codes", &field) ||
             !json_object_is_type(field, json_type_array)) {
-            if (parsed) {
-                json_object_put(parsed);
+            ret = send_json(connection, MHD_HTTP_BAD_REQUEST,
+                            "{\"error\":\"expected {\\\"codes\\\":[…]}\"}");
+        } else {
+            unsigned char next[KEY_MAX + 1] = {0};
+            int wanted = (int)json_object_array_length(field);
+            int applied = 0;
+            for (int i = 0; i < wanted; i++) {
+                int code = json_object_get_int(json_object_array_get_idx(field, i));
+                if (code > 0 && code <= KEY_MAX) {
+                    next[code] = 1;
+                    applied++;
+                }
             }
-            return send_json(connection, MHD_HTTP_BAD_REQUEST,
-                             "{\"error\":\"expected {\\\"codes\\\":[…]}\"}");
-        }
-        unsigned char next[KEY_MAX + 1] = {0};
-        int wanted = (int)json_object_array_length(field);
-        int applied = 0;
-        for (int i = 0; i < wanted; i++) {
-            int code = json_object_get_int(json_object_array_get_idx(field, i));
-            if (code > 0 && code <= KEY_MAX) {
-                next[code] = 1;
-                applied++;
+            for (int code = 0; code <= KEY_MAX; code++) {
+                trigger_codes[code] = next[code];
             }
+            fprintf(stderr, "macroclickwerk: %d trigger code%s registered\n",
+                    applied, applied == 1 ? "" : "s");
+            char body[64];
+            snprintf(body, sizeof(body), "{\"triggers\":%d}", applied);
+            ret = send_json(connection, MHD_HTTP_OK, body);
         }
-        pthread_mutex_lock(&trigger_mutex);
-        memcpy((void *)trigger_codes, next, sizeof(trigger_codes));
-        pthread_mutex_unlock(&trigger_mutex);
-        json_object_put(parsed);
-        fprintf(stderr, "macroclickwerk: %d trigger code%s registered\n",
-                applied, applied == 1 ? "" : "s");
-        char body[64];
-        snprintf(body, sizeof(body), "{\"triggers\":%d}", applied);
-        return send_json(connection, MHD_HTTP_OK, body);
-    }
 
-    if (strcmp(url, "/record") == 0) {
+    } else if (strcmp(url, "/record") == 0) {
         bool on = parsed && json_object_object_get_ex(parsed, "on", &field) && json_object_get_boolean(field);
         recording = on;
-        printf("[DEBUG] Recording %s\n", on ? "started" : "stopped");
-        if (parsed) {
-            json_object_put(parsed);
-        }
-        return send_json(connection, MHD_HTTP_OK, on ? "{\"recording\":true}" : "{\"recording\":false}");
+        debug("Recording %s\n", on ? "started" : "stopped");
+        ret = send_json(connection, MHD_HTTP_OK, on ? "{\"recording\":true}" : "{\"recording\":false}");
+
+    } else {
+        ret = send_json(connection, MHD_HTTP_NOT_FOUND, "{\"error\":\"unknown endpoint\"}");
     }
 
     if (parsed) {
         json_object_put(parsed);
     }
-    return send_json(connection, MHD_HTTP_NOT_FOUND, "{\"error\":\"unknown endpoint\"}");
+    return ret;
 }
 
 static enum MHD_Result handle_request(void *cls,
@@ -957,7 +955,7 @@ static enum MHD_Result handle_request(void *cls,
     struct request_data *req_data = *con_cls;
 
     if (strcmp(method, "GET") == 0) {
-        printf("[DEBUG] GET %s\n", url);
+        debug("GET %s\n", url);
         return send_status(connection);
     }
 
@@ -976,7 +974,7 @@ static enum MHD_Result handle_request(void *cls,
             return MHD_YES;
         }
 
-        printf("[DEBUG] POST %s (%zu bytes)\n", url, req_data->size);
+        debug("POST %s (%zu bytes)\n", url, req_data->size);
         return handle_post(connection, url, req_data->post_data);
     }
 
@@ -1094,6 +1092,29 @@ static void start_reader(struct captured_device *d) {
     pthread_detach(d->reader);
 }
 
+/**
+ * Is the node we just opened still the device the scan matched? A scan happened
+ * a moment ago, and a moment is enough for the kernel to destroy a device and
+ * hand its event number to another — a Bluetooth mouse does exactly that on
+ * every connect, presenting a transient device first. So ask the device we
+ * actually opened what it is, and if that is not what was matched, walk away:
+ * the next hotplug pass will match whatever really lives here now.
+ *
+ * A slot wanted by path is its own answer — the path is what was opened. Fills
+ * `realname` with what the device calls itself either way.
+ */
+static bool device_still_matches(int fd, const char *path, const char *wanted,
+                                 char *realname, size_t size) {
+    realname[0] = '\0';
+    ioctl(fd, EVIOCGNAME(size - 1), realname);
+    if (wanted[0] == '/' || strcasecmp(realname, wanted) == 0) {
+        return true;
+    }
+    fprintf(stderr, "macroclickwerk: %s is now [%s], not the [%s] the scan saw; "
+            "leaving it for the next pass\n", path, realname, wanted);
+    return false;
+}
+
 // Caller holds devices_mutex.
 static bool setup_device(const char *path, const char *wanted) {
     struct captured_device *d = &devices[device_count];
@@ -1105,37 +1126,17 @@ static bool setup_device(const char *path, const char *wanted) {
     if (d->fdi < 0) {
         fprintf(stderr, "Error: Failed to open device [%s]: %s.\n", path, strerror(errno));
         fprintf(stderr, "Hint: Check the device path and that you have permission to read it.\n");
-        free(d->path);
-        d->path = NULL;
-        return false;
+        goto fail;
     }
 
-    // The node was matched by a scan a moment ago, and a moment is enough for
-    // the kernel to destroy the device and hand its event number to another —
-    // a Bluetooth mouse does exactly that on every connect, presenting a
-    // transient device first. So ask the device we actually opened what it is,
-    // and if that is not what the scan matched, walk away: the next hotplug
-    // pass will match whatever really lives here now.
-    d->realname[0] = '\0';
-    ioctl(d->fdi, EVIOCGNAME(sizeof(d->realname) - 1), d->realname);
-    if (wanted[0] != '/' && strcasecmp(d->realname, wanted) != 0) {
-        fprintf(stderr, "macroclickwerk: %s is now [%s], not the [%s] the scan saw; "
-                "leaving it for the next pass\n", path, d->realname, wanted);
-        close(d->fdi);
-        d->fdi = -1;
-        free(d->path);
-        d->path = NULL;
-        return false;
+    if (!device_still_matches(d->fdi, path, wanted, d->realname, sizeof(d->realname))) {
+        goto fail;
     }
 
     char clone_name[64];
     snprintf(clone_name, sizeof(clone_name), "Macroclickwerk Virtual Device %d", device_count);
     if (!create_clone(d, clone_name, 0)) {
-        close(d->fdi);
-        d->fdi = -1;
-        free(d->path);
-        d->path = NULL;
-        return false;
+        goto fail;
     }
 
     // Not grabbed here: the monitor thread does that, and only once something
@@ -1155,6 +1156,18 @@ static bool setup_device(const char *path, const char *wanted) {
     d->alive = true;
     device_count++;
     return true;
+
+    // The slot is left as it was found: no fd, no path, and free for the next
+    // device that comes along. device_count is untouched, so it is not a slot
+    // yet either.
+fail:
+    if (d->fdi >= 0) {
+        close(d->fdi);
+        d->fdi = -1;
+    }
+    free(d->path);
+    d->path = NULL;
+    return false;
 }
 
 /**
@@ -1185,10 +1198,7 @@ static bool attach_device(const char *path, const char *wanted) {
         // Same stale-scan guard as a fresh capture: make sure the node still
         // holds the device this slot is for before adopting it.
         char now[256] = "";
-        ioctl(fd, EVIOCGNAME(sizeof(now) - 1), now);
-        if (wanted[0] != '/' && strcasecmp(now, wanted) != 0) {
-            fprintf(stderr, "macroclickwerk: %s is now [%s], not the [%s] the scan saw; "
-                    "leaving it for the next pass\n", path, now, wanted);
+        if (!device_still_matches(fd, path, wanted, now, sizeof(now))) {
             close(fd);
             return false;
         }
@@ -1573,13 +1583,13 @@ static bool ensure_class(int cls, const char *name) {
         return false;
     }
 
-    printf("[DEBUG] Created synthetic device %s\n", name);
+    debug("Created synthetic device %s\n", name);
     device_count++;
     return true;
 }
 
 int main(int argc, char *argv[]) {
-    printf("[DEBUG] Starting macroclickwerk input service (API v%d)\n", API_VERSION);
+    debug("Starting macroclickwerk input service (API v%d)\n", API_VERSION);
 
     signal(SIGPIPE, SIG_IGN);
     signal(SIGTERM, sig_handler);
@@ -1677,7 +1687,7 @@ int main(int argc, char *argv[]) {
     pthread_t hotplug_thread;
     pthread_create(&hotplug_thread, NULL, monitor_thread, NULL);
 
-    printf("[DEBUG] Listening on %s and %s\n", SOCKET_PATH, EVENT_SOCKET_PATH);
+    debug("Listening on %s and %s\n", SOCKET_PATH, EVENT_SOCKET_PATH);
 
     // Polled rather than pause()d: a process-directed signal may be delivered
     // to whichever thread has it unblocked, and a pause() that another thread's
@@ -1692,7 +1702,7 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    printf("[DEBUG] Shutting down\n");
+    debug("Shutting down\n");
     release_all_held();
     MHD_stop_daemon(http_daemon);
     close(event_listen_fd);

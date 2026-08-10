@@ -469,22 +469,9 @@ curl --unix-socket /var/run/macroclickwerk-socket -X POST -d '{}'           http
 
 ### Checking what is captured
 
-`tools/watch-events` drives the daemon on its own — no shell extension involved.
-It lists the captured devices, turns recording on, decodes the stream, and tells
-you which devices actually produced anything:
-
-```bash
-tools/watch-events 15      # watch for 15 seconds, then summarise
-tools/watch-events         # until Ctrl-C
-tools/watch-events 15 --raw
-```
-
-If a device does not appear here, nothing above the daemon can see it either.
-With `-a` that means it did not look like a keyboard or pointer, or something
-else holds it exclusively — name it in `macroclickwerk.service` with `-n "<its
-name>"` to insist.
-
-Or by hand (`socat` works too, if you have it):
+`/status` lists the captured devices. To see which of them actually produce
+anything, turn recording on and read the event stream directly — no shell
+extension involved (`socat` works too, if you have it):
 
 ```bash
 curl --unix-socket /var/run/macroclickwerk-socket -X POST -d '{"on":true}' http://localhost/record
@@ -494,6 +481,11 @@ s.connect('/var/run/macroclickwerk-events')
 [print(s.recv(4096).decode(), end='') for _ in range(20)]"
 curl --unix-socket /var/run/macroclickwerk-socket -X POST -d '{"on":false}' http://localhost/record
 ```
+
+If a device produces nothing here, nothing above the daemon can see it either.
+With `-a` that means it did not look like a keyboard or pointer, or something
+else holds it exclusively — name it in `macroclickwerk.service` with `-n "<its
+name>"` to insist.
 
 `dt` is microseconds to wait *before* the event; `type`/`code`/`value` are raw
 evdev. `/play` answers once the train has finished playing. `/stop` aborts it and

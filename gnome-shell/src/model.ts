@@ -104,12 +104,12 @@ export type ClickStep = StepCommon & {
     x?: number;
     y?: number;
     /**
-     * 'tap' is the whole click, down then up after holdMs; the split halves
-     * exist for flows where what happens between the down and the up is other
-     * steps. Absent means take it from the event: a click under a split
-     * `onevent` goes down when the person pressed and comes up when they let
-     * go, and falls back to a whole tap when no event woke the run. See
-     * `followsEvent`.
+     * 'tap' is the whole click, down then up after holdMs; the halves exist
+     * for flows where what happens between the down and the up is other steps.
+     * Absent means take it from the event: a click under an `onevent` goes
+     * down when the person pressed and comes up when they let go, and falls
+     * back to a whole tap when no event woke the run. That is the editor's
+     * Follow toggle, which only appears under an event. See `followsEvent`.
      */
     action?: 'tap' | 'down' | 'up';
     holdMs?: number;
@@ -184,25 +184,31 @@ export type WaitStep = StepCommon & {
 };
 
 /**
- * Wait until a button or key is pressed, then go on. While a run is parked
- * here the daemon consumes that button, so the desktop only ever sees what
- * the steps after it do — press the side button, get the macro instead.
+ * Wait until a button or key changes, then go on. While a run is parked here
+ * the daemon consumes that button, so the desktop only ever sees what the
+ * steps after it do — press the side button, get the macro instead.
  */
 export type OnEventStep = StepCommon & {
     kind: 'onevent';
     /** evdev name of what is waited for: BTN_SIDE, KEY_F13, … */
     source: string;
     /**
-     * What wakes the run. 'click' (the default, and what absent means) is the
-     * plain case: the press wakes it and the matching release is swallowed
-     * along with it, one gesture. 'split' reacts to each edge separately —
-     * the step wakes on the next edge, whichever it is, so the first split
-     * step in a flow catches the press and the next one the release: a long
-     * click is two of them around whatever the hold should do. 'press' and
-     * 'release' are older spellings of the halves, still honoured.
+     * Which edge wakes the run. 'either' — the default, and what absent means
+     * — takes the next one whichever it is, so the first such step in a flow
+     * catches the press and the next one the release: a hold is two of them
+     * around whatever it should do, and the steps between follow the finger.
+     * 'press' and 'release' wait for that one edge and sleep through the
+     * other, which is how a flow says "only when they let go", and how the
+     * two halves of a hold are written out explicitly rather than by order.
      */
-    edge?: 'click' | 'split' | 'press' | 'release';
+    edge?: EventEdge;
 };
+
+/** @see OnEventStep.edge */
+export type EventEdge = 'press' | 'release' | 'either';
+
+/** The edges an `onevent` can wait for, in the order they are offered. */
+export const EVENT_EDGES: readonly EventEdge[] = ['either', 'press', 'release'];
 
 /**
  * A loop, and nothing else. It has no condition of its own: `loop while C` is
@@ -366,7 +372,7 @@ export function newStep(kind: StepKind): Step {
         case 'wait':
             return { id, kind: 'wait', ms: 1000, jitterMs: 0 };
         case 'onevent':
-            return { id, kind: 'onevent', source: 'BTN_SIDE', edge: 'click' };
+            return { id, kind: 'onevent', source: 'BTN_SIDE' };
         case 'loop':
             return { id, kind: 'loop', count: 'forever', body: [] };
         case 'if':
@@ -449,71 +455,84 @@ export function pathToStep(list: Step[], id: string): string[] {
     return [];
 }
 
-/** What kind of `onevent` a step is under: one whole click, or one edge of one. */
-export type EventFollow = 'click' | 'split';
-
-const followOf = (step: Step): EventFollow | null =>
-    step.kind !== 'onevent' ? null
-        : (step.edge ?? 'click') === 'click' ? 'click' : 'split';
-
 /**
  * Which "When …" step, if any, a step runs under — and so where its edge comes
- * from. A click or key press below an event does not decide for itself: under a
- * whole click it is a whole click, and under a split event it takes the edge the
- * event brought, going down when the person pressed and up when they let go.
- * That is what makes "hold the side button, hold E" a pair of steps rather than
- * a guess at a duration, and it is why the editor offers those steps no action
- * to pick — the row above already said it.
+ * from. A click or key press below an event need not decide for itself: left
+ * without an action of its own it takes the edge the event brought, going down
+ * when the person pressed and up when they let go. That is what makes "hold
+ * the side button, hold E" a pair of steps rather than a guess at a duration.
+ * The editor uses the answer twice over: to offer those steps the choice of
+ * following, and to draw them as the block they are.
  *
  * Order is the order steps are written, which is the order they run: an event
  * covers everything after it, including the insides of a repeat or an if that
  * comes after it. A repeat also comes back round, so an event anywhere in its
  * body covers that whole body — on the second pass, every step in there is
  * below it.
+ *
+ * Answered for the whole macro in one pass, keyed by step id, because the
+ * editor needs it for every row it draws: asking per row meant rescanning the
+ * macro — and rescanning each repeat's body inside that — once per step.
+ * Steps under no event are simply absent from the map.
  */
-export function followsEvent(root: Step[], stepId: string): EventFollow | null {
+export function eventFollows(root: Step[]): Map<string, OnEventStep> {
     /** The last event in a list, at any depth: what a repeat's body comes back to. */
-    const lastIn = (list: Step[]): EventFollow | null => {
-        let last: EventFollow | null = null;
+    const lastIn = (list: Step[]): OnEventStep | null => {
+        let last: OnEventStep | null = null;
         for (const step of list) {
             for (const child of childLists(step)) {
                 last = lastIn(child.steps) ?? last;
             }
-            last = followOf(step) ?? last;
+            if (step.kind === 'onevent') {
+                last = step;
+            }
         }
         return last;
     };
 
-    let answer: EventFollow | null = null;
-    const scan = (list: Step[], carried: EventFollow | null): boolean => {
+    const under = new Map<string, OnEventStep>();
+    const scan = (list: Step[], carried: OnEventStep | null): void => {
         let armed = carried;
         for (const step of list) {
-            if (step.id === stepId) {
-                answer = armed;
-                return true;
+            if (armed) {
+                under.set(step.id, armed);
             }
             const wraps = step.kind === 'loop';
             for (const child of childLists(step)) {
-                if (scan(child.steps, wraps ? lastIn(child.steps) ?? armed : armed)) {
-                    return true;
-                }
+                scan(child.steps, wraps ? lastIn(child.steps) ?? armed : armed);
             }
-            armed = followOf(step) ?? armed;
+            if (step.kind === 'onevent') {
+                armed = step;
+            }
         }
-        return false;
     };
     scan(root, null);
-    return answer;
+    return under;
 }
 
-export function findStep(list: Step[], id: string): StepLocation | null {
-    let found: StepLocation | null = null;
-    walk(list, loc => {
-        if (!found && loc.step.id === id) {
-            found = loc;
+/** @see eventFollows — this is that answer for one step. */
+export function followsEvent(root: Step[], stepId: string): OnEventStep | null {
+    return eventFollows(root).get(stepId) ?? null;
+}
+
+/**
+ * Where a step sits: its list, its index in it, and how deep that list is. Walks
+ * only as far as the step — the editor asks this once per row, so scanning the
+ * rest of the macro afterwards is work done for nobody.
+ */
+export function findStep(list: Step[], id: string, depth = 0): StepLocation | null {
+    for (const [index, step] of list.entries()) {
+        if (step.id === id) {
+            return { list, index, step, depth };
         }
-    });
-    return found;
+        for (const child of childLists(step)) {
+            const inner = findStep(child.steps, id, depth + 1);
+            if (inner) {
+                return inner;
+            }
+        }
+    }
+    return null;
 }
 
 /** Where a recording lands: a list, and the index to put the first step at. */
@@ -589,15 +608,9 @@ export function moveStepTo(root: Step[], id: string, into: Step[], at: number): 
     if (!loc) {
         return false;
     }
-    let insideItself = false;
-    walk([loc.step], inner => {
-        for (const child of childLists(inner.step)) {
-            if (child.steps === into) {
-                insideItself = true;
-            }
-        }
-    });
-    if (insideItself) {
+    const holds = (step: Step): boolean =>
+        childLists(step).some(child => child.steps === into || child.steps.some(holds));
+    if (holds(loc.step)) {
         return false;
     }
     // Same-list moves: taking the step out shifts everything after it left, so
@@ -626,16 +639,20 @@ export function moveStep(list: Step[], id: string, delta: number): boolean {
 }
 
 /** The container a step sits inside, and where that container itself sits. */
-export function parentOf(root: Step[], id: string): StepLocation | null {
-    let found: StepLocation | null = null;
-    walk(root, loc => {
-        for (const child of childLists(loc.step)) {
-            if (!found && child.steps.some(s => s.id === id)) {
-                found = loc;
+export function parentOf(root: Step[], id: string, depth = 0): StepLocation | null {
+    for (const [index, step] of root.entries()) {
+        const lists = childLists(step);
+        if (lists.some(child => child.steps.some(s => s.id === id))) {
+            return { list: root, index, step, depth };
+        }
+        for (const child of lists) {
+            const inner = parentOf(child.steps, id, depth + 1);
+            if (inner) {
+                return inner;
             }
         }
-    });
-    return found;
+    }
+    return null;
 }
 
 /**
@@ -1044,23 +1061,6 @@ function migrateGuards(steps: Step[]): Step[] {
     return migrated;
 }
 
-/**
- * Clear the action from press steps that follow a split `onevent`. Their edge
- * comes from the event, so a setting of their own is dead weight — and worse,
- * it would be invisible weight: the editor stops offering the choice there, so
- * a value left over from before the event was wired in would go on being obeyed
- * with nothing on screen to say so. That is exactly how a click meant to be
- * held for as long as a button is down ends up being held for 0.2 s instead.
- */
-function dropFollowedActions(body: Step[]): void {
-    walk(body, ({ step }) => {
-        if ((step.kind === 'click' || step.kind === 'key' || step.kind === 'pad') &&
-            step.action !== undefined && followsEvent(body, step.id) !== null) {
-            step.action = undefined;
-        }
-    });
-}
-
 export function parseDocument(json: string): MacroDocument {
     if (!json || json.trim() === '') {
         return emptyDocument();
@@ -1070,6 +1070,13 @@ export function parseDocument(json: string): MacroDocument {
         if (!raw || !Array.isArray(raw.macros)) {
             return emptyDocument();
         }
+        // Every pass below runs on every document, current ones included, and
+        // deliberately so. Gating them on `version` would save a few
+        // microseconds of a parse that measures under twenty on a real
+        // document, and would buy them by trusting a version number: a
+        // hand-edited export, or anything else that arrives claiming to be
+        // current while missing an id, would reach the editor unrepaired.
+
         // Repair anything that lost an id, so the UI never deals with undefined.
         const macros = raw.macros.map(macro => {
             const fixed: Macro = {
@@ -1090,9 +1097,19 @@ export function parseDocument(json: string): MacroDocument {
                 // rather than left behind to mean nothing: a step that is in a
                 // macro runs when that macro does.
                 delete (loc.step as { enabled?: boolean }).enabled;
+                // An `onevent` used to offer a whole-click mode: the press woke
+                // it and the release was swallowed along with it. That is gone,
+                // and 'split' is now spelled 'either', so both drop to the
+                // default. 'press' and 'release' still mean what they always
+                // did and are left alone. Dropping 'click' does change what
+                // such a step does — the click below it now follows the finger
+                // instead of running a fixed hold of its own.
+                const edge = (loc.step as { edge?: string }).edge;
+                if (loc.step.kind === 'onevent' && (edge === 'click' || edge === 'split')) {
+                    delete (loc.step as { edge?: string }).edge;
+                }
             });
             fixed.body = dropRawSteps(migrateGuards(migrateGates(migrateLoops(fixed.body))));
-            dropFollowedActions(fixed.body);
             return fixed;
         });
         return { version: raw.version ?? DOCUMENT_VERSION, macros };
@@ -1156,25 +1173,20 @@ export function describeCondition(cond: Condition | null | undefined): string {
     }
 }
 
-/** BTN_SIDE → "the side button is clicked", KEY_F13 → "F13 is released". */
-export function prettySource(
-    source: string,
-    edge: 'click' | 'split' | 'press' | 'release' = 'click',
-): string {
+/** BTN_SIDE → "the side button is pressed or released", KEY_F13 → "F13 is released". */
+export function prettySource(source: string, edge: EventEdge = 'either'): string {
+    const verb = edge === 'press' ? 'is pressed'
+        : edge === 'release' ? 'is released'
+            : 'is pressed or released';
     const pad = GAMEPAD_BUTTONS[source];
-    const button = !pad && source.match(/^BTN_(\w+)$/);
-    const verb = edge === 'split' ? 'pressed or released'
-        : edge === 'release' ? 'released'
-            : edge === 'press' ? 'pressed'
-                // The whole-click case: buttons click, keys press.
-                : button ? 'clicked' : 'pressed';
     if (pad) {
-        return `pad ${pad} is ${verb}`;
+        return `pad ${pad} ${verb}`;
     }
+    const button = source.match(/^BTN_(\w+)$/);
     if (button) {
-        return `the ${button[1].toLowerCase()} button is ${verb}`;
+        return `the ${button[1].toLowerCase()} button ${verb}`;
     }
-    return `${source.replace(/^KEY_/, '') || '…'} is ${verb}`;
+    return `${source.replace(/^KEY_/, '') || '…'} ${verb}`;
 }
 
 /** How a key or pad step reads. Absent is the follow, and follows just press. */

@@ -416,10 +416,10 @@ check('pathToStep of a missing step is empty', pathToStep(flat.body, 'gone').len
 // continuing on the press, and being stoppable while parked.
 {
     const waiters = [];
-    const waitForInput = (_source, edge) => {
+    const waitForInput = source => {
         let resolver;
         const promise = new Promise(resolve => { resolver = resolve; });
-        const waiter = { edge, fire: (on = 'press') => resolver(on), cancelled: false };
+        const waiter = { source, fire: (on = 'press') => resolver(on), cancelled: false };
         waiters.push(waiter);
         return {
             promise,
@@ -449,7 +449,8 @@ check('pathToStep of a missing step is empty', pathToStep(flat.body, 'gone').len
     await until(() => waiters.length === 1);
     check('the run parks on the onevent step', waiters.length === 1 && seen.join(' ') === 'on',
           seen.join(' '));
-    check('and asks for the edge the step names', waiters[0].edge === 'click', waiters[0].edge);
+    check('waiting on the source the step names', waiters[0].source === 'BTN_SIDE',
+          waiters[0].source);
     waiters[0].fire();
     await run;
     check('the press lets it continue', seen.join(' ') === 'on then', seen.join(' '));
@@ -478,11 +479,11 @@ check('pathToStep of a missing step is empty', pathToStep(flat.body, 'gone').len
           reason === 'error', reason);
 }
 
-// --- a click under a split event follows that event's edge -------------------
+// --- a click under an event follows that event's edge ------------------------
 
 // The long click: press the side button and the left button goes down, let go
 // and it comes up. Neither click step says which — they take it from the event
-// above them, which is why the editor stops offering the choice.
+// above them, which is what the editor's follow toggle leaves them doing.
 {
     const played = [];
     const watching = {
@@ -491,20 +492,20 @@ check('pathToStep of a missing step is empty', pathToStep(flat.body, 'gone').len
     };
 
     const waiters = [];
-    const waitForInput = (_source, edge) => {
+    const waitForInput = (source, edge) => {
         let resolver;
         const promise = new Promise(resolve => { resolver = resolve; });
-        waiters.push({ edge, fire: on => resolver(on) });
+        waiters.push({ source, edge, fire: on => resolver(on) });
         return { promise, cancel: () => resolver(null) };
     };
 
     const hold = newMacro('hold');
     const down = named('onevent', 'down');
     down.source = 'BTN_SIDE';
-    down.edge = 'split';
+    down.edge = 'press';
     const up = named('onevent', 'up');
     up.source = 'BTN_SIDE';
-    up.edge = 'split';
+    up.edge = 'release';
     const clickA = named('click', 'clickA');
     const clickB = named('click', 'clickB');
     // Left, where the pointer is, and no action of their own: the follow.
@@ -515,9 +516,9 @@ check('pathToStep of a missing step is empty', pathToStep(flat.body, 'gone').len
     }
     hold.body.push(down, clickA, up, clickB);
 
-    check('the editor knows both clicks follow the split event',
-          followsEvent(hold.body, clickA.id) === 'split'
-          && followsEvent(hold.body, clickB.id) === 'split');
+    check('the editor knows which event each click answers to',
+          followsEvent(hold.body, clickA.id)?.id === down.id
+          && followsEvent(hold.body, clickB.id)?.id === up.id);
     check('and that the first event itself follows nothing',
           followsEvent(hold.body, down.id) === null);
 
@@ -533,6 +534,9 @@ check('pathToStep of a missing step is empty', pathToStep(flat.body, 'gone').len
     check('and letting go brings it up',
           played.length === 2 && played[1].value === 0 && played[1].code === BTN_LEFT,
           JSON.stringify(played));
+    check('each event asked for the one edge it names',
+          waiters.map(w => w.edge).join() === 'press,release',
+          waiters.map(w => w.edge).join());
 }
 
 // The shape a repeat gives you for free: one event and one click going round
@@ -542,10 +546,10 @@ check('pathToStep of a missing step is empty', pathToStep(flat.body, 'gone').len
 {
     const played = [];
     const waiters = [];
+    const asked = [];
     const macro = newMacro('round');
     const on = named('onevent', 'round-on');
     on.source = 'BTN_RIGHT';
-    on.edge = 'split';
     const click = named('click', 'round-click');
     click.button = 'left';
     click.mode = 'current';
@@ -559,10 +563,11 @@ check('pathToStep of a missing step is empty', pathToStep(flat.body, 'gone').len
         play: async events => { played.push(...events); return { aborted: false }; },
         stop: async () => {},
     }, evaluator, {}, {}, {
-        waitForInput: () => {
+        waitForInput: (source, edge) => {
             let resolver;
             const promise = new Promise(resolve => { resolver = resolve; });
-            waiters.push({ fire: edge => resolver(edge) });
+            asked.push(edge);
+            waiters.push({ fire: on => resolver(on) });
             return { promise, cancel: () => resolver(null) };
         },
     });
@@ -577,6 +582,8 @@ check('pathToStep of a missing step is empty', pathToStep(flat.body, 'gone').len
     check('a repeat over one event and one click alternates down and up',
           played.slice(0, 4).map(e => e.value).join('') === '1010',
           JSON.stringify(played.map(e => e.value)));
+    check('an event that names no edge takes whichever comes next',
+          asked[0] === 'either', String(asked[0]));
 }
 
 // A click with nothing waking it is still a whole click: down, then up after
@@ -598,43 +605,6 @@ check('pathToStep of a missing step is empty', pathToStep(flat.body, 'gone').len
           JSON.stringify(played));
 }
 
-// A whole-click event is over by the time the run moves on, so what follows it
-// is not inside a gesture and clicks normally.
-{
-    const played = [];
-    const waiters = [];
-    const macro = newMacro('whole');
-    const on = named('onevent', 'whole-on');
-    on.source = 'BTN_SIDE';
-    on.edge = 'click';
-    const click = named('click', 'after');
-    click.button = 'left';
-    click.mode = 'current';
-    delete click.action;
-    macro.body.push(on, click);
-
-    check('a step under a whole-click event follows a whole click',
-          followsEvent(macro.body, click.id) === 'click');
-
-    const running = new MacroRunner({
-        play: async events => { played.push(...events); return { aborted: false }; },
-        stop: async () => {},
-    }, evaluator, {}, {}, {
-        waitForInput: () => {
-            let resolver;
-            const promise = new Promise(resolve => { resolver = resolve; });
-            waiters.push({ fire: on2 => resolver(on2) });
-            return { promise, cancel: () => resolver(null) };
-        },
-    }).run(macro);
-    await until(() => waiters.length === 1);
-    waiters[0].fire('press');
-    await running;
-    check('and clicks whole rather than sticking down',
-          played.length === 2 && played[0].value === 1 && played[1].value === 0,
-          JSON.stringify(played));
-}
-
 // Where the follow reaches: after the event, into what comes after it, and
 // round a repeat — an event in a loop body is before every step in that body
 // from the second pass on.
@@ -642,7 +612,6 @@ check('pathToStep of a missing step is empty', pathToStep(flat.body, 'gone').len
     const nested = newMacro('nested');
     const before = named('click', 'before');
     const ev = named('onevent', 'ev');
-    ev.edge = 'split';
     const inIf = named('click', 'inIf');
     const iff = named('if', 'iff');
     iff.then = [inIf];
@@ -650,17 +619,16 @@ check('pathToStep of a missing step is empty', pathToStep(flat.body, 'gone').len
     check('a click above the event decides for itself',
           followsEvent(nested.body, before.id) === null);
     check('a click inside a branch below the event follows',
-          followsEvent(nested.body, inIf.id) === 'split');
+          followsEvent(nested.body, inIf.id)?.id === ev.id);
 
     const looped = newMacro('looped');
     const first = named('click', 'first');
     const wrapped = named('onevent', 'wrapped');
-    wrapped.edge = 'split';
     const loop = named('loop', 'loop');
     loop.body = [first, wrapped];
     looped.body.push(loop);
     check('a repeat comes back round, so its whole body follows',
-          followsEvent(looped.body, first.id) === 'split');
+          followsEvent(looped.body, first.id)?.id === wrapped.id);
 }
 
 // --- a pad step is a key press in the gamepad range --------------------------

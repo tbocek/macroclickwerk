@@ -19,19 +19,24 @@ import {
     type ClickStep,
     type Condition,
     type ConditionType,
+    type EventEdge,
+    type KeyStep,
     type LlmCondition,
     type Macro,
     type MouseButton,
     type MoveStep,
+    type OnEventStep,
+    type PadStep,
     type Region,
     type Step,
     type StepKind,
+    EVENT_EDGES,
     childLists,
     describeCondition,
     describeStep,
     emptyDocument,
     findStep,
-    followsEvent,
+    eventFollows,
     macroEnabled,
     moveStepNested,
     moveStepTo,
@@ -49,6 +54,11 @@ import { MacroStore } from './src/store.js';
 import { buildInstruction, testConnection } from './src/llm.js';
 import { comboCodes, isArmed, parseTriggers, type Trigger } from './src/triggers.js';
 import { keyName } from './src/keymap.js';
+import {
+    chooser, clearClasses, comboRow, commitNumbers, debounce, descendants, entryRow,
+    iconButton, infoButton, passwordRow, setClass, spinRow, spinSuffix, suffixEntry,
+    toggleButton,
+} from './src/widgets.js';
 
 const CONDITION_TYPES: ConditionType[] = ['always', 'llm', 'color', 'and', 'or', 'not'];
 
@@ -157,6 +167,13 @@ const keyActionLabels = (): Record<string, string> => ({
     up: _('Release'),
 });
 
+/** Which edge a "When …" waits for. Built on demand, as the others are. */
+const eventEdgeLabels = (): Record<string, string> => ({
+    either: _('Press or release'),
+    press: _('Press'),
+    release: _('Release'),
+});
+
 /**
  * The kinds worth a play button: one action each, over as soon as it is done.
  * A loop or an `if` would drag its whole body along, and an endless loop would
@@ -228,6 +245,13 @@ const EDITOR_CSS = `
     background-color: alpha(@warning_color, 0.06);
 }
 
+/* A "When …" and the steps that take their edge from it are one gesture, and
+   the rail down their left edge says so. Neutral on purpose: the branch
+   colours mean containment, and this is sequence. Shadow and no fill, so it
+   works the same on a row that opens, and so the state rails below overwrite
+   it rather than stacking beside it. */
+.macroclickwerk-event { box-shadow: inset 4px 0 0 alpha(@window_fg_color, 0.35); }
+
 .macroclickwerk-running {
     background-color: alpha(@accent_bg_color, 0.28);
     box-shadow: inset 4px 0 0 @accent_bg_color;
@@ -277,6 +301,18 @@ const DROP_CLASSES = [
     'macroclickwerk-drop-above', 'macroclickwerk-drop-below', 'macroclickwerk-drop-into',
 ];
 
+/** What a row painted as the recording target may be wearing, row or block. */
+const RECORD_CLASSES = [
+    'macroclickwerk-record-target', 'macroclickwerk-record-target-block',
+    'macroclickwerk-recording-now', 'macroclickwerk-recording-now-block',
+];
+
+/** The same for a row the runner is standing on, and for its icon. */
+const RUN_ROW_CLASSES = ['macroclickwerk-running', 'macroclickwerk-running-block'];
+const RUN_ICON_CLASSES = [
+    'macroclickwerk-running-icon', 'macroclickwerk-running-parent-icon',
+];
+
 /** How far a step inside a body sits in from the rail of that body. */
 const INDENT_PX = 12;
 
@@ -286,298 +322,6 @@ const INDENT_PX = 12;
  * enough that a later resize — an expander opening — is your doing, not ours.
  */
 const SCROLL_SETTLE_MS = 400;
-
-function debounce(fn: () => void, ms = 400): () => void {
-    let sourceId = 0;
-    return () => {
-        if (sourceId) {
-            GLib.source_remove(sourceId);
-        }
-        sourceId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, ms, () => {
-            sourceId = 0;
-            fn();
-            return GLib.SOURCE_REMOVE;
-        });
-    };
-}
-
-/** Shared tail of entryRow and passwordRow: the initial text and a debounced commit. */
-function commitOnChange(row: Adw.EntryRow, value: string, onChange: (text: string) => void): Adw.EntryRow {
-    row.set_text(value);
-    row.connect('changed', debounce(() => onChange(row.get_text() ?? '')));
-    return row;
-}
-
-function entryRow(title: string, value: string, onChange: (text: string) => void): Adw.EntryRow {
-    return commitOnChange(new Adw.EntryRow({ title }), value, onChange);
-}
-
-/** An entry that masks what is typed with dots, for secrets; the reveal eye is built in. */
-function passwordRow(title: string, value: string, onChange: (text: string) => void): Adw.EntryRow {
-    return commitOnChange(new Adw.PasswordEntryRow({ title }), value, onChange);
-}
-
-function spinRow(
-    title: string,
-    value: number,
-    lower: number,
-    upper: number,
-    step: number,
-    onChange: (value: number) => void,
-): Adw.SpinRow {
-    const row = new Adw.SpinRow({
-        title,
-        adjustment: new Gtk.Adjustment({ lower, upper, stepIncrement: step, value }),
-    });
-    row.connect('notify::value', () => onChange(row.get_value()));
-    return row;
-}
-
-function comboRow<T extends string>(
-    title: string,
-    options: readonly T[],
-    labels: Record<string, string>,
-    selected: T,
-    onChange: (value: T) => void,
-): Adw.ComboRow {
-    const model = new Gtk.StringList();
-    for (const option of options) {
-        model.append(labels[option] ?? option);
-    }
-    const row = new Adw.ComboRow({
-        title,
-        model,
-        selected: Math.max(0, options.indexOf(selected)),
-    });
-    // Tracked rather than compared against the initial value, so picking A, B, A
-    // still reports the last change. The empty string is a real choice — "this
-    // macro", "from the top" — so only out-of-range reads are dropped.
-    let current = selected;
-    row.connect('notify::selected', () => {
-        const value = options[row.get_selected()];
-        if (value !== undefined && value !== current) {
-            current = value;
-            onChange(value);
-        }
-    });
-    return row;
-}
-
-/**
- * The number half of spinRow, without the row, for when it belongs beside
- * another setting instead of on a line of its own. Whole numbers only — every
- * one of these counts something: milliseconds, pixels, how far off a colour is.
- */
-/** 10^(digits before the point − 1): the size of one leading-digit step. */
-function magnitudeOf(value: number): number {
-    return Math.pow(10, Math.floor(Math.log10(value) + 1e-9));
-}
-
-/**
- * One leading digit at the current size is what a nudge moves by: 1 ms steps
- * under 10 ms, 10 ms steps to 90 ms, 100 ms steps under a second, whole
- * seconds to 9 s, tens to 90 s, and so on for as long as the range runs —
- * the finer the value, the finer the nudge. Off-band values round onto the
- * band in the direction pressed, and crossing a boundary lands exactly on it:
- * down from 100 is 90, not 0.
- */
-function bandedUp(value: number): number {
-    if (value < 0) {
-        return -bandedDown(-value);
-    }
-    if (value === 0) {
-        return 1;
-    }
-    const step = magnitudeOf(value);
-    return (Math.floor(value / step + 1e-9) + 1) * step;
-}
-
-function bandedDown(value: number): number {
-    if (value < 0) {
-        return -bandedUp(-value);
-    }
-    if (value <= 1) {
-        return 0;
-    }
-    const step = magnitudeOf(Math.max(value - 1, 1));
-    return (Math.ceil(value / step - 1e-9) - 1) * step;
-}
-
-/** 200 → "0.2s", 20 → "20ms", 2500 → "2.5s": how a time field shows itself. */
-function formatMsUnits(ms: number): string {
-    if (Math.abs(ms) < 100) {
-        return `${ms}ms`;
-    }
-    return `${Number.parseFloat((ms / 1000).toFixed(3))}s`;
-}
-
-/** "0.2s" → 200, "20ms" → 20, and a bare "200" is milliseconds. */
-function parseMsUnits(text: string): number | null {
-    const match = text.trim().match(/^(-?\d+(?:[.,]\d+)?)\s*(ms|s)?$/i);
-    if (!match) {
-        return null;
-    }
-    const number = Number.parseFloat(match[1].replace(',', '.'));
-    if (!Number.isFinite(number)) {
-        return null;
-    }
-    return Math.round(match[2]?.toLowerCase() === 's' ? number * 1000 : number);
-}
-
-/**
- * A number with − and + beside it. Not a GtkSpinButton: the whole point is
- * the banded stepping above, and a spin button's increment is fixed per
- * widget, not per press. With `timeUnits` the field speaks human time —
- * shows 0.2s rather than 200, reads "300ms", "0.5s" and bare milliseconds.
- */
-function spinSuffix(
-    value: number,
-    lower: number,
-    upper: number,
-    tooltip: string,
-    onChange: (value: number) => void,
-    timeUnits = false,
-): Gtk.Widget {
-    const clamp = (v: number) => Math.max(lower, Math.min(upper, Math.round(v)));
-    let current = clamp(value);
-    const show = (v: number) => timeUnits ? formatMsUnits(v) : `${v}`;
-    const parse = (text: string) => {
-        if (timeUnits) {
-            return parseMsUnits(text);
-        }
-        const parsed = Number.parseInt(text.trim(), 10);
-        return Number.isFinite(parsed) ? parsed : null;
-    };
-
-    const entry = new Gtk.Entry({
-        text: show(current),
-        tooltip_text: tooltip,
-        valign: Gtk.Align.CENTER,
-        xalign: 1,
-        input_purpose: Gtk.InputPurpose.DIGITS,
-        // Sized to the largest number it can hold, plus a minus sign where
-        // there can be one, but capped: a wait may run to an hour, and a field
-        // sized for 3600000 is a wide field on every row that a wait is not.
-        // Past the cap it scrolls — the value stays whole, only its widest end
-        // is out of view, and that end is the rare one. Time fields get one
-        // more, for the unit: "0.25s" is five.
-        width_chars: Math.min(timeUnits ? 5 : 4, Math.max(3, `${upper}`.length + (lower < 0 ? 1 : 0))),
-        max_width_chars: Math.min(timeUnits ? 5 : 4, Math.max(3, `${upper}`.length + (lower < 0 ? 1 : 0))),
-    });
-
-    /** What the field says right now, for the nudge to step from — the typed
-     * text when it parses, the last good value when it does not. */
-    const read = () => {
-        const parsed = parse(entry.get_text() ?? '');
-        return parsed !== null ? clamp(parsed) : current;
-    };
-    const commit = (next: number) => {
-        current = clamp(next);
-        entry.set_text(show(current));
-        onChange(current);
-    };
-    // Typing commits after a pause, so half-typed numbers do not fire.
-    const typed = debounce(() => {
-        const parsed = parse(entry.get_text() ?? '');
-        if (parsed !== null && clamp(parsed) === parsed && parsed !== current) {
-            current = parsed;
-            onChange(current);
-        }
-    });
-    entry.connect('changed', typed);
-    entry.connect('activate', () => commit(read()));
-
-    const minus = new Gtk.Button({ label: '−', tooltip_text: tooltip });
-    const plus = new Gtk.Button({ label: '+', tooltip_text: tooltip });
-    minus.connect('clicked', () => commit(bandedDown(read())));
-    plus.connect('clicked', () => commit(bandedUp(read())));
-
-    const box = new Gtk.Box({
-        valign: Gtk.Align.CENTER,
-        css_classes: ['linked', 'macroclickwerk-spin'],
-    });
-    box.append(entry);
-    box.append(minus);
-    box.append(plus);
-    return box;
-}
-
-/**
- * A label factory for GtkDropDown. The button and the popup want different
- * things from the same strings — the button must not grow the window, the list
- * must stay readable — so each gets its own.
- */
-function labelFactory(forButton: boolean, maxChars: number): Gtk.SignalListItemFactory {
-    const factory = new Gtk.SignalListItemFactory();
-    factory.connect('setup', (_f, item: Gtk.ListItem) => {
-        item.set_child(new Gtk.Label({
-            xalign: forButton ? 1 : 0,
-            ellipsize: forButton ? Pango.EllipsizeMode.END : Pango.EllipsizeMode.NONE,
-            max_width_chars: forButton ? maxChars : -1,
-        }));
-    });
-    factory.connect('bind', (_f, item: Gtk.ListItem) => {
-        const label = item.get_child() as Gtk.Label;
-        label.set_label((item.get_item() as Gtk.StringObject).get_string() ?? '');
-    });
-    return factory;
-}
-
-/**
- * The chooser half of comboRow, without the row, for when it belongs beside
- * another setting instead of on a line of its own. Same change tracking.
- *
- * A dropdown is as wide as its widest entry, and these sit on rows that are
- * already full, so the button is capped and ellipsized — a macro called
- * something long, or a step described at length, would otherwise set the width
- * of the whole window. The popup still shows every label whole.
- */
-function chooser<T extends string>(
-    options: readonly T[],
-    labels: Record<string, string>,
-    selected: T,
-    tooltip: string,
-    onChange: (value: T) => void,
-    maxChars = 22,
-): Gtk.DropDown {
-    const model = new Gtk.StringList();
-    for (const option of options) {
-        model.append(labels[option] ?? option);
-    }
-    const dropdown = new Gtk.DropDown({
-        model,
-        selected: Math.max(0, options.indexOf(selected)),
-        tooltip_text: tooltip,
-        valign: Gtk.Align.CENTER,
-        factory: labelFactory(true, maxChars),
-        list_factory: labelFactory(false, maxChars),
-    });
-    let current = selected;
-    dropdown.connect('notify::selected', () => {
-        const value = options[dropdown.get_selected()];
-        if (value !== undefined && value !== current) {
-            current = value;
-            onChange(value);
-        }
-    });
-    return dropdown;
-}
-
-/** A bare entry for a row suffix, where an EntryRow would be a whole row. */
-function suffixEntry(
-    text: string, placeholder: string, tooltip: string,
-    onChange: (text: string) => void,
-): Gtk.Entry {
-    const entry = new Gtk.Entry({
-        text,
-        placeholder_text: placeholder,
-        tooltip_text: tooltip,
-        valign: Gtk.Align.CENTER,
-        width_chars: 9,
-    });
-    entry.connect('changed', () => onChange(entry.get_text() ?? ''));
-    return entry;
-}
 
 /** What a trigger can take over, beside any key by name. */
 const TRIGGER_SOURCES = ['BTN_LEFT', 'BTN_RIGHT', 'BTN_MIDDLE', 'BTN_SIDE', 'BTN_EXTRA'] as const;
@@ -601,67 +345,6 @@ const triggerActionLabels = (): Record<string, string> => ({
     stop: _('Stop a macro'),
 });
 
-function iconButton(iconName: string, tooltip: string, onClick: () => void): Gtk.Button {
-    const button = new Gtk.Button({
-        icon_name: iconName,
-        tooltip_text: tooltip,
-        valign: Gtk.Align.CENTER,
-        css_classes: ['flat'],
-    });
-    button.connect('clicked', onClick);
-    return button;
-}
-
-/** The toggle sibling of `iconButton`: same flat row-suffix styling. */
-function toggleButton(iconName: string, tooltip: string, active: boolean): Gtk.ToggleButton {
-    return new Gtk.ToggleButton({
-        icon_name: iconName,
-        tooltip_text: tooltip,
-        active,
-        valign: Gtk.Align.CENTER,
-        css_classes: ['flat'],
-    });
-}
-
-/** As tall as a popover is allowed to get before its text starts scrolling. */
-const POPOVER_MAX_H = 420;
-
-/**
- * A ⓘ that opens a popover. For guidance too long for a subtitle and too small
- * for documentation nobody opens, kept next to the field it is about.
- *
- * The text scrolls. A label alone cannot be made shorter than its own wrapped
- * height, so a long one gives the popover a minimum size it cannot meet next to
- * a row near the edge of the screen — and a popover with nowhere to go simply
- * does not appear, which reads as a dead button.
- */
-function infoButton(tooltip: string, markup: string, width = 46): Gtk.MenuButton {
-    const label = new Gtk.Label({
-        label: markup,
-        use_markup: true,
-        wrap: true,
-        xalign: 0,
-        max_width_chars: width,
-        margin_top: 12,
-        margin_bottom: 12,
-        margin_start: 12,
-        margin_end: 12,
-    });
-    const scroller = new Gtk.ScrolledWindow({
-        child: label,
-        hscrollbar_policy: Gtk.PolicyType.NEVER,
-        propagate_natural_width: true,
-        propagate_natural_height: true,
-        max_content_height: POPOVER_MAX_H,
-    });
-    return new Gtk.MenuButton({
-        icon_name: 'help-about-symbolic',
-        tooltip_text: tooltip,
-        valign: Gtk.Align.CENTER,
-        css_classes: ['flat'],
-        popover: new Gtk.Popover({ child: scroller }),
-    });
-}
 
 /**
  * What actually decides whether a check works: advice first, then the wrapper
@@ -730,7 +413,8 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
     // so highlighting can toggle style classes instead of rebuilding anything.
     private _stepRows = new Map<string, StepRow>();
     private _highlighted: string[] = [];
-    private _runningChangedId = 0;
+    /** Settings watchers held for the life of the window, dropped when it closes. */
+    private _watchers: number[] = [];
     /** The ▶/■ beside each macro's name, by macro id. */
     private _runButtons = new Map<string, Gtk.Button>();
     /** The Stop beside each ▶, shown only while that macro is running. */
@@ -749,8 +433,6 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
     private _recordChoicesModel?: Gtk.StringList;
     /** The row currently painted as the target, so it can be unpainted. */
     private _markedRow?: Gtk.Widget;
-    private _targetChangedId = 0;
-    private _recordingChangedId = 0;
 
     // The Body/Then/Else headers by "stepId:branch". Move up and down ask these
     // whether a container is open, because folded or not is a fact about the
@@ -788,19 +470,7 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
     ): Adw.EntryRow {
         const row = new Adw.EntryRow({ title });
         row.set_text(values.join(', '));
-
-        let current = [...values];
-        const commit = debounce(() => {
-            const parsed = parseNumbers(row.get_text() ?? '', values.length);
-            if (parsed) {
-                row.remove_css_class('error');
-                current = parsed;
-                onChange(parsed);
-            } else {
-                row.add_css_class('error');
-            }
-        });
-        row.connect('changed', commit);
+        const current = commitNumbers(row, values.length, values, onChange);
 
         if (fromPoint) {
             const pick = new Gtk.Button({
@@ -809,7 +479,7 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
                 valign: Gtk.Align.CENTER,
             });
             pick.connect('clicked', () => this._pickPointInto(point => {
-                const parsed = parseNumbers(row.get_text() ?? '', values.length) ?? current;
+                const parsed = parseNumbers(row.get_text() ?? '', values.length) ?? current();
                 const next = fromPoint(point.x, point.y, parsed);
                 // Through the row, so the same parse-and-commit path runs and
                 // what you see is what was saved.
@@ -825,7 +495,7 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
                 valign: Gtk.Align.CENTER,
             });
             show.connect('clicked', () => {
-                const parsed = parseNumbers(row.get_text() ?? '', values.length) ?? current;
+                const parsed = parseNumbers(row.get_text() ?? '', values.length) ?? current();
                 onShow(parsed);
             });
             row.add_suffix(show);
@@ -848,16 +518,7 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
             valign: Gtk.Align.CENTER,
             xalign: 1,
         });
-        const commit = debounce(() => {
-            const parsed = parseNumbers(entry.get_text() ?? '', values.length);
-            if (parsed) {
-                entry.remove_css_class('error');
-                onChange(parsed);
-            } else {
-                entry.add_css_class('error');
-            }
-        });
-        entry.connect('changed', commit);
+        commitNumbers(entry, values.length, values, onChange);
         return entry;
     }
 
@@ -1081,12 +742,11 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
      */
     private _widen(widget: Gtk.Widget, max: number): number {
         let found = 0;
-        for (let child = widget.get_first_child(); child; child = child.get_next_sibling()) {
+        for (const child of descendants(widget)) {
             if (child instanceof Adw.Clamp) {
                 child.maximum_size = max;
                 found++;
             }
-            found += this._widen(child, max);
         }
         return found;
     }
@@ -1125,34 +785,28 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
             }
         });
 
-        // Where the shell's runner currently is. Only style classes change, so
-        // this can arrive several times a second without disturbing an edit.
-        this._runningChangedId = this._settings.connect(
-            'changed::running-steps', () => {
+        // Kept as a list so that connecting and disconnecting cannot drift
+        // apart: a watcher added here is dropped below without being named
+        // twice more.
+        this._watchers.push(
+            // Where the shell's runner currently is. Only style classes change,
+            // so this can arrive several times a second without disturbing an
+            // edit.
+            this._settings.connect('changed::running-steps', () => {
                 this._reportEditedStops();
                 this._applyRunningHighlight();
-            });
-        // Both are painted by the same pass: the target only reads as a target
-        // once you can see whether it is live.
-        this._targetChangedId = this._settings.connect(
-            'changed::record-into', () => this._applyRecordTarget());
-        this._recordingChangedId = this._settings.connect(
-            'changed::recording', () => this._applyRecordTarget());
+            }),
+            // Both are painted by the same pass: the target only reads as a
+            // target once you can see whether it is live.
+            this._settings.connect('changed::record-into', () => this._applyRecordTarget()),
+            this._settings.connect('changed::recording', () => this._applyRecordTarget()),
+        );
 
         window.connect('close-request', () => {
             this._closed = true;
             unsubscribe();
-            if (this._runningChangedId) {
-                this._settings.disconnect(this._runningChangedId);
-                this._runningChangedId = 0;
-            }
-            if (this._targetChangedId) {
-                this._settings.disconnect(this._targetChangedId);
-                this._targetChangedId = 0;
-            }
-            if (this._recordingChangedId) {
-                this._settings.disconnect(this._recordingChangedId);
-                this._recordingChangedId = 0;
+            for (const id of this._watchers.splice(0)) {
+                this._settings.disconnect(id);
             }
             this._store.destroy();
             return false;
@@ -1187,13 +841,9 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
 
     /** The scrolled window the macros page puts its own content in. */
     private _scroller(widget: Gtk.Widget | null = this._macrosPage): Gtk.ScrolledWindow | null {
-        for (let child = widget?.get_first_child() ?? null; child; child = child.get_next_sibling()) {
+        for (const child of descendants(widget)) {
             if (child instanceof Gtk.ScrolledWindow) {
                 return child;
-            }
-            const found = this._scroller(child);
-            if (found) {
-                return found;
             }
         }
         return null;
@@ -1388,10 +1038,7 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
      * icon is a long way from the body you chose.
      */
     private _applyRecordTarget(): void {
-        for (const cls of ['macroclickwerk-record-target', 'macroclickwerk-recording-now']) {
-            this._markedRow?.remove_css_class(cls);
-            this._markedRow?.remove_css_class(`${cls}-block`);
-        }
+        clearClasses(this._markedRow, RECORD_CLASSES);
 
         // A selection nothing on the page answers to — none yet, or one left in a
         // macro that has since gone — falls back to the end of the macro being
@@ -1410,11 +1057,7 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
         // The record controls cannot start anything else during a whole
         // recording, and go red rather than dead so the reason is visible.
         for (const control of this._recordControls) {
-            if (recording) {
-                control.add_css_class('destructive-action');
-            } else {
-                control.remove_css_class('destructive-action');
-            }
+            setClass(control, 'destructive-action', recording);
         }
     }
 
@@ -1502,14 +1145,10 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
     }
 
     private _paintDrop(row: Gtk.Widget, where: DropZone | null): void {
-        if (this._dropHighlight && this._dropHighlight !== row) {
-            for (const cls of DROP_CLASSES) {
-                this._dropHighlight.remove_css_class(cls);
-            }
+        if (this._dropHighlight !== row) {
+            clearClasses(this._dropHighlight, DROP_CLASSES);
         }
-        for (const cls of DROP_CLASSES) {
-            row.remove_css_class(cls);
-        }
+        clearClasses(row, DROP_CLASSES);
         if (where) {
             row.add_css_class(where === 'before' ? 'macroclickwerk-drop-above'
                 : where === 'after' ? 'macroclickwerk-drop-below'
@@ -1622,15 +1261,13 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
     }
 
     private _setRunState(entry: StepRow, state: 'idle' | 'active' | 'ancestor'): void {
-        for (const cls of ['macroclickwerk-running', 'macroclickwerk-running-block']) {
-            entry.row.remove_css_class(cls);
-        }
-        for (const cls of ['macroclickwerk-running-icon', 'macroclickwerk-running-parent-icon']) {
-            entry.icon.remove_css_class(cls);
-        }
+        clearClasses(entry.row, RUN_ROW_CLASSES);
+        clearClasses(entry.icon, RUN_ICON_CLASSES);
         entry.icon.icon_name = entry.kindIcon;
+        // The body headers sit beside the step now, not inside it, so they need
+        // the same rail or the chain of rails breaks at every loop.
         for (const branch of entry.branchRows) {
-            branch.remove_css_class('macroclickwerk-running-block');
+            setClass(branch, 'macroclickwerk-running-block', state !== 'idle');
         }
 
         if (state === 'active') {
@@ -1640,13 +1277,6 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
         } else if (state === 'ancestor') {
             entry.icon.add_css_class('macroclickwerk-running-parent-icon');
             entry.row.add_css_class('macroclickwerk-running-block');
-        }
-        if (state !== 'idle') {
-            // The body headers sit beside the step now, not inside it, so they
-            // need the same rail or the chain of rails breaks at every loop.
-            for (const branch of entry.branchRows) {
-                branch.add_css_class('macroclickwerk-running-block');
-            }
         }
     }
 
@@ -1784,8 +1414,11 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
             () => 'into',
             () => ({ list: macro.body, at: macro.body.length }));
 
+        // Which event each step answers to, worked out once for the macro: every
+        // row needs it, and asking per row rescanned the whole macro per row.
+        const under = eventFollows(macro.body);
         for (const step of macro.body) {
-            for (const widget of this._buildStepWidgets(macro, step)) {
+            for (const widget of this._buildStepWidgets(macro, step, under)) {
                 group.add(widget);
             }
         }
@@ -1859,6 +1492,71 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
     }
 
     /**
+     * The switch a click, key or pad step gets when it sits under a "When …":
+     * take the edge from the event, or decide for yourself. On is the absent
+     * action — the step goes down when the person pressed and up when they let
+     * go. Off puts it back on its own feet with a plain click, which is what
+     * the whole-click mode used to be, and the action dropdown comes back out
+     * beside it. It shows the event's own icon: what this is bound to.
+     *
+     * Nothing is hidden by this. The old rule was to strip the action from any
+     * step under an event, since the editor showed no way to see or change it;
+     * the toggle is that way, so the setting can stay.
+     */
+    private _followToggle(
+        step: ClickStep | KeyStep | PadStep,
+        event: OnEventStep,
+    ): Gtk.Widget {
+        const toggle = toggleButton(STEP_ICONS.onevent,
+            `${_('Follow')} “${this._describe(event)}” — ` +
+            _('down when it is pressed, up when it is released. ' +
+              'Off: this step decides for itself.'),
+            step.action === undefined);
+        toggle.connect('toggled', () => {
+            // 'tap' rather than nothing when it stops following: a step with no
+            // action *is* a follower, so there would be nothing to turn off.
+            step.action = toggle.get_active() ? undefined : 'tap';
+            this._saveAndRebuild();
+        });
+        return toggle;
+    }
+
+    /**
+     * The words a click, a key press and a pad press all say: the follow
+     * toggle, when there is an event above to follow, and otherwise what to do
+     * with the button and how long to hold it. A step that is following says
+     * neither — the choice was made one row up, and a half-press has no
+     * duration. Only the wording differs between the three kinds, so that is
+     * all `words` carries.
+     */
+    private _pressSuffixes(
+        suffixes: Gtk.Box,
+        step: ClickStep | KeyStep | PadStep,
+        follows: OnEventStep | null,
+        retitle: () => void,
+        words: { action: string; hold: string },
+    ): void {
+        if (follows) {
+            suffixes.append(this._followToggle(step, follows));
+            if (step.action === undefined) {
+                return;
+            }
+        }
+        suffixes.append(chooser(KEY_ACTIONS, keyActionLabels(), step.action ?? 'tap',
+            words.action, value => {
+                step.action = value;
+                retitle();
+                this._saveAndRebuild();   // the hold field comes and goes with tap
+            }));
+        if ((step.action ?? 'tap') === 'tap') {
+            suffixes.append(spinSuffix(step.holdMs ?? 20, 0, 10000, words.hold, value => {
+                step.holdMs = value;
+                this._save();
+            }, true));
+        }
+    }
+
+    /**
      * One step, followed by its Body/Then/Else blocks as sibling rows rather
      * than rows inside it — folding a loop shut to get at its settings must not
      * take its body off the screen with it.
@@ -1870,6 +1568,7 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
     private _buildStepWidgets(
         macro: Macro,
         step: Step,
+        under: Map<string, OnEventStep>,
         indent = 0,
     ): Gtk.Widget[] {
         const stepKey = `step:${step.id}`;
@@ -1947,20 +1646,17 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
         // would close the dropdown you are still looking at.
         const retitle = () => row.set_title(this._describe(step));
 
-        // A press step under a "when …" has no edge to choose: under a whole
-        // click it is a whole click, under a split event it goes down when the
-        // person pressed and up when they let go. Either way the choice was
-        // made one row up, so no dropdown here. Hiding it is only half of it —
-        // a setting left over from before the event was wired in would still
-        // be showing in the title while the run ignored it, so it goes as
-        // well, and saves along with the next thing that changes.
-        const follows = followsEvent(macro.body, step.id);
-        if (follows && 'action' in step && step.action !== undefined) {
-            step.action = undefined;
-            retitle();
+        // The "When …" this step runs under, if any: what its rail says, and
+        // what a press step can take its edge from — see `_pressSuffixes`.
+        const follows = under.get(step.id) ?? null;
+
+        // An event and the steps that run under it are one gesture, and rows
+        // stacked in a list do not say so. They share a rail — a neutral one:
+        // the branch colours mean containment, and this is sequence. The event
+        // itself is the top of its own block.
+        if (step.kind === 'onevent' || follows) {
+            row.add_css_class('macroclickwerk-event');
         }
-        /** A hold time is a tap's duration, and a split event's halves have none. */
-        const holdApplies = follows !== 'split';
 
         switch (step.kind) {
         // A repeat has exactly one setting, so it lives on the row rather than
@@ -2011,41 +1707,19 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
                     retitle();
                     this._save();
                 }));
-            if (!follows) {
-                suffixes.append(chooser(KEY_ACTIONS, keyActionLabels(), step.action ?? 'tap',
-                    _('Whether to click, hold down, or release'), value => {
-                        step.action = value;
-                        retitle();
-                        this._saveAndRebuild();   // the hold field comes and goes with tap
-                    }));
-            }
-            if (holdApplies && (step.action ?? 'tap') === 'tap') {
-                suffixes.append(spinSuffix(step.holdMs ?? 20, 0, 10000,
-                    _('How long the button stays down'), value => {
-                        step.holdMs = value;
-                        this._save();
-                    }, true));
-            }
+            this._pressSuffixes(suffixes, step, follows, retitle, {
+                action: _('Whether to click, hold down, or release'),
+                hold: _('How long the button stays down'),
+            });
             break;
 
         // The same words a click has, for the same reason: which, what, and
         // for how long — "Press ctrl+c", "Hold down shift".
         case 'key':
-            if (!follows) {
-                suffixes.append(chooser(KEY_ACTIONS, keyActionLabels(), step.action ?? 'tap',
-                    _('Whether to press, hold down, or release'), value => {
-                        step.action = value;
-                        retitle();
-                        this._saveAndRebuild();   // the hold field comes and goes with tap
-                    }));
-            }
-            if (holdApplies && (step.action ?? 'tap') === 'tap') {
-                suffixes.append(spinSuffix(step.holdMs ?? 20, 0, 10000,
-                    _('How long the key stays down'), value => {
-                        step.holdMs = value;
-                        this._save();
-                    }, true));
-            }
+            this._pressSuffixes(suffixes, step, follows, retitle, {
+                action: _('Whether to press, hold down, or release'),
+                hold: _('How long the key stays down'),
+            });
             break;
 
         case 'text':
@@ -2065,21 +1739,10 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
                     retitle();
                     this._save();
                 }, 10));
-            if (!follows) {
-                suffixes.append(chooser(KEY_ACTIONS, keyActionLabels(), step.action ?? 'tap',
-                    _('Whether to press, hold down, or release'), value => {
-                        step.action = value;
-                        retitle();
-                        this._saveAndRebuild();   // the hold field comes and goes with tap
-                    }));
-            }
-            if (holdApplies && (step.action ?? 'tap') === 'tap') {
-                suffixes.append(spinSuffix(step.holdMs ?? 20, 0, 10000,
-                    _('How long the button stays down'), value => {
-                        step.holdMs = value;
-                        this._save();
-                    }, true));
-            }
+            this._pressSuffixes(suffixes, step, follows, retitle, {
+                action: _('Whether to press, hold down, or release'),
+                hold: _('How long the button stays down'),
+            });
             break;
 
         // Both numbers, and the line already reads "Wait 1s ±200ms", so the
@@ -2116,28 +1779,21 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
                         this._save();
                     }));
             }
-            // One toggle. Off: the step reacts to the whole click. On: it
-            // reacts to each edge separately — it wakes on the next edge,
-            // whichever that is, so the first such step in the flow catches
-            // the press and the next one the release. A long click is two of
-            // them around whatever the hold should do.
-            const split = new Gtk.ToggleButton({
-                label: _('Press/release'),
-                active: step.edge === 'split' || step.edge === 'press' || step.edge === 'release',
-                valign: Gtk.Align.CENTER,
-                tooltip_text: _('React to press and release separately: this step wakes on ' +
-                    'the next one of the two. Two such steps bracket a hold — press E on ' +
-                    'the press, release it on the release. Off: one whole click.'),
-            });
-            split.connect('toggled', () => {
-                step.edge = split.get_active() ? 'split' : 'click';
-                retitle();
-                // Every press step below this one gains or loses its own
-                // action along with the toggle, so the page is redrawn rather
-                // than just this row.
-                this._saveAndRebuild();
-            });
-            suffixes.append(split);
+            // Which edge wakes it. The default takes the next one whichever it
+            // is, so the first such step in the flow catches the press and the
+            // next one the release — a hold is two of them around whatever
+            // should happen in between. Naming one edge instead says it
+            // outright, and sleeps through the other.
+            suffixes.append(chooser(EVENT_EDGES, eventEdgeLabels(), step.edge ?? 'either',
+                _('Which edge wakes the run: the press, the release, or ' +
+                  'whichever comes next'),
+                value => {
+                    step.edge = value === 'either' ? undefined : value;
+                    retitle();
+                    // The steps below read as the edge they follow, so their
+                    // titles change with this: redraw rather than retitle.
+                    this._saveAndRebuild();
+                }, 14));
             break;
         }
 
@@ -2264,7 +1920,7 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
             }
 
             for (const child of list.steps) {
-                for (const widget of this._buildStepWidgets(macro, child, INDENT_PX)) {
+                for (const widget of this._buildStepWidgets(macro, child, under, INDENT_PX)) {
                     nested.add_row(widget);
                 }
             }
@@ -2342,11 +1998,6 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
                 }));
                 break;
 
-            // No rows: both numbers sit on the step's own line, which already
-            // reads "Scroll 3 vertically".
-            case 'scroll':
-                break;
-
             case 'key':
                 // Action and hold are not here: they sit on the step's own
                 // line, the way a click's button and hold do.
@@ -2372,16 +2023,6 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
                 }));
                 break;
 
-            // No rows: the wait and its variation are both on the step's own
-            // line, which already reads "Wait 1s ±200ms".
-            case 'wait':
-                break;
-
-            // No rows: a repeat's count sits on the row itself, which is what
-            // keeps the card from opening onto a single setting.
-            case 'loop':
-                break;
-
             case 'if':
                 rows.push(...this._buildConditionSection(_('Condition'), step.cond, next => {
                     step.cond = next;
@@ -2389,12 +2030,12 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
                 }, condKey));
                 break;
 
-            // No rows: which macro and where in it are both on the step's own
-            // line, which already reads Start “Ready”.
-            case 'start':
-            case 'stop':
-                break;
-
+            // Everything else folds open onto nothing, and so does not fold
+            // open at all: a scroll, a wait, a repeat, a start, a stop and a
+            // gamepad press each say all they have on their own line — "Scroll
+            // 3 vertically", "Wait 1s ±200ms", Start “Ready” — and a card that
+            // opens onto a single control you can already see is a card that
+            // should stay shut.
             default:
                 break;
         }
@@ -3273,11 +2914,8 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
                     // Red until every name resolves — the title above shows
                     // what the names resolve *to*, which is the safety net
                     // against LEFT quietly being an arrow key.
-                    if (comboCodes(trigger.key) === null && trigger.key !== '') {
-                        keyEntry.add_css_class('error');
-                    } else {
-                        keyEntry.remove_css_class('error');
-                    }
+                    setClass(keyEntry, 'error',
+                        comboCodes(trigger.key) === null && trigger.key !== '');
                 });
             row.add_suffix(keyEntry);
         } else if (trigger.action !== 'none') {
@@ -3364,17 +3002,11 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
             row.set_text(current);
             const commit = debounce(() => {
                 const text = (row.get_text() ?? '').trim();
-                if (text === '') {
-                    this._settings.set_strv(key, []);
-                    row.remove_css_class('error');
-                    return;
-                }
-                const [ok] = Gtk.accelerator_parse(text);
+                // Empty is a shortcut removed, not a shortcut typed wrong.
+                const [ok] = text === '' ? [true] : Gtk.accelerator_parse(text);
+                setClass(row, 'error', !ok);
                 if (ok) {
-                    row.remove_css_class('error');
-                    this._settings.set_strv(key, [text]);
-                } else {
-                    row.add_css_class('error');
+                    this._settings.set_strv(key, text === '' ? [] : [text]);
                 }
             });
             row.connect('changed', commit);

@@ -102,72 +102,55 @@ check('the inert ones claim no code',
 
 {
     const woken = [];
-    const waiter = (code, edge = 'press') =>
-        ({ code, edge, resolve: fired => woken.push(`${code}:${edge}:${fired}`) });
+    const waiter = code => ({ code, edge: 'either', resolve: fired => woken.push(`${code}:${fired}`) });
     const waiters = [waiter(BUTTON_CODES.side), waiter(BUTTON_CODES.side), waiter(BUTTON_CODES.extra)];
 
     let claimed = claimWaiters(waiters, trig(BUTTON_CODES.side, 1));
     claimed.forEach(w => w.resolve(true));
     check('a press wakes every run parked on that code',
-          woken.join(' ') === `${BUTTON_CODES.side}:press:true ${BUTTON_CODES.side}:press:true`,
+          woken.join(' ') === `${BUTTON_CODES.side}:true ${BUTTON_CODES.side}:true`,
           woken.join(' '));
     check('and removes exactly them', waiters.length === 1 && waiters[0].code === BUTTON_CODES.extra);
 
-    claimed = claimWaiters(waiters, trig(BUTTON_CODES.extra, 0));
-    check('a release wakes no press waiter', claimed.length === 0 && waiters.length === 1);
     claimed = claimWaiters(waiters, trig(BUTTON_CODES.extra, 1, { trig: undefined }));
     check('an unconsumed press wakes nobody', claimed.length === 0 && waiters.length === 1);
+    claimed = claimWaiters(waiters, trig(BUTTON_CODES.extra, 0));
+    check('a release wakes a parked run just as a press does',
+          claimed.length === 1 && waiters.length === 0);
 }
 
-// The two edges are separate waits: a run parked on the release sleeps
-// through the press, and the other way round — which is what turns two
-// onevent steps into "hold E while I hold the button".
+// A waiter wakes on the next edge, whichever it is. Two in sequence bracket one
+// hold — first the press, then the release — which is what turns two onevent
+// steps into "hold E while I hold the button".
+{
+    const woken = [];
+    const parked = () => ({ code: BUTTON_CODES.left, edge: 'either', resolve: f => woken.push(f) });
+    const waiters = [parked()];
+    claimWaiters(waiters, trig(BUTTON_CODES.left, 1)).forEach(w => w.resolve(true));
+    check('the first waiter wakes on the press', woken.length === 1 && waiters.length === 0);
+    waiters.push(parked());
+    claimWaiters(waiters, trig(BUTTON_CODES.left, 2)).forEach(w => w.resolve(true));
+    check('autorepeat wakes nobody', woken.length === 1);
+    claimWaiters(waiters, trig(BUTTON_CODES.left, 0)).forEach(w => w.resolve(true));
+    check('the next one wakes on the release',
+          woken.length === 2 && waiters.length === 0, `${woken.length}`);
+}
+
+// A waiter that names one edge sleeps through the other, so an event set to
+// "press" is not woken by the letting go — which is what makes the two-step
+// hold spellable: one event on the press, one on the release.
 {
     const woken = [];
     const waiters = [
-        { code: BUTTON_CODES.left, edge: 'press', resolve: f => woken.push(`press:${f}`) },
-        { code: BUTTON_CODES.left, edge: 'release', resolve: f => woken.push(`release:${f}`) },
+        { code: BUTTON_CODES.left, edge: 'press', resolve: () => woken.push('press') },
+        { code: BUTTON_CODES.left, edge: 'release', resolve: () => woken.push('release') },
     ];
-    claimWaiters(waiters, trig(BUTTON_CODES.left, 1)).forEach(w => w.resolve(true));
-    check('the press wakes only the press waiter',
-          woken.join(' ') === 'press:true' && waiters.length === 1, woken.join(' '));
-    claimWaiters(waiters, trig(BUTTON_CODES.left, 2)).forEach(w => w.resolve(true));
-    check('autorepeat wakes neither edge', woken.join(' ') === 'press:true');
-    claimWaiters(waiters, trig(BUTTON_CODES.left, 0)).forEach(w => w.resolve(true));
-    check('the release wakes the release waiter',
-          woken.join(' ') === 'press:true release:true' && waiters.length === 0,
-          woken.join(' '));
-}
-
-// The default: a click waiter (toggle off) wakes on the press — the
-// release-swallowing that sets it apart happens in the engine's drain,
-// after the wake.
-{
-    const woken = [];
-    const waiters = [{ code: BUTTON_CODES.side, edge: 'click', resolve: f => woken.push(f) }];
-    check('a release does not wake a click waiter',
-          claimWaiters(waiters, trig(BUTTON_CODES.side, 0)).length === 0 && waiters.length === 1);
-    claimWaiters(waiters, trig(BUTTON_CODES.side, 1)).forEach(w => w.resolve(true));
-    check('the press wakes a click waiter', woken.join() === 'true' && waiters.length === 0,
-          woken.join());
-}
-
-// The toggle: a split waiter wakes on the next edge, whichever it is. Two in
-// sequence bracket one hold — first the press, then the release — which is
-// the long click.
-{
-    const woken = [];
-    const splitWaiter = () =>
-        ({ code: BUTTON_CODES.left, edge: 'split', resolve: f => woken.push(f) });
-    const waiters = [splitWaiter()];
-    claimWaiters(waiters, trig(BUTTON_CODES.left, 1)).forEach(w => w.resolve(true));
-    check('a split waiter wakes on the press', woken.length === 1 && waiters.length === 0);
-    waiters.push(splitWaiter());
-    claimWaiters(waiters, trig(BUTTON_CODES.left, 2)).forEach(w => w.resolve(true));
-    check('autorepeat does not wake a split waiter', woken.length === 1);
-    claimWaiters(waiters, trig(BUTTON_CODES.left, 0)).forEach(w => w.resolve(true));
-    check('the next split waiter wakes on the release',
-          woken.length === 2 && waiters.length === 0, `${woken.length}`);
+    claimWaiters(waiters, trig(BUTTON_CODES.left, 0)).forEach(w => w.resolve());
+    check('a release passes the press-only waiter by',
+          woken.join() === 'release' && waiters.length === 1, woken.join());
+    claimWaiters(waiters, trig(BUTTON_CODES.left, 1)).forEach(w => w.resolve());
+    check('and the press wakes the one that was waiting for it',
+          woken.join() === 'release,press' && waiters.length === 0, woken.join());
 }
 
 // A waiter and a configured trigger on the same code: the waiter wins, the
@@ -176,7 +159,7 @@ check('the inert ones claim no code',
 {
     const actions = recordingActions();
     const map = armedByCode([{ id: 'r', source: 'BTN_SIDE', action: 'key', key: 'KEY_E' }]);
-    const waiters = [{ code: BUTTON_CODES.side, edge: 'press', resolve: () => {} }];
+    const waiters = [{ code: BUTTON_CODES.side, edge: 'either', resolve: () => {} }];
     const event = trig(BUTTON_CODES.side, 1);
     if (claimWaiters(waiters, event).length === 0) {
         dispatch(map, event, actions);
@@ -187,8 +170,8 @@ check('the inert ones claim no code',
 
 // --- the wake says which edge it was -----------------------------------------
 
-// Not just "something happened": the steps after a split event take their own
-// edge from this answer, so a click under one goes down on the press and up on
+// Not just "something happened": the steps after an event take their own edge
+// from this answer, so a click under one goes down on the press and up on
 // the release. Driven through the engine because that is where the event
 // becomes an answer; the socket underneath is not there, which the engine
 // treats as "the daemon is down" and reports, and is why a complaint about it
@@ -199,7 +182,7 @@ check('the inert ones claim no code',
         { setTriggers: async codes => { asked.push(codes.join('+') || '(none)'); } },
         '/nonexistent/macroclickwerk-test.sock', recordingActions());
     const answers = [];
-    engine.waitFor('BTN_SIDE', 'split').promise.then(edge => answers.push(edge));
+    engine.waitFor('BTN_SIDE').promise.then(edge => answers.push(edge));
     engine.handle(trig(BUTTON_CODES.side, 1));
 
     // The run is between the two halves here: it has been woken by the press
@@ -209,14 +192,14 @@ check('the inert ones claim no code',
     check('the button stays claimed between the press and the release',
           !asked.includes('(none)'), asked.join(' , '));
 
-    engine.waitFor('BTN_SIDE', 'split').promise.then(edge => answers.push(edge));
+    engine.waitFor('BTN_SIDE').promise.then(edge => answers.push(edge));
     engine.handle(trig(BUTTON_CODES.side, 0));
-    const cancelled = engine.waitFor('BTN_SIDE', 'split');
+    const cancelled = engine.waitFor('BTN_SIDE');
     cancelled.promise.then(edge => answers.push(edge));
     cancelled.cancel();
 
     check('an unknown source still has no wait to give',
-          engine.waitFor('BTN_NOPE', 'split') === null);
+          engine.waitFor('BTN_NOPE') === null);
     check('and once the gesture is over the claim is dropped',
           asked[asked.length - 1] === '(none)', asked.join(' , '));
     engine.destroy();
@@ -225,6 +208,29 @@ check('the inert ones claim no code',
     await Promise.resolve();
     check('the wake names the edge, and a cancelled wait names none',
           answers.join(' ') === 'press release ', answers.join(' '));
+}
+
+// A run parked on the press twice over: the release in between is nobody's —
+// the press-only waiter is not woken by it, and the desktop must not be handed
+// the second half of a gesture whose first half a macro took. So it is
+// swallowed, and the waiter is still there for the next real press.
+{
+    const engine = new TriggerEngine(
+        { setTriggers: async () => {} },
+        '/nonexistent/macroclickwerk-test.sock', recordingActions());
+    const answers = [];
+    engine.waitFor('BTN_SIDE', 'press').promise.then(edge => answers.push(String(edge)));
+    engine.handle(trig(BUTTON_CODES.side, 1));
+    engine.waitFor('BTN_SIDE', 'press').promise.then(edge => answers.push(String(edge)));
+    engine.handle(trig(BUTTON_CODES.side, 0));
+    await Promise.resolve();
+    check('a press-only wait sleeps through the release that follows',
+          answers.join() === 'press', answers.join());
+    engine.handle(trig(BUTTON_CODES.side, 1));
+    await Promise.resolve();
+    check('and the next press finds it still parked',
+          answers.join() === 'press,press', answers.join());
+    engine.destroy();
 }
 
 // A run stopped mid-gesture, with the button still down: the leftover release
@@ -236,7 +242,7 @@ check('the inert ones claim no code',
     const engine = new TriggerEngine(
         { setTriggers: async codes => { asked.push(codes.join('+') || '(none)'); } },
         '/nonexistent/macroclickwerk-test.sock', actions);
-    const parked = engine.waitFor('BTN_SIDE', 'split');
+    const parked = engine.waitFor('BTN_SIDE');
     let ended = '';
     parked.promise.then(edge => { ended = String(edge); });
     engine.handle(trig(BUTTON_CODES.side, 1));

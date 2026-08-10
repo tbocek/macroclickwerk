@@ -22,6 +22,7 @@ import {
 } from './keymap.js';
 import type {
     ClickStep,
+    EventEdge,
     KeyStep,
     Macro,
     MoveStep,
@@ -71,16 +72,13 @@ export interface RunnerCallbacks {
     /** Names a macro for `describeStep`, so those steps read as what they poke. */
     macroName?: (macroId: string) => string | undefined;
     /**
-     * Park until the chosen edge of a button or key — its press, or its
-     * release — consuming the event. Resolves with the edge that woke it, null
-     * if cancelled; null for a source that names no real input, undefined when
-     * nothing here can wait at all — either way the step fails rather than
-     * hangs.
+     * Park until the chosen edge of a button or key — its press, its release,
+     * or whichever comes next — consuming the event. Resolves with the edge
+     * that woke it, null if cancelled; null for a source that names no real
+     * input, undefined when nothing here can wait at all — either way the step
+     * fails rather than hangs.
      */
-    waitForInput?: (
-        source: string,
-        edge: 'click' | 'split' | 'press' | 'release',
-    ) => {
+    waitForInput?: (source: string, edge: EventEdge) => {
         promise: Promise<'press' | 'release' | null>;
         cancel: () => void;
     } | null | undefined;
@@ -108,7 +106,7 @@ export class MacroRunner {
     /** Calls off the onevent wait this run is parked on, if it is on one. */
     private _waitCancel: (() => void) | null = null;
     /**
-     * The edge of the last split `onevent` this run woke on, and null when the
+     * The edge of the last `onevent` this run woke on, and null when the
      * run is not inside one. Clicks and key presses after such an event take
      * their edge from here rather than from a setting of their own — pressing
      * the button puts them down, letting go lifts them — which is the whole of
@@ -567,9 +565,9 @@ export class MacroRunner {
 
     /**
      * What a click or key press does, given what it asked for. An explicit
-     * tap/down/up is itself. Absent follows the split `onevent` the run is
-     * inside — down on the press, up on the release, so the button mirrors the
-     * finger — and is a whole tap when no event woke the run.
+     * tap/down/up is itself. Absent follows the `onevent` the run is inside —
+     * down on the press, up on the release, so the button mirrors the finger —
+     * and is a whole tap when no event woke the run.
      */
     private _pressAction(explicit?: 'tap' | 'down' | 'up'): 'tap' | 'down' | 'up' {
         if (explicit) {
@@ -781,8 +779,7 @@ export class MacroRunner {
     }
 
     private async _doOnEvent(step: OnEventStep): Promise<void> {
-        const edge = step.edge ?? 'click';
-        const wait = this._callbacks.waitForInput?.(step.source, edge);
+        const wait = this._callbacks.waitForInput?.(step.source, step.edge ?? 'either');
         if (wait === undefined) {
             throw new Error('waiting for a click is not available here');
         }
@@ -794,13 +791,11 @@ export class MacroRunner {
         try {
             // Resolves null when cancelled — a stopped run, not a failure; the
             // interpreter's own cancellation check unwinds from here.
-            const woken = await wait.promise;
-            // A whole click is over by the time the run moves on: the button is
-            // already back up, so nothing after it is inside a gesture. The
-            // split halves are the opposite — the steps after them happen while
-            // the finger is still down, or just after it came off — so they are
-            // what the steps below follow.
-            this._inputEdge = edge === 'click' ? null : woken;
+            //
+            // The steps after this one happen while the finger is still down,
+            // or just after it came off, so the edge that woke the run is what
+            // they follow.
+            this._inputEdge = await wait.promise;
         } finally {
             this._waitCancel = null;
         }

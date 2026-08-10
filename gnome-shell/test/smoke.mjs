@@ -6,7 +6,7 @@ import {
     macroEnabled,
     changedDefinitions,
     STEP_KIND_LABELS, parseNumbers, reachesEnd, lastPointerEndpoint,
-    AUTHORABLE_STEP_KINDS,
+    AUTHORABLE_STEP_KINDS, EVENT_EDGES, followsEvent,
 } from '../dist/src/model.js';
 import { textToEvents, keyCode, keyName, charToKey, buttonFromCode } from '../dist/src/keymap.js';
 import { starterMacro } from '../dist/src/starter.js';
@@ -367,37 +367,57 @@ check('gate retry becomes a loop that breaks when ready',
       && retryBody[0].body[0].then[0].kind === 'break');
 check('gate retry waits inside the loop', retryBody[0].body[1].kind === 'wait' && retryBody[0].body[1].ms === 500);
 
-// a press step under a split event loses the action it used to carry: the
-// event decides now, and a leftover setting would be obeyed with nothing on
-// screen to say so — which is how a click meant to be held for as long as a
-// button is down ends up held for 0.2s instead.
+// every press step under an event is offered the follow — click, key and pad
+// alike. A step keeps whatever action it stores: an empty one follows the edge,
+// one that names an action does that instead, and the row shows which.
 const heldDoc = JSON.stringify({ version: 1, macros: [{ id: 'm', name: 'h', body: [
     { id: 'c0', kind: 'click', button: 'left', mode: 'current', action: 'down', holdMs: 200 },
-    { id: 'e1', kind: 'onevent', source: 'BTN_RIGHT', edge: 'split' },
-    { id: 'c1', kind: 'click', button: 'left', mode: 'current', action: 'down', holdMs: 200 },
-    { id: 'k1', kind: 'key', code: 'KEY_E', action: 'up' },
+    { id: 'e1', kind: 'onevent', source: 'BTN_RIGHT' },
+    { id: 'c1', kind: 'click', button: 'left', mode: 'current', holdMs: 200 },
+    { id: 'k1', kind: 'key', code: 'KEY_E' },
     { id: 'p1', kind: 'pad', button: 'BTN_SOUTH', action: 'down' },
 ] }] });
 const held = parseDocument(heldDoc).macros[0].body;
-check('a click above the event keeps its action', held[0].action === 'down');
-check('every press step below it gives its action up',
-      held[2].action === undefined && held[3].action === undefined
-      && held[4].action === undefined,
-      JSON.stringify(held.slice(2).map(s => s.action)));
+check('a click above the event follows nothing', followsEvent(held, 'c0') === null);
+check('click, key and pad below it all answer to the same event',
+      followsEvent(held, 'c1')?.id === 'e1' && followsEvent(held, 'k1')?.id === 'e1'
+      && followsEvent(held, 'p1')?.id === 'e1');
+check('an empty action is left empty, which is what following looks like',
+      held[2].action === undefined && held[3].action === undefined);
 check('the hold time is left alone, for if the event goes away', held[2].holdMs === 200);
-check('and the freed click reads as a plain click',
+check('a follower reads as a plain click',
       describeStep(held[2]) === 'Click left at pointer', describeStep(held[2]));
+check('and a step that names an action keeps it', held[4].action === 'down');
 
-// A whole-click event decides too — it says "one whole click", which is the
-// only thing a step under it can be.
+// The whole-click mode is gone: an event now waits for the press, the release,
+// or whichever comes first, and a stored 'click' is dropped on the way in.
 const wholeDoc = JSON.stringify({ version: 1, macros: [{ id: 'm', name: 'w', body: [
     { id: 'e', kind: 'onevent', source: 'BTN_RIGHT', edge: 'click' },
     { id: 'c', kind: 'click', button: 'left', mode: 'current', action: 'down', holdMs: 900 },
 ] }] });
 const whole = parseDocument(wholeDoc).macros[0].body;
-check('a click under a whole-click event gives its action up too',
-      whole[1].action === undefined && whole[1].holdMs === 900,
+check('a stored click/split mode is dropped', whole[0].edge === undefined,
+      JSON.stringify(whole[0]));
+check('the event reads as both edges',
+      describeStep(whole[0]) === 'When the right button is pressed or released',
+      describeStep(whole[0]));
+check('and the click under it keeps the action it was given',
+      whole[1].action === 'down' && whole[1].holdMs === 900,
       JSON.stringify(whole[1]));
+
+// the two single edges survive the trip and each say so
+const edgeDoc = JSON.stringify({ version: 1, macros: [{ id: 'm', name: 'e', body: [
+    { id: 'p', kind: 'onevent', source: 'BTN_RIGHT', edge: 'press' },
+    { id: 'r', kind: 'onevent', source: 'KEY_F13', edge: 'release' },
+] }] });
+const edges = parseDocument(edgeDoc).macros[0].body;
+check('a press-only event is kept', edges[0].edge === 'press'
+      && describeStep(edges[0]) === 'When the right button is pressed',
+      describeStep(edges[0]));
+check('a release-only event is kept', edges[1].edge === 'release'
+      && describeStep(edges[1]) === 'When F13 is released', describeStep(edges[1]));
+check('and all three edges are offered', EVENT_EDGES.join() === 'either,press,release',
+      EVENT_EDGES.join());
 
 // pixel and regionColor fold onto one colour condition
 const colDoc = JSON.stringify({ version: 1, macros: [{ id: 'm', name: 'c', body: [

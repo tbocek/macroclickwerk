@@ -13,6 +13,7 @@ import GLib from 'gi://GLib';
 
 import { DaemonClient, EventStream, type StreamedEvent } from './daemon.js';
 import { BUTTON_CODES, EV_KEY, keyCode } from './keymap.js';
+import type { EventEdge } from './model.js';
 import { reportProblem } from './problems.js';
 
 export interface Trigger {
@@ -151,9 +152,9 @@ export function dispatch(
 
 /**
  * Which edge woke a parked run, or null when the wait was called off. The
- * steps after the event need this, not just the fact of it: a click under a
- * split `onevent` goes down on the press and up on the release, so the answer
- * to "what happened" is the answer to "what should this click do".
+ * steps after the event need this, not just the fact of it: a click under an
+ * `onevent` goes down on the press and up on the release, so the answer to
+ * "what happened" is the answer to "what should this click do".
  */
 export type WokenEdge = 'press' | 'release' | null;
 
@@ -161,32 +162,31 @@ export type WokenEdge = 'press' | 'release' | null;
 export interface Waiter {
     code: number;
     /**
-     * What wakes this waiter. 'click' wakes on the press and the engine then
-     * swallows the release as part of the gesture. 'split' wakes on the next
-     * edge whichever it is — which is what lets two split steps in a row
-     * bracket one hold: the first catches the press, the second the release.
-     * 'press' and 'release' are the fixed halves, kept for older documents.
+     * Which edge wakes it. 'either' takes the next one whichever it is — which
+     * is what lets two such steps in a row bracket one hold: the first catches
+     * the press, the second the release. 'press' and 'release' sleep through
+     * the other half. @see OnEventStep.edge
      */
-    edge: 'click' | 'split' | 'press' | 'release';
+    edge: EventEdge;
     /** Fired with the edge that woke it, null when the wait was called off. */
     resolve: (edge: WokenEdge) => void;
 }
 
 /**
- * Remove and return every waiter the event wakes: click and press waiters on
- * value 1, release waiters on value 0, split waiters on either edge, and
- * autorepeat wakes nobody. Waiters outrank configured triggers for the same
- * code — a run explicitly parked on this click is more specific than a
- * standing remap, and firing both would act twice on one press.
+ * Remove and return every waiter the event wakes: 'either' waiters on both
+ * edges, the other two on the one they name, and autorepeat wakes nobody.
+ * Waiters outrank configured triggers for the same code — a run explicitly
+ * parked on this click is more specific than a standing remap, and firing both
+ * would act twice on one press.
  */
 export function claimWaiters(waiters: Waiter[], event: StreamedEvent): Waiter[] {
     if (!event.trig || event.type !== EV_KEY ||
         (event.value !== 0 && event.value !== 1)) {
         return [];
     }
-    const wakes = (waiter: Waiter) => waiter.code === event.code &&
-        (waiter.edge === 'split' ||
-            (event.value === 0 ? waiter.edge === 'release' : waiter.edge !== 'release'));
+    const wanted = event.value === 0 ? 'release' : 'press';
+    const wakes = (waiter: Waiter) =>
+        waiter.code === event.code && (waiter.edge === 'either' || waiter.edge === wanted);
     const claimed = waiters.filter(wakes);
     if (claimed.length > 0) {
         // Every run waiting on this edge wakes: two macros parked on the same
@@ -230,7 +230,7 @@ export class TriggerEngine {
     }
 
     /**
-     * Park a run until the chosen edge of `source` — pressed, or released.
+     * Park a run until the next edge of `source` — pressed, or released.
      * While anything waits on a code, the daemon consumes both of its edges:
      * the button belongs to the macro for the duration, so a run waiting on
      * the release is not surprised by the press doing its normal job first.
@@ -241,7 +241,7 @@ export class TriggerEngine {
      */
     waitFor(
         source: string,
-        edge: 'click' | 'split' | 'press' | 'release' = 'click',
+        edge: EventEdge = 'either',
     ): { promise: Promise<WokenEdge>; cancel: () => void } | null {
         const code = sourceCode(source);
         if (code === null) {
@@ -268,13 +268,14 @@ export class TriggerEngine {
 
     handle(event: StreamedEvent): void {
         // A wake on a press left its release in flight, and the release belongs
-        // to whoever got the press: swallowed for a click-mode wake, handed on
-        // to a run that has since parked on exactly that release. Either way
+        // to whoever got the press: handed on to a run that has since parked on
+        // this code, and swallowed when none has — the desktop must not get the
+        // second half of a gesture whose first half a macro took. Either way
         // the code stays claimed until it lands — see `_draining`.
         if (event.type === EV_KEY && this._draining.has(event.code)) {
             const claimedByWaiter = event.value === 0 &&
-                this._waiters.some(waiter => waiter.code === event.code &&
-                    (waiter.edge === 'release' || waiter.edge === 'split'));
+                this._waiters.some(waiter =>
+                    waiter.code === event.code && waiter.edge !== 'press');
             if (event.value === 0) {
                 this._draining.delete(event.code);
             }
@@ -288,14 +289,13 @@ export class TriggerEngine {
         }
         const woken = claimWaiters(this._waiters, event);
         if (woken.length > 0) {
-            // Any wake on a press holds the code until the release lands. For a
-            // click waiter that is the swallowing above. For a split one it is
-            // what keeps the gesture whole: the run is between its two halves
-            // now, and it takes a moment to come back and park on the second —
-            // if the code were given up here, the daemon would stop consuming
-            // in that gap, hand the release to the desktop instead, and leave
-            // whatever the first half pressed held down with nothing coming to
-            // lift it.
+            // A wake on a press holds the code until the release lands, and
+            // that is what keeps the gesture whole: the run is between its two
+            // halves now, and it takes a moment to come back and park on the
+            // second — if the code were given up here, the daemon would stop
+            // consuming in that gap, hand the release to the desktop instead,
+            // and leave whatever the first half pressed held down with nothing
+            // coming to lift it.
             if (event.value === 1) {
                 this._draining.add(event.code);
             }

@@ -5,15 +5,12 @@ TARGET = macroclickwerk
 CC = gcc
 CFLAGS = -Wall -O3 -lpthread -ljson-c -lmicrohttpd
 
-.PHONY: default all clean install uninstall watch
+.PHONY: default all clean install uninstall
 
 default: all
 
 all: macroclickwerk.c
 	$(CC) $(CFLAGS) -o $(TARGET) macroclickwerk.c
-
-watch:
-	./tools/watch-events 15
 
 clean:
 	-rm -f *.o
