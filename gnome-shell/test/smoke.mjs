@@ -367,21 +367,21 @@ check('gate retry becomes a loop that breaks when ready',
       && retryBody[0].body[0].then[0].kind === 'break');
 check('gate retry waits inside the loop', retryBody[0].body[1].kind === 'wait' && retryBody[0].body[1].ms === 500);
 
-// every press step under an event is offered the follow — click, key and pad
-// alike. A step keeps whatever action it stores: an empty one follows the edge,
+// every press step under an event is offered the follow — click and key alike.
+// A step keeps whatever action it stores: an empty one follows the edge,
 // one that names an action does that instead, and the row shows which.
 const heldDoc = JSON.stringify({ version: 1, macros: [{ id: 'm', name: 'h', body: [
     { id: 'c0', kind: 'click', button: 'left', mode: 'current', action: 'down', holdMs: 200 },
     { id: 'e1', kind: 'onevent', source: 'BTN_RIGHT' },
     { id: 'c1', kind: 'click', button: 'left', mode: 'current', holdMs: 200 },
     { id: 'k1', kind: 'key', code: 'KEY_E' },
-    { id: 'p1', kind: 'pad', button: 'BTN_SOUTH', action: 'down' },
+    { id: 'k2', kind: 'key', code: 'KEY_F', action: 'down' },
 ] }] });
 const held = parseDocument(heldDoc).macros[0].body;
 check('a click above the event follows nothing', followsEvent(held, 'c0') === null);
-check('click, key and pad below it all answer to the same event',
+check('click and key below it both answer to the same event',
       followsEvent(held, 'c1')?.id === 'e1' && followsEvent(held, 'k1')?.id === 'e1'
-      && followsEvent(held, 'p1')?.id === 'e1');
+      && followsEvent(held, 'k2')?.id === 'e1');
 check('an empty action is left empty, which is what following looks like',
       held[2].action === undefined && held[3].action === undefined);
 check('the hold time is left alone, for if the event goes away', held[2].holdMs === 200);

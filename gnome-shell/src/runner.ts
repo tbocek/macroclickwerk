@@ -428,15 +428,6 @@ export class MacroRunner {
             case 'key':
                 await this._doKey(step);
                 return 'normal';
-            case 'pad':
-                // A pad button is a key press whose code lives in the gamepad
-                // range; the daemon routes it to the gamepad clone from the
-                // code alone, so the key machinery carries it as-is.
-                await this._doKey({
-                    id: step.id, kind: 'key', code: step.button,
-                    action: step.action, mods: [], holdMs: step.holdMs,
-                });
-                return 'normal';
             case 'text':
                 await this._doText(step);
                 return 'normal';

@@ -57,13 +57,6 @@ repeat forever:
   draws a green outline over the checked area for a second every time it runs,
   taken just after the screenshot so it is never in the picture the model sees.
 - **Emergency stop** that aborts mid-macro and releases every held key.
-- **Gamepads** — a pad (Bluetooth or USB) is captured like any keyboard or
-  mouse: sticks and triggers pass through with their real axis ranges, pad
-  buttons can be recorded, remapped by a trigger, waited on by an `on event`
-  step, and pressed by the **Gamepad button** step — the pad's answer to click
-  and key press. With no pad connected, the synthetic *Macroclickwerk Virtual
-  Gamepad* carries injected buttons, so pad macros work on a machine that has
-  never seen a controller.
 - **Triggers** — a mouse button or key the daemon takes over, and what happens
   in its place: press another key (side button becomes E), or start, pause or
   stop a macro — one of them, or everything switched on, which turns a spare

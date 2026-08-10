@@ -51,9 +51,15 @@
 #define MAX_PLAY_EVENTS    100000
 #define API_VERSION        2
 
+// Keyboards and pointers, and deliberately nothing else. Gamepads were
+// captured here once and are not any more: a clone can carry a pad's axes and
+// buttons faithfully — measured, byte for byte — and still be ignored by the
+// games that read it, because a controller is chosen by identity and the
+// programs doing the choosing have their own ideas about which of the two
+// devices is the real one. Keyboards and mice have no such notion, which is
+// why the same machinery works for them and did not for pads.
 #define CLASS_KEYBOARD 1
 #define CLASS_POINTER  2
-#define CLASS_GAMEPAD  4
 
 struct captured_device {
     char *path;
@@ -68,7 +74,6 @@ struct captured_device {
     char wanted[256];     // the -n name or -d path that owns this slot
     char realname[256];   // what the device called itself when it was opened
     char clone_node[32];  // the clone's /dev/input/eventN node
-    char clone_js[32];    // the clone's /dev/input/jsN node, gamepads only
     bool watched;         // something other than us is reading the clone
     int forward_failures; // forwards that failed and forced an ungrab
     bool grab_denied;     // last grab attempt failed; logged once, retried quietly
@@ -345,9 +350,9 @@ static void release_clone_keys(struct captured_device *d) {
     }
 }
 
-// What a device is, judged by what it can say: something that types, something
-// that points, something with game buttons — or none of them: power buttons
-// and lid switches stay 0 and are left alone.
+// What a device is, judged by what it can say: something that types, or
+// something that points — or neither: power buttons, lid switches and
+// controllers stay 0 and are left alone.
 static int classify(const unsigned int key_bits[], const unsigned int rel_bits[]) {
     int cls = 0;
     if (has_bit(key_bits, KEY_A) || has_bit(key_bits, KEY_ESC) || has_bit(key_bits, KEY_SPACE)) {
@@ -355,13 +360,6 @@ static int classify(const unsigned int key_bits[], const unsigned int rel_bits[]
     }
     if (has_bit(key_bits, BTN_LEFT) || has_bit(rel_bits, REL_X)) {
         cls |= CLASS_POINTER;
-    }
-    // BTN_SOUTH is the gamepad face button (A on an Xbox layout); BTN_TRIGGER
-    // marks the older joystick range. Either makes it a pad worth capturing —
-    // the clone mirrors its axes with their real ranges, so sticks and
-    // triggers pass through faithfully while grabbed.
-    if (has_bit(key_bits, BTN_SOUTH) || has_bit(key_bits, BTN_TRIGGER)) {
-        cls |= CLASS_GAMEPAD;
     }
     return cls;
 }
@@ -456,10 +454,8 @@ static bool mirror_capabilities(struct captured_device *d, int *cls_out) {
 
 // On top of the mirrored capabilities, enable everything we might ever inject
 // into a device of this class. Without this, injecting KEY_E into a mouse clone
-// silently does nothing. `synthetic` marks a clone with no real device behind
-// it: only that one gets made-up axis ranges — a real pad's clone already
-// mirrored its own, and overwriting them would misreport every stick.
-static bool add_injection_capabilities(int fdo, int cls, bool synthetic) {
+// silently does nothing.
+static bool add_injection_capabilities(int fdo, int cls) {
     if (ioctl(fdo, UI_SET_EVBIT, EV_SYN) < 0) {
         return false;
     }
@@ -500,42 +496,6 @@ static bool add_injection_capabilities(int fdo, int cls, bool synthetic) {
         }
     }
 
-    if (cls & CLASS_GAMEPAD) {
-        if (ioctl(fdo, UI_SET_EVBIT, EV_KEY) < 0) {
-            return false;
-        }
-        // The whole joystick and gamepad button range: face buttons,
-        // shoulders, triggers, select/start/mode, stick clicks.
-        for (int code = BTN_JOYSTICK; code <= BTN_THUMBR; code++) {
-            ioctl(fdo, UI_SET_KEYBIT, code);
-        }
-        if (synthetic) {
-            // Sticks and the dpad hat, so the fallback pad reads as a whole
-            // gamepad and not a button box.
-            if (ioctl(fdo, UI_SET_EVBIT, EV_ABS) < 0) {
-                return false;
-            }
-            struct uinput_abs_setup abs_setup = {};
-            for (int axis = ABS_X; axis <= ABS_RY; axis++) {
-                ioctl(fdo, UI_SET_ABSBIT, axis);
-                abs_setup.code = axis;
-                abs_setup.absinfo.minimum = -32768;
-                abs_setup.absinfo.maximum = 32767;
-                abs_setup.absinfo.fuzz = 16;
-                abs_setup.absinfo.flat = 128;
-                ioctl(fdo, UI_ABS_SETUP, &abs_setup);
-            }
-            for (int axis = ABS_HAT0X; axis <= ABS_HAT0Y; axis++) {
-                ioctl(fdo, UI_SET_ABSBIT, axis);
-                abs_setup.code = axis;
-                abs_setup.absinfo.minimum = -1;
-                abs_setup.absinfo.maximum = 1;
-                abs_setup.absinfo.fuzz = 0;
-                abs_setup.absinfo.flat = 0;
-                ioctl(fdo, UI_ABS_SETUP, &abs_setup);
-            }
-        }
-    }
     return true;
 }
 
@@ -552,15 +512,11 @@ static bool create_clone(struct captured_device *d, const char *name, int forced
         return false;
     }
 
-    // Every failure past this point closes fdo. A half-built clone used to be
+    // Capabilities first, so the clone is a copy of what it stands in for.
+    // Every failure past this point closes fdo: a half-built clone used to be
     // harmless because the only caller gave up and exited; now that a failed
-    // attach is retried on the next hotplug event, leaving it open would leak a
-    // /dev/uinput descriptor per attempt.
-    if (ioctl(d->fdo, UI_DEV_SETUP, &usetup) < 0) {
-        fprintf(stderr, "Error: Failed to configure virtual device [%s]: %s.\n", name, strerror(errno));
-        goto fail;
-    }
-
+    // attach is retried on the next hotplug event, leaving it open would leak
+    // a descriptor per attempt.
     int cls = forced_class;
     if (d->fdi >= 0 && !mirror_capabilities(d, &cls)) {
         goto fail;
@@ -571,7 +527,18 @@ static bool create_clone(struct captured_device *d, const char *name, int forced
     }
     d->cls = cls;
 
-    if (!add_injection_capabilities(d->fdo, cls, d->fdi < 0)) {
+    // The ids stay invented rather than copied from the real device. A clone
+    // wearing its original's vendor and product would match that device's hwdb
+    // entries and apply their scancode remaps a second time, to input the real
+    // device already had them applied to — and a remap applied twice is the
+    // wrong key. Nothing about a keyboard or a mouse is looked up by product
+    // id, so there is nothing to be gained against that.
+    if (ioctl(d->fdo, UI_DEV_SETUP, &usetup) < 0) {
+        fprintf(stderr, "Error: Failed to configure virtual device [%s]: %s.\n", name, strerror(errno));
+        goto fail;
+    }
+
+    if (!add_injection_capabilities(d->fdo, cls)) {
         fprintf(stderr, "Error: Failed to add injection capabilities to [%s]: %s.\n", name, strerror(errno));
         goto fail;
     }
@@ -586,7 +553,6 @@ static bool create_clone(struct captured_device *d, const char *name, int forced
     // is safe. Failing to resolve it just means this device is never grabbed,
     // which errs on the side that keeps input flowing.
     d->clone_node[0] = '\0';
-    d->clone_js[0] = '\0';
     char sysname[64] = "";
     if (ioctl(d->fdo, UI_GET_SYSNAME(sizeof(sysname)), sysname) >= 0) {
         char sysdir[128];
@@ -595,16 +561,10 @@ static bool create_clone(struct captured_device *d, const char *name, int forced
         if (dir) {
             struct dirent *entry;
             while ((entry = readdir(dir)) != NULL) {
-                // %.15s: a node name is "event"/"js" plus a number; the
-                // precision only bounds the compiler's worst case.
+                // %.15s: a node name is "event" plus a number; the precision
+                // only bounds the compiler's worst case.
                 if (strncmp(entry->d_name, "event", 5) == 0) {
                     snprintf(d->clone_node, sizeof(d->clone_node),
-                             "/dev/input/%.15s", entry->d_name);
-                } else if (entry->d_name[0] == 'j' && entry->d_name[1] == 's') {
-                    // A pad clone also gets a joydev node, and older games
-                    // read that one; a reader there wants the grab just as
-                    // much as a reader on the event node.
-                    snprintf(d->clone_js, sizeof(d->clone_js),
                              "/dev/input/%.15s", entry->d_name);
                 }
             }
@@ -731,10 +691,6 @@ static struct captured_device *device_for(unsigned int type, unsigned int code) 
     int want;
     if (type == EV_REL || type == EV_ABS) {
         want = CLASS_POINTER;
-    } else if (type == EV_KEY && code >= BTN_JOYSTICK && code <= BTN_THUMBR) {
-        // Checked before the pointer range, which contains it: BTN_SOUTH and
-        // friends belong to the pad, not to a mouse that happens to exist.
-        want = CLASS_GAMEPAD;
     } else if (type == EV_KEY && code >= BTN_MISC && code < KEY_OK) {
         want = CLASS_POINTER;
     } else if (type == EV_KEY) {
@@ -747,11 +703,17 @@ static struct captured_device *device_for(unsigned int type, unsigned int code) 
     // whose source is currently unplugged is still a perfectly good target.
     //
     // Best of one pass, ties going to the first slot: a device that is only
-    // this class beats one that merely covers it, which beats anything at all.
-    // Preferring the dedicated one matters for combined receivers — a Logitech
-    // unifying mouse advertises KEY_ESC and so on, and would otherwise swallow
-    // every keystroke into the mouse clone just because it comes first. With
-    // nothing in particular wanted, the first device is as good as any.
+    // this class beats one that merely covers it. Preferring the dedicated one
+    // matters for combined receivers — a Logitech unifying mouse advertises
+    // KEY_ESC and so on, and would otherwise swallow every keystroke into the
+    // mouse clone just because it comes first. With nothing in particular
+    // wanted, the first device is as good as any.
+    //
+    // A class nothing covers finds nothing, rather than settling for whatever
+    // came first — writing a key into a clone that has no such key bit is a
+    // step that reports success and does nothing at all. In practice there is
+    // always something: ensure_class() makes a keyboard and a pointer when no
+    // real device carries them.
     struct captured_device *found = NULL;
     int best = 0;
     pthread_mutex_lock(&devices_mutex);
@@ -760,7 +722,7 @@ static struct captured_device *device_for(unsigned int type, unsigned int code) 
         int score = want == 0 ? 1
                   : devices[i].cls == want ? 3
                   : (devices[i].cls & want) ? 2
-                  : 1;
+                  : 0;
         if (score > best) {
             best = score;
             found = &devices[i];
@@ -864,7 +826,6 @@ static enum MHD_Result send_status(struct MHD_Connection *connection) {
         json_object_object_add(dev, "wanted", json_object_new_string(devices[i].wanted));
         json_object_object_add(dev, "keyboard", json_object_new_boolean(devices[i].cls & CLASS_KEYBOARD));
         json_object_object_add(dev, "pointer", json_object_new_boolean(devices[i].cls & CLASS_POINTER));
-        json_object_object_add(dev, "gamepad", json_object_new_boolean(devices[i].cls & CLASS_GAMEPAD));
         json_object_array_add(devs, dev);
     }
     pthread_mutex_unlock(&devices_mutex);
@@ -933,10 +894,12 @@ static enum MHD_Result handle_play(struct MHD_Connection *connection, struct jso
     free(events);
 
     if (played < 0) {
-        return send_json(connection, MHD_HTTP_INTERNAL_SERVER_ERROR, "{\"error\":\"no suitable device\"}");
+        return send_json(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                         "{\"error\":\"no suitable device\"}");
     }
 
     char body[128];
+
     snprintf(body, sizeof(body), "{\"played\":%ld,\"aborted\":%s}", played, aborted ? "true" : "false");
     return send_json(connection, MHD_HTTP_OK, body);
 }
@@ -1216,11 +1179,10 @@ static bool setup_device(const char *path, const char *wanted) {
     // stderr, not stdout: the unit sends stdout to /dev/null, and what was
     // actually captured is the first thing you want to see when a device turns
     // out to be missing.
-    fprintf(stderr, "macroclickwerk: captured %s%s%s%s\n",
+    fprintf(stderr, "macroclickwerk: captured %s%s%s\n",
             path,
             (d->cls & CLASS_KEYBOARD) ? " [keys]" : "",
-            (d->cls & CLASS_POINTER) ? " [pointer]" : "",
-            (d->cls & CLASS_GAMEPAD) ? " [pad]" : "");
+            (d->cls & CLASS_POINTER) ? " [pointer]" : "");
 
     d->alive = true;
     device_count++;
@@ -1371,7 +1333,8 @@ static void rescan(bool verbose) {
         e->cls = 0;
         e->grabbable = false;
         if (auto_capture) {
-            unsigned int ev[EV_MAX / 32 + 1] = {0}, key[KEY_MAX / 32 + 1] = {0}, rel[REL_MAX / 32 + 1] = {0};
+            unsigned int ev[EV_MAX / 32 + 1] = {0}, key[KEY_MAX / 32 + 1] = {0},
+                         rel[REL_MAX / 32 + 1] = {0};
             if (ioctl(fd, EVIOCGBIT(0, sizeof(ev)), &ev) >= 0) {
                 if (has_bit(ev, EV_KEY)) {
                     ioctl(fd, EVIOCGBIT(EV_KEY, sizeof(key)), &key);
@@ -1498,10 +1461,8 @@ static void scan_clone_watchers(void) {
                 continue;
             }
             for (int i = 0; i < device_count; i++) {
-                if ((devices[i].clone_node[0] != '\0' &&
-                     strcmp(target, devices[i].clone_node) == 0) ||
-                    (devices[i].clone_js[0] != '\0' &&
-                     strcmp(target, devices[i].clone_js) == 0)) {
+                if (devices[i].clone_node[0] != '\0' &&
+                    strcmp(target, devices[i].clone_node) == 0) {
                     watched[i] = true;
                 }
             }
@@ -1651,7 +1612,10 @@ static void *monitor_thread(void *arg) {
 }
 
 // If no captured device can carry a whole device class, add an ungrabbed uinput
-// device for it so single-device setups can still replay everything.
+// device for it so single-device setups can still replay everything. There are
+// two classes and a machine always has somewhere for a keystroke or a click to
+// go, so this is the difference between a macro working and a macro needing a
+// second mouse.
 static bool ensure_class(int cls, const char *name) {
     for (int i = 0; i < device_count; i++) {
         if (devices[i].cls & cls) {
@@ -1733,8 +1697,7 @@ int main(int argc, char *argv[]) {
     }
 
     if (!ensure_class(CLASS_KEYBOARD, "Macroclickwerk Virtual Keyboard") ||
-        !ensure_class(CLASS_POINTER, "Macroclickwerk Virtual Mouse") ||
-        !ensure_class(CLASS_GAMEPAD, "Macroclickwerk Virtual Gamepad")) {
+        !ensure_class(CLASS_POINTER, "Macroclickwerk Virtual Mouse")) {
         release_devices();
         return EXIT_FAILURE;
     }
