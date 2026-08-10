@@ -631,24 +631,6 @@ check('pathToStep of a missing step is empty', pathToStep(flat.body, 'gone').len
           followsEvent(looped.body, first.id)?.id === wrapped.id);
 }
 
-// --- a pad step is a key press in the gamepad range --------------------------
-
-{
-    const played = [];
-    const padDaemon = {
-        play: async events => { played.push(...events); return { aborted: false }; },
-        stop: async () => {},
-    };
-    const macro = newMacro('paddy');
-    macro.body.push(named('pad', 'a'));   // BTN_SOUTH, tap
-    await new MacroRunner(padDaemon, evaluator, {}, {}, {}).run(macro);
-    const keys = played.filter(e => e.type === 1);
-    check('a pad step presses and releases its button',
-          keys.length === 2 && keys[0].code === 0x130 && keys[0].value === 1
-          && keys[1].code === 0x130 && keys[1].value === 0,
-          JSON.stringify(keys));
-}
-
 // --- a dead model stops only the macros that ask it --------------------------
 
 // The model being unreachable is a fact about one macro's conditions, not

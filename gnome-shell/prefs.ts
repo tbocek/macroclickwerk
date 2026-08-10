@@ -13,7 +13,6 @@ import { ExtensionPreferences, gettext as _ } from 'resource:///org/gnome/Shell/
 
 import {
     CONDITION_TYPE_LABELS,
-    GAMEPAD_BUTTONS,
     AUTHORABLE_STEP_KINDS as STEP_KINDS,
     STEP_KIND_LABELS,
     type ClickStep,
@@ -26,7 +25,6 @@ import {
     type MouseButton,
     type MoveStep,
     type OnEventStep,
-    type PadStep,
     type Region,
     type Step,
     type StepKind,
@@ -125,7 +123,6 @@ const STEP_ICONS: Record<StepKind, string> = {
     scroll: 'view-sort-descending-symbolic',
     key: 'input-keyboard-symbolic',
     text: 'insert-text-symbolic',
-    pad: 'input-gaming-symbolic',
     wait: 'alarm-symbolic',
     onevent: 'input-touchpad-symbolic',   // a press coming *in*: the step that waits for one
     loop: 'media-playlist-repeat-symbolic',
@@ -180,7 +177,17 @@ const eventEdgeLabels = (): Record<string, string> => ({
  * drag the session with it — from a window that has no Stop. `break` and the
  * rest only mean something inside a run, so on their own they do nothing.
  */
-const RUNNABLE_ALONE: StepKind[] = ['click', 'move', 'scroll', 'key', 'text', 'pad', 'wait'];
+const RUNNABLE_ALONE: StepKind[] = ['click', 'move', 'scroll', 'key', 'text', 'wait'];
+
+/**
+ * What a typed key name means: the kernel's spelling, with the prefix filled in
+ * for anyone who wrote just the letter. "f" and "KEY_F" are the same key, and
+ * nobody should have to know which of the two this field wanted.
+ */
+function evdevKeyName(name: string): string {
+    const upper = name.trim().toUpperCase();
+    return upper.startsWith('KEY_') ? upper : `KEY_${upper}`;
+}
 
 /**
  * Only `then` and `else` get a header row of their own — a loop has one body
@@ -1504,7 +1511,7 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
      * the toggle is that way, so the setting can stay.
      */
     private _followToggle(
-        step: ClickStep | KeyStep | PadStep,
+        step: ClickStep | KeyStep,
         event: OnEventStep,
     ): Gtk.Widget {
         const toggle = toggleButton(STEP_ICONS.onevent,
@@ -1522,16 +1529,16 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
     }
 
     /**
-     * The words a click, a key press and a pad press all say: the follow
-     * toggle, when there is an event above to follow, and otherwise what to do
-     * with the button and how long to hold it. A step that is following says
-     * neither — the choice was made one row up, and a half-press has no
-     * duration. Only the wording differs between the three kinds, so that is
-     * all `words` carries.
+     * The words a click and a key press both say: the follow toggle, when
+     * there is an event above to follow, and otherwise what to do with the
+     * button and how long to hold it. A step that is following says neither —
+     * the choice was made one row up, and a half-press has no duration. Only
+     * the wording differs between the two kinds, so that is all `words`
+     * carries.
      */
     private _pressSuffixes(
         suffixes: Gtk.Box,
-        step: ClickStep | KeyStep | PadStep,
+        step: ClickStep | KeyStep,
         follows: OnEventStep | null,
         retitle: () => void,
         words: { action: string; hold: string },
@@ -1728,21 +1735,6 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
                     step.delayMs = value;
                     this._save();
                 }, true));
-            break;
-
-        // The pad's click: which button, what to do with it, for how long —
-        // the same three words a key press has.
-        case 'pad':
-            suffixes.append(chooser(Object.keys(GAMEPAD_BUTTONS), GAMEPAD_BUTTONS, step.button,
-                _('Which gamepad button'), value => {
-                    step.button = value;
-                    retitle();
-                    this._save();
-                }, 10));
-            this._pressSuffixes(suffixes, step, follows, retitle, {
-                action: _('Whether to press, hold down, or release'),
-                hold: _('How long the button stays down'),
-            });
             break;
 
         // Both numbers, and the line already reads "Wait 1s ±200ms", so the
@@ -1999,20 +1991,26 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
                 break;
 
             case 'key':
+                // One field for the whole combo, in the order the row's own
+                // title reads it and the order the fingers go down: modifiers
+                // first, the key last. Two fields asked which of them a name
+                // belonged in — a question with one right answer, since the
+                // last name typed is always the key.
+                //
                 // Action and hold are not here: they sit on the step's own
                 // line, the way a click's button and hold do.
-                rows.push(entryRow(_('Key (evdev name, e.g. KEY_E)'), step.code, text => {
-                    const upper = text.trim().toUpperCase();
-                    step.code = upper.startsWith('KEY_') ? upper : `KEY_${upper}`;
-                    save();
-                }));
-                rows.push(entryRow(_('Modifiers (space separated)'), (step.mods ?? []).join(' '), text => {
-                    step.mods = text.split(/[\s,+]+/).filter(Boolean).map(name => {
-                        const upper = name.toUpperCase();
-                        return upper.startsWith('KEY_') ? upper : `KEY_${upper}`;
-                    });
-                    save();
-                }));
+                rows.push(entryRow(_('Keys (evdev names, e.g. KEY_LEFTCTRL KEY_F)'),
+                    [...(step.mods ?? []), step.code].join(' '), text => {
+                        const names = text.split(/[\s,+]+/).filter(Boolean).map(evdevKeyName);
+                        // An empty field is a field being retyped, not a step
+                        // asking to lose its key: leave the last good combo in
+                        // place until something replaces it.
+                        if (names.length > 0) {
+                            step.code = names[names.length - 1];
+                            step.mods = names.slice(0, -1);
+                        }
+                        save();
+                    }));
                 break;
 
             case 'text':
@@ -2031,8 +2029,8 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
                 break;
 
             // Everything else folds open onto nothing, and so does not fold
-            // open at all: a scroll, a wait, a repeat, a start, a stop and a
-            // gamepad press each say all they have on their own line — "Scroll
+            // open at all: a scroll, a wait, a repeat, a start and a stop
+            // each say all they have on their own line — "Scroll
             // 3 vertically", "Wait 1s ±200ms", Start “Ready” — and a card that
             // opens onto a single control you can already see is a card that
             // should stay shut.

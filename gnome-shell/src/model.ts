@@ -153,30 +153,6 @@ export type TextStep = StepCommon & {
     delayMs?: number;
 };
 
-/**
- * A gamepad button, the pad's answer to click and key press. Injected into
- * the gamepad clone — the real pad's when one is captured, the synthetic
- * "Macroclickwerk Virtual Gamepad" otherwise, so pad macros work with no pad
- * plugged in at all.
- */
-export type PadStep = StepCommon & {
-    kind: 'pad';
-    /** evdev name of the button: BTN_SOUTH, BTN_TR, … */
-    button: string;
-    /** As a click's, including absent meaning "take it from the event". */
-    action?: 'tap' | 'down' | 'up';
-    holdMs?: number;
-};
-
-/** The pad buttons the editor offers, friendly name beside the kernel's. */
-export const GAMEPAD_BUTTONS: Record<string, string> = {
-    BTN_SOUTH: 'A (south)', BTN_EAST: 'B (east)',
-    BTN_WEST: 'X (west)', BTN_NORTH: 'Y (north)',
-    BTN_TL: 'LB', BTN_TR: 'RB', BTN_TL2: 'LT', BTN_TR2: 'RT',
-    BTN_SELECT: 'Select', BTN_START: 'Start', BTN_MODE: 'Guide',
-    BTN_THUMBL: 'L3', BTN_THUMBR: 'R3',
-};
-
 export type WaitStep = StepCommon & {
     kind: 'wait';
     ms: number;
@@ -260,7 +236,6 @@ export type Step =
     | ScrollStep
     | KeyStep
     | TextStep
-    | PadStep
     | WaitStep
     | OnEventStep
     | LoopStep
@@ -367,8 +342,6 @@ export function newStep(kind: StepKind): Step {
             return { id, kind: 'key', code: 'KEY_E', action: 'tap', mods: [], holdMs: 20 };
         case 'text':
             return { id, kind: 'text', value: '', delayMs: 12 };
-        case 'pad':
-            return { id, kind: 'pad', button: 'BTN_SOUTH', action: 'tap', holdMs: 20 };
         case 'wait':
             return { id, kind: 'wait', ms: 1000, jitterMs: 0 };
         case 'onevent':
@@ -770,18 +743,26 @@ export function lastPointerEndpoint(steps: Step[]): { x: number; y: number } | n
 }
 
 /**
- * Verbatim recording produced opaque `raw` steps; without it nothing creates
- * them and nothing can edit them, so any left over are dropped.
+ * Step kinds that no longer exist. Verbatim recording produced opaque `raw`
+ * steps, and `pad` pressed a gamepad button; nothing creates either any more
+ * and nothing can edit them, so any left in a saved document are dropped
+ * rather than shown as rows that cannot work.
  */
-function dropRawSteps(steps: Step[]): Step[] {
+const RETIRED_KINDS: Record<string, string> = {
+    raw: 'a verbatim step; that recording mode is gone',
+    pad: 'a gamepad button step; gamepads are no longer supported',
+};
+
+function dropRetiredSteps(steps: Step[]): Step[] {
     const kept: Step[] = [];
     for (const step of steps) {
-        if ((step as unknown as { kind: string }).kind === 'raw') {
-            log('macroclickwerk: dropping a verbatim step; that recording mode is gone');
+        const retired = RETIRED_KINDS[(step as unknown as { kind: string }).kind];
+        if (retired) {
+            log(`macroclickwerk: dropping ${retired}`);
             continue;
         }
         for (const list of childLists(step)) {
-            const migrated = dropRawSteps(list.steps);
+            const migrated = dropRetiredSteps(list.steps);
             list.steps.length = 0;
             list.steps.push(...migrated);
         }
@@ -1109,7 +1090,7 @@ export function parseDocument(json: string): MacroDocument {
                     delete (loc.step as { edge?: string }).edge;
                 }
             });
-            fixed.body = dropRawSteps(migrateGuards(migrateGates(migrateLoops(fixed.body))));
+            fixed.body = dropRetiredSteps(migrateGuards(migrateGates(migrateLoops(fixed.body))));
             return fixed;
         });
         return { version: raw.version ?? DOCUMENT_VERSION, macros };
@@ -1178,10 +1159,6 @@ export function prettySource(source: string, edge: EventEdge = 'either'): string
     const verb = edge === 'press' ? 'is pressed'
         : edge === 'release' ? 'is released'
             : 'is pressed or released';
-    const pad = GAMEPAD_BUTTONS[source];
-    if (pad) {
-        return `pad ${pad} ${verb}`;
-    }
     const button = source.match(/^BTN_(\w+)$/);
     if (button) {
         return `the ${button[1].toLowerCase()} button ${verb}`;
@@ -1244,10 +1221,6 @@ export function describeStep(
         }
         case 'text':
             return `Type "${truncate(step.value)}"`;
-        case 'pad': {
-            const label = GAMEPAD_BUTTONS[step.button] ?? step.button;
-            return `${pressVerb(step.action)} pad ${label}`;
-        }
         case 'wait':
             return step.jitterMs
                 ? `Wait ${formatMs(step.ms)} ±${formatMs(step.jitterMs)}`
@@ -1284,7 +1257,7 @@ export function describeStep(
  * recording is gone, is all of them.
  */
 export const AUTHORABLE_STEP_KINDS: StepKind[] = [
-    'click', 'move', 'scroll', 'key', 'text', 'pad', 'wait', 'onevent',
+    'click', 'move', 'scroll', 'key', 'text', 'wait', 'onevent',
     'loop', 'if', 'break', 'continue', 'start', 'stop',
 ];
 
@@ -1294,7 +1267,6 @@ export const STEP_KIND_LABELS: Record<StepKind, string> = {
     scroll: 'Scroll',
     key: 'Key press',
     text: 'Type text',
-    pad: 'Gamepad button',
     wait: 'Wait',
     onevent: 'On event',
     loop: 'Loop',

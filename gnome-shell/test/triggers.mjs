@@ -5,7 +5,7 @@
 import {
     parseTriggers, isArmed, armedByCode, dispatch, sourceCode, claimWaiters, TriggerEngine,
 } from '../dist/src/triggers.js';
-import { EV_KEY, BUTTON_CODES, GAMEPAD_CODES, KEY_CODES } from '../dist/src/keymap.js';
+import { EV_KEY, BUTTON_CODES, KEY_CODES } from '../dist/src/keymap.js';
 
 let failures = 0;
 const check = (name, cond, extra = '') => {
@@ -264,13 +264,12 @@ check('the inert ones claim no code',
 // --- remaps mirror press and release, whatever the source --------------------
 
 // A remap is a hold-follow on any EV_KEY source: mouse button to key, key to
-// key, key to mouse button, gamepad button to key. Down mirrors down, up
-// mirrors up, and the held source's autorepeat is left to the kernel.
+// key, key to mouse button. Down mirrors down, up mirrors up, and the held
+// source's autorepeat is left to the kernel.
 {
     const map = armedByCode([
         { id: 'k', source: 'KEY_F13', action: 'key', key: 'KEY_E' },
         { id: 'b', source: 'BTN_LEFT', action: 'key', key: 'BTN_RIGHT' },
-        { id: 'g', source: 'BTN_SOUTH', action: 'key', key: 'KEY_SPACE' },
     ]);
 
     let actions = recordingActions();
@@ -287,18 +286,12 @@ check('the inert ones claim no code',
     check('a mouse button remaps to another button, both edges',
           actions.done.join(' | ') === `key ${BUTTON_CODES.right} down | key ${BUTTON_CODES.right} up`,
           actions.done.join(' | '));
-
-    actions = recordingActions();
-    dispatch(map, trig(GAMEPAD_CODES.BTN_SOUTH, 1), actions);
-    dispatch(map, trig(GAMEPAD_CODES.BTN_SOUTH, 0), actions);
-    check('a gamepad button works as a source, both edges',
-          actions.done.join(' | ') === `key ${KEY_CODES.KEY_SPACE} down | key ${KEY_CODES.KEY_SPACE} up`,
-          actions.done.join(' | '));
 }
 
-check('gamepad names resolve like any other source',
-      sourceCode('BTN_SOUTH') === 0x130 && sourceCode('btn_tr') === 0x137
-      && sourceCode('BTN_THUMBR') === 0x13e);
+// Gamepads are not supported, so their button names name nothing — a trigger
+// left over from when they were stays unarmed rather than eating a button.
+check('gamepad names no longer resolve to anything',
+      sourceCode('BTN_SOUTH') === null && sourceCode('BTN_THUMBR') === null);
 
 // --- the stored form -------------------------------------------------------
 
