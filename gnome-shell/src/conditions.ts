@@ -9,6 +9,7 @@ import { LlmClient, LlmError, type LlmSettings } from './llm.js';
 import { reportProblem } from './problems.js';
 import type { Config } from './store.js';
 import {
+    averageColor,
     captureRegion,
     captureScreen,
     colorCoverage,
@@ -79,6 +80,9 @@ export class ConditionEvaluator {
             case 'always':
                 return { result: true, detail: '' };
 
+            case 'never':
+                return { result: false, detail: '' };
+
             case 'not': {
                 const inner = await this._evaluateInner(condition.of);
                 return { result: !inner.result, detail: inner.detail };
@@ -131,20 +135,31 @@ export class ConditionEvaluator {
         const pixbuf = await captureRegion(condition.x, condition.y, w, h);
         const target = parseColor(condition.color);
 
+        let outcome: { result: boolean; detail: string };
         if (w * h === 1) {
             const actual = readPixel(pixbuf, 0, 0);
             const distance = colorDistance(actual, target);
-            return {
+            outcome = {
                 result: distance <= condition.tolerance,
                 detail: `found ${formatColor(actual)}, distance ${distance.toFixed(1)} vs tolerance ${condition.tolerance}`,
             };
+        } else {
+            const coverage = colorCoverage(pixbuf, target, condition.tolerance);
+            outcome = {
+                result: coverage >= condition.coverage,
+                detail: `found ${formatColor(averageColor(pixbuf))} on average, ` +
+                    `${(coverage * 100).toFixed(1)}% matched, need ${(condition.coverage * 100).toFixed(0)}%`,
+            };
         }
 
-        const coverage = colorCoverage(pixbuf, target, condition.tolerance);
-        return {
-            result: coverage >= condition.coverage,
-            detail: `${(coverage * 100).toFixed(1)}% matched, need ${(condition.coverage * 100).toFixed(0)}%`,
-        };
+        // After the capture — a green outline over the area is exactly the sort
+        // of thing a colour check would then measure — and after the scan,
+        // which holds the main loop and would sit between the flash and its
+        // first paint.
+        if (condition.flash) {
+            this._onFlash?.({ x: condition.x, y: condition.y, w, h });
+        }
+        return outcome;
     }
 
     private async _evaluateLlm(condition: LlmCondition): Promise<{ result: boolean; detail: string }> {

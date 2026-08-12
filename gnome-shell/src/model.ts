@@ -20,6 +20,15 @@ export interface AlwaysCondition {
     type: 'always';
 }
 
+/**
+ * The other half of `always`. It is also what an empty document means nowhere:
+ * a condition is missing only in the "no test, run it" direction, so this one
+ * has to be asked for by name.
+ */
+export interface NeverCondition {
+    type: 'never';
+}
+
 export interface LlmCondition {
     type: 'llm';
     prompt: string;
@@ -43,6 +52,8 @@ export interface ColorCondition {
     tolerance: number;
     /** Fraction of pixels that must match, 0..1. */
     coverage: number;
+    /** Flash a green outline over the checked area whenever this check runs. */
+    flash?: boolean;
 }
 
 export interface AndCondition {
@@ -62,6 +73,7 @@ export interface NotCondition {
 
 export type Condition =
     | AlwaysCondition
+    | NeverCondition
     | LlmCondition
     | ColorCondition
     | AndCondition
@@ -323,6 +335,8 @@ export function newCondition(type: ConditionType): Condition {
             return { type: 'or', of: [] };
         case 'not':
             return { type: 'not', of: { type: 'always' } };
+        case 'never':
+            return { type: 'never' };
         case 'always':
         default:
             return { type: 'always' };
@@ -1139,6 +1153,8 @@ export function describeCondition(cond: Condition | null | undefined): string {
     switch (cond.type) {
         case 'always':
             return 'always';
+        case 'never':
+            return 'never';
         case 'llm':
             return `LLM: "${truncate(cond.prompt)}"`;
         case 'color':
@@ -1279,6 +1295,7 @@ export const STEP_KIND_LABELS: Record<StepKind, string> = {
 
 export const CONDITION_TYPE_LABELS: Record<ConditionType, string> = {
     always: 'Always true',
+    never: 'Never true',
     llm: 'Ask the LLM about a screenshot',
     color: 'Screen colour',
     and: 'All of…',

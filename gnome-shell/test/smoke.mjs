@@ -1,6 +1,7 @@
 import {
     parseDocument, stringifyDocument, newStep, describeStep, describeCondition,
     insertStep, moveStep, moveStepNested, parentOf, removeStep, cloneStep, walk, findStep, newMacro,
+    newCondition,
     resolveRecordTarget,
     resolveRunStart,
     macroEnabled,
@@ -432,6 +433,18 @@ check('regionColor becomes colour', cols[1].cond.type === 'color' && cols[1].con
 check('nested condition migrated', cols[2].cond.of[0].type === 'color');
 check('1x1 colour describes as a pixel', describeCondition(cols[0].cond).startsWith('pixel'), describeCondition(cols[0].cond));
 check('area colour describes as coverage', describeCondition(cols[1].cond).includes('30×40'), describeCondition(cols[1].cond));
+check('colour check remembers its flash', parseDocument(JSON.stringify({ version: 1, macros: [{ id: 'm', name: 'c', body: [
+    { id: 'a', kind: 'if', cond: { type: 'color', x: 1, y: 2, w: 3, h: 4, color: '#abcdef', tolerance: 9, coverage: 0.5, flash: true }, then: [], else: [] },
+] }] })).macros[0].body[0].cond.flash === true);
+
+// never is a condition of its own, not a missing one: it survives a round trip
+const neverDoc = parseDocument(JSON.stringify({ version: 1, macros: [{ id: 'm', name: 'n', body: [
+    { id: 'a', kind: 'if', cond: { type: 'never' }, then: [], else: [] },
+] }] }));
+check('never survives parsing', neverDoc.macros[0].body[0].cond.type === 'never');
+check('never describes as never', describeCondition(neverDoc.macros[0].body[0].cond) === 'never',
+      describeCondition(neverDoc.macros[0].body[0].cond));
+check('never is not always', describeCondition(newCondition('never')) !== describeCondition(newCondition('always')));
 
 // llm verdict parsing
 check('verdict json', parseVerdict('{"match": true, "reason": "green"}').match === true);

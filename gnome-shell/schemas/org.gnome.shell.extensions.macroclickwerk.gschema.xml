@@ -70,6 +70,21 @@
             <description>Internal: the rectangle the shell captured, as JSON</description>
         </key>
 
+        <!-- Both halves of a colour pick. With a region in the request the
+             shell skips the picker and only reads that area, which is the
+             editor asking what the colour there is right now. -->
+        <key name="pick-color-request" type="s">
+            <default>''</default>
+            <summary>Colour pick request</summary>
+            <description>Internal: asks the shell for the colour of a spot on the screen, picked now or of a given area</description>
+        </key>
+
+        <key name="pick-color-result" type="s">
+            <default>''</default>
+            <summary>Colour pick result</summary>
+            <description>Internal: the area and its colour, as JSON</description>
+        </key>
+
         <key name="pick-point-request" type="s">
             <default>''</default>
             <summary>Point pick request</summary>

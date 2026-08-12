@@ -15,11 +15,14 @@ only counts — forever, or a fixed number of times; you leave it with `break`
 inside an `if`, which keeps every condition in one place:
 
 - **screen colour** — "the pixel at 840,512 is green ±24", or "60% of this
-  40×40 area is green". Sub-5 ms, deterministic, no network.
+  40×40 area is green". Sub-5 ms, deterministic, no network. Both the spot and
+  the colour come off the screen itself: **Pick** takes a click as one pixel
+  and a drag as the area with the average colour over it.
 - **ask a local vision model** — a screenshot plus your own prompt ("Is the button
   on the left green?"), answered yes/no by an OpenAI-compatible endpoint running
   on your machine.
-- **and / or / not** over the above.
+- **and / or / not** over the above, and **always** / **never** for a branch
+  that is not deciding anything today.
 
 The macro that ships on first run is the one this was built for:
 
@@ -53,9 +56,11 @@ repeat forever:
 - **Macros that drive each other** — a `start` step restarts a macro from the
   top *or from any step you pick*, so a watcher can send another macro straight
   to the part that matters; `stop` ends one.
-- **See what a check is looking at** — a **Flash** toggle on a screen-check
-  draws a green outline over the checked area for a second every time it runs,
-  taken just after the screenshot so it is never in the picture the model sees.
+- **See what a check is looking at** — a **Flash** toggle on either screen
+  check draws a green outline over the checked area for a second every time it
+  runs, drawn just after the screen is read so it is never part of what was
+  measured or of the picture the model sees. Picking an area flashes it back at
+  you too, so the numbers that land in the field are never taken on trust.
 - **Emergency stop** that aborts mid-macro and releases every held key.
 - **Triggers** — a mouse button or key the daemon takes over, and what happens
   in its place: press another key (side button becomes E), or start, pause or
@@ -398,10 +403,11 @@ spot on the real screen for a couple of seconds, so you can check a number
 without running anything. Next to it, **Pick** fills the field by pointing: the
 window gets out of the way, you click where you mean, and the position lands in
 the field — the same gesture as recording one step, without adding one, which is
-how you correct a coordinate that has moved. On an area it moves the corner and
-leaves the size alone. A pick that catches nothing before it times out says so
-and leaves the field as it was. A step's title follows its coordinates, so a
-click that now goes somewhere else says where.
+how you correct a coordinate that has moved. A pick that catches nothing before
+it times out says so and leaves the field as it was. A step's title follows its
+coordinates, so a click that now goes somewhere else says where. An area is
+picked by dragging one out instead, described with the condition it belongs to
+below.
 
 Where a click or a move goes is one row: the numbers, **Pick**, **Show**, and
 buttons for not using coordinates at all. On a click the mouse button means
@@ -422,11 +428,26 @@ history.
 
 Screen areas for `llm` conditions can also be chosen with **Pick**, which drops
 the window out of the way and lets you drag a rectangle over the screen;
-**Screen** goes back to checking the whole screen. The **Flash** toggle on the
-same row draws a green outline over the checked area for a second every time
-the check runs, so you can watch a running macro look where you meant it to.
-The flash fires just after the screenshot is taken, so it is never in the
-picture the model is asked about.
+**Screen** goes back to checking the whole screen. Whatever you drag out is
+flashed back at you once the window returns, so the numbers in the field never
+have to be taken on trust.
+
+A colour condition's **Pick** is the same overlay, and it brings the colour
+back with it: click a pixel and the check is that pixel and the colour it has,
+drag a rectangle and the check is that area and the average colour over it —
+the same average the check itself measures. Growing a check from one pixel to
+an area drops the required coverage from every pixel to most of them, which is
+the only demand a patch of real screen — antialiased edges, a gradient, a bit
+of text — can meet. **Read** beside the colour leaves the area alone and fills
+in what it looks like right now, for when the button you are watching has
+changed shade since you picked it.
+
+The **Flash** toggle on the area row draws a green outline over the checked
+area for a second every time the check runs, so you can watch a running macro
+look where you meant it to. Both checks have one. The flash fires just after
+the screen is read, never before: the outline's own green would otherwise be
+part of the colour the check measured, and part of the picture the model is
+asked about.
 
 At the top of the Macros page, **Backup** has an **Export** and an **Import**,
 each offering **Macros** or **Settings** — two files, because they move for

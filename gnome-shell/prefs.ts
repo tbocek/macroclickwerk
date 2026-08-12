@@ -16,6 +16,7 @@ import {
     AUTHORABLE_STEP_KINDS as STEP_KINDS,
     STEP_KIND_LABELS,
     type ClickStep,
+    type ColorCondition,
     type Condition,
     type ConditionType,
     type EventEdge,
@@ -58,7 +59,17 @@ import {
     toggleButton,
 } from './src/widgets.js';
 
-const CONDITION_TYPES: ConditionType[] = ['always', 'llm', 'color', 'and', 'or', 'not'];
+const CONDITION_TYPES: ConditionType[] = ['always', 'never', 'llm', 'color', 'and', 'or', 'not'];
+
+/**
+ * The two constants say all there is to say on their own, so inside an "all of"
+ * or an "any of" they only ever weaken the group: an `always` in an "all of" is
+ * a line that does nothing, and one in an "any of" makes the rest of it dead.
+ */
+const GROUPABLE_TYPES = CONDITION_TYPES.filter(type => type !== 'always' && type !== 'never');
+
+/** What a colour check asks of an area the first time it is given one. */
+const AREA_COVERAGE = 0.6;
 
 const MACROS_FILE = 'macroclickwerk-macros.json';
 const SETTINGS_FILE = 'macroclickwerk-settings.json';
@@ -469,30 +480,25 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
         onChange: (values: number[]) => void,
         onShow?: (values: number[]) => void,
         /**
-         * Turns a position picked off the screen into the whole row. Given the
-         * point and what the row holds now, so a rectangle can keep its size and
-         * move its corner. Adds a **Pick** button when supplied.
+         * Fills the row in from the screen. What that takes differs per row —
+         * an area picked with the pointer brings a colour back with it — so the
+         * row only offers the button and the caller says what it does. It goes
+         * before **Show**: first put something in the field, then look at it.
          */
-        fromPoint?: (x: number, y: number, current: number[]) => number[],
+        pick?: { tooltip: string; run: () => void },
     ): Adw.EntryRow {
         const row = new Adw.EntryRow({ title });
         row.set_text(values.join(', '));
         const current = commitNumbers(row, values.length, values, onChange);
 
-        if (fromPoint) {
-            const pick = new Gtk.Button({
+        if (pick) {
+            const button = new Gtk.Button({
                 label: _('Pick'),
-                tooltip_text: _('Go to the spot and click: that position lands here'),
+                tooltip_text: pick.tooltip,
                 valign: Gtk.Align.CENTER,
             });
-            pick.connect('clicked', () => this._pickPointInto(point => {
-                const parsed = parseNumbers(row.get_text() ?? '', values.length) ?? current();
-                const next = fromPoint(point.x, point.y, parsed);
-                // Through the row, so the same parse-and-commit path runs and
-                // what you see is what was saved.
-                row.set_text(next.join(', '));
-            }));
-            row.add_suffix(pick);
+            button.connect('clicked', pick.run);
+            row.add_suffix(button);
         }
 
         if (onShow) {
@@ -2145,6 +2151,25 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
         return [row, ...rows];
     }
 
+    /**
+     * The toggle that makes a check outline the area it is reading while it
+     * reads it. Both checks that look at a piece of the screen have one, and
+     * both mean the same thing by it, so they share the button.
+     */
+    private _flashToggle(condition: LlmCondition | ColorCondition): Gtk.ToggleButton {
+        const flash = new Gtk.ToggleButton({
+            label: _('Flash'),
+            active: condition.flash === true,
+            tooltip_text: _('Flash a green outline over the checked area for a second whenever this check runs'),
+            valign: Gtk.Align.CENTER,
+        });
+        flash.connect('toggled', () => {
+            condition.flash = flash.get_active();
+            this._save();
+        });
+        return flash;
+    }
+
     private _buildConditionRows(
         condition: Condition,
         replace: (next: Condition) => void,
@@ -2156,6 +2181,7 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
 
         switch (condition.type) {
             case 'always':
+            case 'never':
                 break;
 
             case 'llm': {
@@ -2196,51 +2222,50 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
                     });
                     areaRow.add_suffix(clear);
                 }
-                const flash = new Gtk.ToggleButton({
-                    label: _('Flash'),
-                    active: condition.flash === true,
-                    tooltip_text: _('Flash a green outline over the checked area for a second whenever this check runs'),
-                    valign: Gtk.Align.CENTER,
-                });
-                flash.connect('toggled', () => {
-                    condition.flash = flash.get_active();
-                    save();
-                });
-                areaRow.add_suffix(flash);
+                areaRow.add_suffix(this._flashToggle(condition));
                 rows.push(areaRow);
 
                 break;
             }
 
-            case 'color':
-                rows.push(this._numbersRow(_('Area (x, y, width, height)'),
+            case 'color': {
+                // The colour leads, because it is what this condition is about
+                // and so it is the line the type chooser joins. Tolerance sits
+                // on it for the same reason: on its own line the number said
+                // nothing about what it measured.
+                const colourRow = entryRow(_('Colour (#rrggbb)'), condition.color, text => {
+                    condition.color = text.trim();
+                    save();
+                });
+                colourRow.add_suffix(spinSuffix(condition.tolerance, 0, 442,
+                    _('Tolerance: how far off this colour a pixel may be and still count'),
+                    value => {
+                        condition.tolerance = value;
+                        save();
+                    }));
+                const read = new Gtk.Button({
+                    label: _('Read'),
+                    tooltip_text: _('Fill this in with the colour that area has on the screen right now — over an area, its average'),
+                    valign: Gtk.Align.CENTER,
+                });
+                read.connect('clicked', () => this._readColorFor(condition));
+                colourRow.add_suffix(read);
+                rows.push(colourRow);
+
+                const areaRow = this._numbersRow(_('Area (x, y, width, height)'),
                     [condition.x, condition.y, condition.w, condition.h],
                     ([x, y, w, h]) => {
-                        condition.x = x;
-                        condition.y = y;
-                        condition.w = Math.max(1, w);
-                        condition.h = Math.max(1, h);
+                        this._setColorArea(condition, { x, y, w, h });
                         rebuild();
                     },
                     ([x, y, w, h]) => this._showMarker(x, y, Math.max(1, w), Math.max(1, h)),
-                    // The size stays: what you are pointing at is which pixel to
-                    // look at, not how big a patch of it to take.
-                    (x, y, [, , w, h]) => [x, y, w, h]));
-                {
-                    // Tolerance sits on the colour it is a tolerance of: on its
-                    // own line the number said nothing about what it measured.
-                    const colourRow = entryRow(_('Colour (#rrggbb)'), condition.color, text => {
-                        condition.color = text.trim();
-                        save();
+                    {
+                        tooltip: _('Click a pixel on the screen, or drag over an area: where it is and what colour it is both land here'),
+                        run: () => this._pickColorFor(condition),
                     });
-                    colourRow.add_suffix(spinSuffix(condition.tolerance, 0, 442,
-                        _('Tolerance: how far off this colour a pixel may be and still count'),
-                        value => {
-                            condition.tolerance = value;
-                            save();
-                        }));
-                    rows.push(colourRow);
-                }
+                areaRow.add_suffix(this._flashToggle(condition));
+                rows.push(areaRow);
+
                 // Coverage is meaningless for a single pixel, which is the
                 // default shape, so it only appears once there is an area.
                 if (condition.w * condition.h > 1) {
@@ -2250,6 +2275,7 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
                     }));
                 }
                 break;
+            }
 
             case 'not': {
                 const nested = this._expander(`${key}:not`, {
@@ -2274,7 +2300,7 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
                 // sit directly under it, each still folding on its own.
                 const addRow = new Adw.ActionRow({ title: _('Add a sub-condition') });
                 const model = new Gtk.StringList();
-                const addable = CONDITION_TYPES.filter(type => type !== 'always');
+                const addable = GROUPABLE_TYPES;
                 for (const type of addable) {
                     model.append(CONDITION_TYPE_LABELS[type]);
                 }
@@ -2695,6 +2721,69 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
                     condition.region = answer.region as Region;
                     this._saveAndRebuild();
                 }
+            },
+        });
+    }
+
+    /**
+     * Move a colour check onto an area, whether that came from the field or
+     * from the screen. Growing past one pixel brings the coverage threshold
+     * down with it: every pixel matching is the right demand of the single
+     * pixel a new check starts as, and a demand no patch of real screen —
+     * antialiased edges, a gradient, a bit of text — ever meets.
+     */
+    private _setColorArea(condition: ColorCondition, region: Region): void {
+        const wasPixel = condition.w * condition.h === 1;
+        condition.x = region.x;
+        condition.y = region.y;
+        condition.w = Math.max(1, region.w);
+        condition.h = Math.max(1, region.h);
+        if (wasPixel && condition.w * condition.h > 1 && condition.coverage >= 1) {
+            condition.coverage = AREA_COVERAGE;
+        }
+    }
+
+    /**
+     * Point at the screen and take both halves of a colour check off it: a
+     * click is the pixel it landed on, a drag is the rectangle and its average
+     * colour. Nothing here waits for the daemon — the picker is the shell's own
+     * overlay, the same one the model's area comes from.
+     */
+    private _pickColorFor(condition: ColorCondition): void {
+        this._askShell('pick-color', {}, {
+            minimize: true,
+            onResult: answer => {
+                const region = answer.region as Region | undefined;
+                if (!answer.ok || !region) {
+                    this._toast(`${_('nothing was picked')}: ${answer.message ?? _('it was cancelled')}`);
+                    return;
+                }
+                this._setColorArea(condition, region);
+                if (typeof answer.color === 'string') {
+                    condition.color = answer.color;
+                }
+                this._saveAndRebuild();
+            },
+        });
+    }
+
+    /** What the area this check already points at looks like right now. */
+    private _readColorFor(condition: ColorCondition): void {
+        const region: Region = {
+            x: condition.x,
+            y: condition.y,
+            w: Math.max(1, condition.w),
+            h: Math.max(1, condition.h),
+        };
+        this._askShell('pick-color', { region }, {
+            minimize: true,
+            onResult: answer => {
+                if (!answer.ok || typeof answer.color !== 'string') {
+                    this._toast(`${_('could not read that colour')}: ${answer.message ?? _('unknown reason')}`);
+                    return;
+                }
+                condition.color = answer.color;
+                this._saveAndRebuild();
             },
         });
     }

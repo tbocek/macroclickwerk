@@ -109,24 +109,46 @@ export function showMarker(x: number, y: number, w?: number, h?: number, duratio
 /** How long the flash while a check reads an area stays. */
 const FLASH_DURATION_MS = 1000;
 
+/** Smaller than this and an outline is not something you would see. */
+const FLASH_MIN_SIZE = 24;
+
 /**
  * A green outline over the area a running check is reading, gone again within
  * the second; no region means the whole screen. That convention is resolved
  * here, where the stage lives, so callers pass a condition's region through.
  */
 export function flashRegion(region?: Region | null): void {
-    const { x, y, w, h } = region ?? { x: 0, y: 0, w: global.stage.width, h: global.stage.height };
+    const area = region ?? { x: 0, y: 0, w: global.stage.width, h: global.stage.height };
+    // A colour check on a single pixel would otherwise flash a single pixel.
+    // The box grows around the area rather than out of its corner, so the spot
+    // it is pointing at stays in the middle of it.
+    const w = Math.max(Math.round(area.w), FLASH_MIN_SIZE);
+    const h = Math.max(Math.round(area.h), FLASH_MIN_SIZE);
     const box = new St.Widget({ style_class: 'macroclickwerk-marker-flash', reactive: false });
-    box.set_position(Math.round(x), Math.round(y));
-    box.set_size(Math.round(w), Math.round(h));
+    box.set_position(
+        Math.round(area.x) - Math.round((w - area.w) / 2),
+        Math.round(area.y) - Math.round((h - area.h) / 2),
+    );
+    box.set_size(w, h);
     presentMarker([box], FLASH_DURATION_MS);
+}
+
+export interface PickOptions {
+    /** What the picker says it is for while it waits. */
+    hint?: string;
+    /**
+     * Whether a click that did not drag is a 1×1 region rather than nothing.
+     * A colour pick wants that — one pixel is the ordinary case there — and an
+     * area to look at does not: a stray click would set an empty rectangle.
+     */
+    point?: boolean;
 }
 
 /**
  * Drag a rectangle over the screen. Resolves null when cancelled with Escape or
  * a right click.
  */
-export function pickRegion(): Promise<Region | null> {
+export function pickRegion(options: PickOptions = {}): Promise<Region | null> {
     return new Promise(resolve => {
         const overlay = new St.Widget({
             style_class: 'macroclickwerk-picker',
@@ -143,7 +165,8 @@ export function pickRegion(): Promise<Region | null> {
 
         const hint = new St.Label({
             style_class: 'macroclickwerk-picker-hint',
-            text: 'Drag to select the area the model should look at — Escape to cancel',
+            text: options.hint
+                ?? 'Drag to select the area the model should look at — Escape to cancel',
         });
         overlay.add_child(hint);
         hint.set_position(
@@ -224,7 +247,15 @@ export function pickRegion(): Promise<Region | null> {
                 w: Math.round(Math.abs(x - startX)),
                 h: Math.round(Math.abs(y - startY)),
             };
-            finish(region.w < 4 || region.h < 4 ? null : region);
+            // Too small to have been a drag. Where the press landed is still a
+            // place on the screen, so a picker that takes points takes it —
+            // from the press, which is where you aimed, not from the release,
+            // which is wherever the pointer had drifted by then.
+            if (region.w < 4 || region.h < 4) {
+                finish(options.point ? { x: startX, y: startY, w: 1, h: 1 } : null);
+                return Clutter.EVENT_STOP;
+            }
+            finish(region);
             return Clutter.EVENT_STOP;
         });
 

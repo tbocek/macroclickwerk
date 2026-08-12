@@ -21,13 +21,14 @@ import { MacroStore, type Config } from './src/store.js';
 import { starterMacro } from './src/starter.js';
 import {
     childLists, describeStep, findStep, lastPointerEndpoint, reachesEnd,
-    resolveRecordTarget, resolveRunStart, type Macro, type RecordTarget, type Step,
+    resolveRecordTarget, resolveRunStart, type Macro, type RecordTarget, type Region, type Step,
 } from './src/model.js';
 import { clearProblems, onProblemsChanged, problemCount, reportProblem } from './src/problems.js';
 import { EV_KEY } from './src/keymap.js';
 import { TriggerEngine, parseTriggers } from './src/triggers.js';
 import { MacroPopup } from './ui/popup.js';
 import { clearMarker, flashRegion, pickRegion, showMarker } from './ui/overlay.js';
+import { averageColor, captureRegion, formatColor } from './src/screenshot.js';
 
 const KEYBINDINGS = [
     'run-macro', 'record-toggle', 'capture-step', 'panic-stop',
@@ -39,6 +40,23 @@ const KEYBINDINGS = [
  * keep up with the eye.
  */
 const RUNNING_PUBLISH_MS = 100;
+
+/**
+ * How long to let the screen become what it will be before a colour is read
+ * off it. Something has just been asked to get out of the way — the
+ * preferences window, or the picker's own dimmed overlay — and neither is gone
+ * in the frame that asked. Sampling too early reads the thing that was leaving.
+ */
+const SETTLE_BEFORE_SAMPLE_MS = 250;
+
+function settle(ms: number): Promise<void> {
+    return new Promise(resolve => {
+        GLib.timeout_add(GLib.PRIORITY_DEFAULT, ms, () => {
+            resolve();
+            return GLib.SOURCE_REMOVE;
+        });
+    });
+}
 
 /** Where preferences wants a captured step to land. */
 interface CaptureTarget {
@@ -760,6 +778,30 @@ export default class MacroclickwerkExtension extends Extension {
     }
 
     /**
+     * A place on the screen and the colour it has, which for a colour check are
+     * one answer rather than two: a click takes the pixel, a drag takes the
+     * rectangle and the average over it — the same average the check reads when
+     * it runs. With a region already given, the pick is skipped and only the
+     * colour is read, which is the editor asking what that area looks like now.
+     */
+    private async _pickColor(given: Region | null): Promise<object> {
+        const region = given ?? await pickRegion({
+            point: true,
+            hint: 'Click a pixel for its colour, or drag over an area for its average — Escape to cancel',
+        });
+        if (!region) {
+            return { ok: false, message: 'nothing was picked' };
+        }
+
+        await settle(SETTLE_BEFORE_SAMPLE_MS);
+        const pixbuf = await captureRegion(region.x, region.y, region.w, region.h);
+        const color = formatColor(averageColor(pixbuf));
+        // Only now: the outline is over the very pixels that were just read.
+        flashRegion(region);
+        return { ok: true, region, color };
+    }
+
+    /**
      * Run one step, now, because a play button in the editor asked. Only that
      * step: preferences does not offer this on a loop or an `if`, which would
      * take their whole body with them — and an endless loop would take the
@@ -1021,7 +1063,21 @@ export default class MacroclickwerkExtension extends Extension {
             return; // our own state; nothing to redo here
         }
         if (key === 'pick-region-request') {
-            void this._answerRequest('pick-region', async () => ({ region: await pickRegion() }));
+            void this._answerRequest('pick-region', async () => {
+                const region = await pickRegion();
+                // Flashed back at you: the picker is gone by the time the
+                // editor shows the numbers, and this says which rectangle they
+                // are before you have to trust them.
+                if (region) {
+                    flashRegion(region);
+                }
+                return { region };
+            });
+            return;
+        }
+        if (key === 'pick-color-request') {
+            void this._answerRequest<{ serial?: number; region?: Region | null }>(
+                'pick-color', request => this._pickColor(request.region ?? null));
             return;
         }
         if (key === 'pick-point-request') {

@@ -126,6 +126,35 @@ export function readPixel(pixbuf: GdkPixbuf.Pixbuf, x = 0, y = 0): Rgb {
     return { r: pixels[offset], g: pixels[offset + 1], b: pixels[offset + 2] };
 }
 
+/**
+ * The mean colour of an area — for a 1×1 one, that pixel. Averaged on the
+ * stored sRGB values rather than on light: the check this feeds compares sRGB
+ * distances, so a gamma-correct mean would be a target the comparison it is
+ * measured against does not use.
+ */
+export function averageColor(pixbuf: GdkPixbuf.Pixbuf): Rgb {
+    const pixels = pixbuf.get_pixels();
+    const channels = pixbuf.get_n_channels();
+    const rowstride = pixbuf.get_rowstride();
+    const width = pixbuf.get_width();
+    const height = pixbuf.get_height();
+
+    let r = 0;
+    let g = 0;
+    let b = 0;
+    for (let y = 0; y < height; y++) {
+        for (let x = 0; x < width; x++) {
+            const offset = y * rowstride + x * channels;
+            r += pixels[offset];
+            g += pixels[offset + 1];
+            b += pixels[offset + 2];
+        }
+    }
+
+    const count = Math.max(1, width * height);
+    return { r: Math.round(r / count), g: Math.round(g / count), b: Math.round(b / count) };
+}
+
 /** Fraction of pixels within `tolerance` of `target`, 0..1. */
 export function colorCoverage(pixbuf: GdkPixbuf.Pixbuf, target: Rgb, tolerance: number): number {
     const pixels = pixbuf.get_pixels();
