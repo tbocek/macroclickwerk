@@ -120,6 +120,13 @@ export default class MacroclickwerkExtension extends Extension {
             this._store.activeMacroId = macro.id;
         }
 
+        // Nothing is running in a shell that has only just started, whatever
+        // the last one left in the key. `disable` clears it on the way out, but
+        // a session that ends takes the process with it and never gets there —
+        // so a logout during a run left the editor showing that run for ever
+        // after, offering Pause on a macro no longer capable of being paused.
+        this._publishRunningPaths();
+
         const config = this._store.config;
         this._daemon = new DaemonClient(config.controlSocket, config.eventSocket);
         this._evaluator = new ConditionEvaluator(config, trace => this._onTrace(trace), flashRegion);
@@ -845,7 +852,18 @@ export default class MacroclickwerkExtension extends Extension {
             } else {
                 this._clearMark();
             }
-            runner?.stop(this._runningMacros().length === 1);
+            if (runner) {
+                runner.stop(this._runningMacros().length === 1);
+            } else {
+                // Nothing is running under that id, so whatever the published
+                // state says about it is out of date. Say so here, because the
+                // run loop that would normally publish it is not there to: an
+                // editor left showing Pause for a run that does not exist has
+                // no way back, every press being answered by a stop that stops
+                // nothing and republishes nothing.
+                this._runningPaths.delete(macro.id);
+                this._publishRunningPaths();
+            }
             this._popup?.refresh();
             return {
                 ok: true,

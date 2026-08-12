@@ -114,7 +114,6 @@ export class MacroRunner {
      * editor knows to stop offering the choice.
      */
     private _inputEdge: 'press' | 'release' | null = null;
-    private _warnedAboutMotion = false;
     private _paused = false;
     private _path: RunningStep[] = [];
     private _failedAt = '';
@@ -219,7 +218,6 @@ export class MacroRunner {
         this._running = true;
         this._cancelled = false;
         this._paused = false;
-        this._warnedAboutMotion = false;
         this._path = [];
         this._failedAt = '';
         this._failedStepId = '';
@@ -589,9 +587,18 @@ export class MacroRunner {
         // move left off is the whole point, and another macro nudging the pointer
         // between the two would land it somewhere else entirely.
         await this._daemon.exclusive(async lease => {
-            await this._moveToTarget(step, lease);
+            const arrived = await this._moveToTarget(step, lease);
             if (this._cancelled) {
                 return;
+            }
+            // Not arriving is a reason not to click, not a detail to click
+            // through. Wherever the pointer got stuck belongs to something —
+            // in the applications this is pointed at, usually something that
+            // does damage when clicked — and a click there is both wrong and
+            // untraceable, since the step's own coordinates say it went
+            // somewhere else entirely.
+            if (!arrived) {
+                throw new Error(this._motionFailure(step));
             }
             await press(lease);
         });
@@ -611,7 +618,23 @@ export class MacroRunner {
             return;
         }
         // Only the move to hold together here — there is nothing after it.
-        await this._daemon.exclusive(lease => this._moveToTarget(step, lease));
+        const arrived = await this._daemon.exclusive(lease => this._moveToTarget(step, lease));
+        if (!arrived && !this._cancelled) {
+            // A move that did not move is the whole step, so it fails outright
+            // rather than reporting success from the wrong place and leaving
+            // every later step to be aimed from there.
+            throw new Error(this._motionFailure(step));
+        }
+    }
+
+    /** Why a move failed, said in terms of where it meant to be and where it is. */
+    private _motionFailure(step: ClickStep | MoveStep): string {
+        const [px, py] = global.get_pointer();
+        const target = step.mode === 'prev'
+            ? this._prevPointer
+            : { x: step.x ?? 0, y: step.y ?? 0 };
+        return `the pointer would not go to ${target?.x ?? 0},${target?.y ?? 0} — ` +
+            `it stopped at ${Math.round(px)},${Math.round(py)}`;
     }
 
     /**
@@ -625,18 +648,18 @@ export class MacroRunner {
      * nowhere to go and stays put, which for a click means clicking where the
      * pointer already is.
      */
-    private async _moveToTarget(step: ClickStep | MoveStep, lease: Playback): Promise<void> {
+    private async _moveToTarget(step: ClickStep | MoveStep, lease: Playback): Promise<boolean> {
         const target = step.mode === 'prev'
             ? this._prevPointer
             : { x: step.x ?? 0, y: step.y ?? 0 };
         if (!target) {
-            return;
+            return true;   // a 'prev' with nowhere to go stays put, as it always has
         }
         if (!this._prevPinned) {
             const [px, py] = global.get_pointer();
             this._prevPointer = { x: px, y: py };
         }
-        await this._moveAbs(target.x, target.y, lease);
+        return this._moveAbs(target.x, target.y, lease);
     }
 
     private async _playRelative(dx: number, dy: number, via?: Playback): Promise<void> {
@@ -664,11 +687,11 @@ export class MacroRunner {
      * pointer is still shared with the person at the desk — a hand on the
      * mouse is answered by the next pass, which reads where it really is.
      */
-    private async _moveAbs(x: number, y: number, via?: Playback): Promise<void> {
+    private async _moveAbs(x: number, y: number, via?: Playback): Promise<boolean> {
         const seat = await this._defaultSeat();
         for (let i = 0; seat && i < MAX_WARP_ITERATIONS; i++) {
             if (this._cancelled) {
-                return;
+                return false;
             }
             seat.warp_pointer(x, y);
             // The warp is applied on the input thread, not inside the call:
@@ -676,20 +699,38 @@ export class MacroRunner {
             await this._sleep(2);
             const [px, py] = global.get_pointer();
             if (Math.abs(x - px) <= 1 && Math.abs(y - py) <= 1) {
-                return;
+                return true;
             }
         }
 
+        // The walk is a closed loop — every pass measures and re-aims — so it
+        // absorbs a scale factor or an acceleration curve on its own: those
+        // overshoot by a proportion, and a proportion of a shrinking error
+        // shrinks. What it cannot absorb is being pinned. A pointer held by
+        // something else stops at the same spot pass after pass, and the
+        // distance left over stops falling.
+        let stalled = 0;
+        let previous = Number.POSITIVE_INFINITY;
         for (let i = 0; i < MAX_MOVE_ITERATIONS; i++) {
             if (this._cancelled) {
-                return;
+                return false;
             }
             const [px, py] = global.get_pointer();
             const dx = Math.round(x - px);
             const dy = Math.round(y - py);
             if (Math.abs(dx) <= 1 && Math.abs(dy) <= 1) {
-                return;
+                return true;
             }
+            const distance = Math.abs(dx) + Math.abs(dy);
+            // A pass that got no closer than the one before it. Two of those in
+            // a row and the remaining ten are ten more helpings of the same
+            // nudge, each one landing in whatever is holding the pointer — a
+            // game reading them as mouse-look spins the camera ten times over.
+            stalled = distance >= previous ? stalled + 1 : 0;
+            if (stalled >= 2) {
+                break;
+            }
+            previous = distance;
             await this._playRelative(dx, dy, via);
             await this._sleep(6);
         }
@@ -699,19 +740,23 @@ export class MacroRunner {
         // reported as "stopped at 4000,0 instead of 4000,0".
         const [ex, ey] = global.get_pointer();
         if (this._cancelled || (Math.abs(x - ex) <= 1 && Math.abs(y - ey) <= 1)) {
-            return;
+            return !this._cancelled;
         }
 
-        if (!this._warnedAboutMotion) {
-            this._warnedAboutMotion = true;
-            const [px, py] = global.get_pointer();
-            this._status(`Pointer stopped at ${Math.round(px)},${Math.round(py)} instead of ${x},${y}`);
-            reportProblem('Step', `the pointer stopped at ${Math.round(px)},${Math.round(py)} instead of ${x},${y}`, {
-                where: this._where(),
-                hint: 'Everything after this clicked in the wrong place. If the target grabs the ' +
-                    'pointer (games with mouse look), record relative motion instead of absolute clicks.',
-            });
-        }
+        // Reported here, where both positions are known, rather than left to
+        // the caller's shorter message. Not gated on having warned before any
+        // more: the step this belongs to now fails, so the run stops rather
+        // than carrying on to say the same thing about every step after it.
+        this._status(`Pointer stopped at ${Math.round(ex)},${Math.round(ey)} instead of ${x},${y}`);
+        reportProblem('Step', `the pointer stopped at ${Math.round(ex)},${Math.round(ey)} instead of ${x},${y}`, {
+            where: this._where(),
+            hint: 'Something is holding the pointer — a game with mouse look confines it, and a ' +
+                'confined pointer cannot be moved to a fixed position at all. Nothing was clicked: ' +
+                'clicking where it got stuck would be a click on whatever happens to be there. ' +
+                'Record relative motion instead of absolute clicks, or take the game out of ' +
+                'mouse-look before the step runs.',
+        });
+        return false;
     }
 
     private async _doScroll(step: ScrollStep): Promise<void> {
