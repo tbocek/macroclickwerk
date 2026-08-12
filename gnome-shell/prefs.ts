@@ -1881,6 +1881,15 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
 
         this._selectable(row, `after:${step.id}`, macro.id);
 
+        // Right-click anywhere on the row. On the row rather than on a button
+        // of its own: a step's line is already full, and this is the gesture
+        // people try on a list without being told to.
+        const secondary = new Gtk.GestureClick({ button: Gdk.BUTTON_SECONDARY });
+        secondary.connect('pressed', (_gesture, _presses, x: number, y: number) => {
+            this._stepMenu(macro, step, row, x, y);
+        });
+        row.add_controller(secondary);
+
         if (row instanceof Adw.ExpanderRow) {
             for (const child of fields) {
                 row.add_row(child);
@@ -2667,6 +2676,74 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
                     this._toast(`capture failed: ${answer.message ?? 'unknown reason'}`);
                 }
                 // A successful capture lands in `macros`, which rebuilds us anyway.
+            },
+        });
+    }
+
+    /**
+     * The menu a step's row opens on a right click.
+     *
+     * One entry, because there is one thing the row cannot already say. The ▶
+     * beside a step runs that step alone; Run at the top of the macro starts
+     * from the selected row, which is wherever you last clicked and rarely the
+     * step you are looking at. "Run from here" is the middle of those two:
+     * this step, and everything after it.
+     */
+    private _stepMenu(macro: Macro, step: Step, row: Gtk.Widget, x: number, y: number): void {
+        const box = new Gtk.Box({
+            orientation: Gtk.Orientation.VERTICAL,
+            margin_top: 6,
+            margin_bottom: 6,
+            margin_start: 6,
+            margin_end: 6,
+        });
+        const popover = new Gtk.Popover({ child: box, position: Gtk.PositionType.BOTTOM });
+
+        const run = new Gtk.Button({
+            label: _('Run from here'),
+            tooltip_text: _('Start the macro at this step and carry on from it'),
+            css_classes: ['flat'],
+        });
+        run.connect('clicked', () => {
+            // Down before the window goes, or the popover is left behind over
+            // a minimised window and comes back with it.
+            popover.popdown();
+            this._runFrom(macro, step);
+        });
+        box.append(run);
+
+        popover.set_parent(row);
+        popover.set_pointing_to(new Gdk.Rectangle({
+            x: Math.round(x), y: Math.round(y), width: 1, height: 1,
+        }));
+        // A popover parented by hand is unparented by hand, and not from inside
+        // the signal that is still using it — hence the idle.
+        popover.connect('closed', () => {
+            GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
+                popover.unparent();
+                return GLib.SOURCE_REMOVE;
+            });
+        });
+        popover.popup();
+    }
+
+    /**
+     * Start this macro at this step. The mark moves here too: it is what the
+     * editor highlights and where a pause would continue from, so leaving it
+     * pointing at some other row would make the next press disagree with this
+     * one. The step is named in the request as well, so the run does not depend
+     * on the mark's write arriving first.
+     */
+    private _runFrom(macro: Macro, step: Step): void {
+        this._selectTarget(macro.id, `after:${step.id}`);
+        this._save();
+        this._window?.minimize();
+        this._askShell('run-macro', { macroId: macro.id, action: 'run', at: step.id }, {
+            onResult: answer => {
+                if (!answer.ok) {
+                    this._window?.present();
+                    this._toast(answer.message ?? _('it did not run'));
+                }
             },
         });
     }

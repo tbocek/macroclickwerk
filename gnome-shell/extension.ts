@@ -607,12 +607,19 @@ export default class MacroclickwerkExtension extends Extension {
     }
 
     /** Start one macro, from the selected step when the selection is in it. */
-    private _runMacro(macro: Macro): boolean {
+    /**
+     * `at` names the step to begin at, for a caller that has one in mind —
+     * the editor's "run from here". Naming it in the request beats leaving it
+     * to the mark: the mark is a second settings write, and a run that depends
+     * on two writes landing in order is a run that starts in the wrong place
+     * when they do not.
+     */
+    private _runMacro(macro: Macro, at?: string): boolean {
         const runner = this._runnerFor(macro.id);
         if (!runner || runner.running) {
             return false;
         }
-        void runner.run(macro, this._resumeStepFor(macro));
+        void runner.run(macro, at || this._resumeStepFor(macro));
         return true;
     }
 
@@ -835,7 +842,7 @@ export default class MacroclickwerkExtension extends Extension {
      * stop throws that place away. It is the same pair the panel offers, where
      * the switch pauses and the Stop item below it does not.
      */
-    private _runOneMacro(request: { macroId?: string; action?: string }): object {
+    private _runOneMacro(request: { macroId?: string; action?: string; at?: string }): object {
         const macro = request.macroId ? this._store?.getMacro(request.macroId) : null;
         if (!macro) {
             return { ok: false, message: 'that macro is no longer there' };
@@ -873,7 +880,7 @@ export default class MacroclickwerkExtension extends Extension {
                 message: paused ? `Paused “${macro.name}”` : `Stopped “${macro.name}”`,
             };
         }
-        if (!this._runMacro(macro)) {
+        if (!this._runMacro(macro, request.at)) {
             return { ok: false, message: 'it is already running' };
         }
         return { ok: true, message: `Running “${macro.name}”` };
@@ -1113,7 +1120,7 @@ export default class MacroclickwerkExtension extends Extension {
             return;
         }
         if (key === 'run-macro-request') {
-            void this._answerRequest<{ serial?: number; macroId?: string; action?: string }>(
+            void this._answerRequest<{ serial?: number; macroId?: string; action?: string; at?: string }>(
                 'run-macro', request => this._runOneMacro(request));
             return;
         }

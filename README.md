@@ -389,6 +389,14 @@ same row — the window stays out of the way until you stop (`Ctrl+Shift+R`, the
 panel menu, or picking **Multiple steps** again). `Ctrl+Shift+M` captures one
 step without opening Settings, into whichever row is selected.
 
+**Right-click any step** for **Run from here**: the macro starts at that step
+and carries on from it, which is how you try the second half of something
+without sitting through the first. It sits between the two buttons that were
+already there — the **▶** on a step runs that step *alone*, and **Run** at the
+top starts from the selected row, which is wherever you last clicked and rarely
+the step you are looking at. Running from here moves the selection here too, so
+the mark, the highlight and where a pause would continue from all agree.
+
 The **▶** on a step does that one step immediately, on the real screen: the
 window drops out of the way, the step runs, and the window comes back. It is the
 quickest way to check that a click really lands where you meant it to, without
