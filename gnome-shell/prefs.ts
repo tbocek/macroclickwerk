@@ -16,6 +16,7 @@ import {
     AUTHORABLE_STEP_KINDS as STEP_KINDS,
     STEP_KIND_LABELS,
     type ClickStep,
+    type ColorCondition,
     type Condition,
     type ConditionType,
     type EventEdge,
@@ -53,12 +54,19 @@ import { buildInstruction, testConnection } from './src/llm.js';
 import { comboCodes, isArmed, parseTriggers, type Trigger } from './src/triggers.js';
 import { keyName } from './src/keymap.js';
 import {
-    chooser, clearClasses, comboRow, commitNumbers, debounce, descendants, entryRow,
-    iconButton, infoButton, passwordRow, setClass, spinRow, spinSuffix, suffixEntry,
-    toggleButton,
+    chooser, clearClasses, colorSwatch, comboRow, commitNumbers, debounce, descendants,
+    entryRow, iconButton, infoButton, passwordRow, setClass, spinRow, spinSuffix,
+    suffixEntry, toggleButton, withColorSwatches,
 } from './src/widgets.js';
 
-const CONDITION_TYPES: ConditionType[] = ['always', 'llm', 'color', 'and', 'or', 'not'];
+const CONDITION_TYPES: ConditionType[] = ['always', 'never', 'llm', 'color', 'and', 'or', 'not'];
+
+/**
+ * The two constants say all there is to say on their own, so inside an "all of"
+ * or an "any of" they only ever weaken the group: an `always` in an "all of" is
+ * a line that does nothing, and one in an "any of" makes the rest of it dead.
+ */
+const GROUPABLE_TYPES = CONDITION_TYPES.filter(type => type !== 'always' && type !== 'never');
 
 const MACROS_FILE = 'macroclickwerk-macros.json';
 const SETTINGS_FILE = 'macroclickwerk-settings.json';
@@ -148,8 +156,8 @@ const mouseButtonLabels = (): Record<MouseButton, string> => ({
     extra: _('Extra'),
 });
 
-/** What a key step can do, in the order it is offered. */
-const KEY_ACTIONS = ['tap', 'down', 'up'] as const;
+/** What a click or a key step can do, in the order it is offered. */
+const PRESS_ACTIONS = ['tap', 'down', 'up'] as const;
 
 /**
  * Built on demand, for the same reason mouseButtonLabels is. One word each,
@@ -157,10 +165,23 @@ const KEY_ACTIONS = ['tap', 'down', 'up'] as const;
  * entry, and "Press and keep held" made every row in the window wider than it
  * had room for. The line these sit on already reads "Hold down ctrl+c", so the
  * sentence was being said twice; the tooltip keeps the long form.
+ *
+ * A mouse and a keyboard differ in one word of the three: the whole gesture is
+ * a *click* on a mouse and a *type* on a keyboard. Naming it separately is what
+ * leaves "press" free for the half that goes down and stays there, so both
+ * kinds can name their halves press and release — a pair with two ends you can
+ * see. Nothing is a "hold": a hold implies an unhold, and the button that ends
+ * it is the Release two entries down the same list.
  */
+const clickActionLabels = (): Record<string, string> => ({
+    tap: _('Click'),
+    down: _('Press'),
+    up: _('Release'),
+});
+
 const keyActionLabels = (): Record<string, string> => ({
-    tap: _('Press'),
-    down: _('Hold'),
+    tap: _('Type'),
+    down: _('Press'),
     up: _('Release'),
 });
 
@@ -469,30 +490,25 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
         onChange: (values: number[]) => void,
         onShow?: (values: number[]) => void,
         /**
-         * Turns a position picked off the screen into the whole row. Given the
-         * point and what the row holds now, so a rectangle can keep its size and
-         * move its corner. Adds a **Pick** button when supplied.
+         * Fills the row in from the screen. What that takes differs per row —
+         * an area picked with the pointer brings a colour back with it — so the
+         * row only offers the button and the caller says what it does. It goes
+         * before **Show**: first put something in the field, then look at it.
          */
-        fromPoint?: (x: number, y: number, current: number[]) => number[],
+        pick?: { tooltip: string; run: () => void },
     ): Adw.EntryRow {
         const row = new Adw.EntryRow({ title });
         row.set_text(values.join(', '));
         const current = commitNumbers(row, values.length, values, onChange);
 
-        if (fromPoint) {
-            const pick = new Gtk.Button({
+        if (pick) {
+            const button = new Gtk.Button({
                 label: _('Pick'),
-                tooltip_text: _('Go to the spot and click: that position lands here'),
+                tooltip_text: pick.tooltip,
                 valign: Gtk.Align.CENTER,
             });
-            pick.connect('clicked', () => this._pickPointInto(point => {
-                const parsed = parseNumbers(row.get_text() ?? '', values.length) ?? current();
-                const next = fromPoint(point.x, point.y, parsed);
-                // Through the row, so the same parse-and-commit path runs and
-                // what you see is what was saved.
-                row.set_text(next.join(', '));
-            }));
-            row.add_suffix(pick);
+            button.connect('clicked', pick.run);
+            row.add_suffix(button);
         }
 
         if (onShow) {
@@ -580,7 +596,7 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
             return [parsed?.[0] ?? 0, parsed?.[1] ?? 0];
         };
         const pick = iconButton('find-location-symbolic',
-            _('Go to the spot and click: that position lands here'),
+            _('Click the spot on the screen: that position lands here'),
             () => this._pickPointInto(({ x, y }) => entry.set_text(`${x}, ${y}`)));
         const show = iconButton('view-reveal-symbolic',
             _('Flash this position on the screen for a couple of seconds'),
@@ -1455,13 +1471,23 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
     }
 
     /**
+     * A step's title as a row shows it, which is not quite as it reads: a row
+     * title is Pango markup, so any colour the step names is followed by a
+     * block of that colour — and everything else in it is escaped, `_describe`
+     * being free to return an ampersand from a macro's name or a prompt.
+     */
+    private _rowTitle(step: Step): string {
+        return withColorSwatches(this._describe(step));
+    }
+
+    /**
      * The title says what the step does, so a setting that changes that has to
      * put it right — a click that now goes somewhere else must not still be
      * headed "Click left @ 100,200". Updated in place: rebuilding would take the
      * field you are typing in with it.
      */
     private _refreshStepTitle(step: Step): void {
-        this._stepRows.get(step.id)?.row.set_title(this._describe(step));
+        this._stepRows.get(step.id)?.row.set_title(this._rowTitle(step));
     }
 
     /** "3 steps", "empty" — the same phrasing wherever a body is counted. */
@@ -1541,7 +1567,7 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
         step: ClickStep | KeyStep,
         follows: OnEventStep | null,
         retitle: () => void,
-        words: { action: string; hold: string },
+        words: { actions: Record<string, string>; action: string; hold: string },
     ): void {
         if (follows) {
             suffixes.append(this._followToggle(step, follows));
@@ -1549,7 +1575,7 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
                 return;
             }
         }
-        suffixes.append(chooser(KEY_ACTIONS, keyActionLabels(), step.action ?? 'tap',
+        suffixes.append(chooser(PRESS_ACTIONS, words.actions, step.action ?? 'tap',
             words.action, value => {
                 step.action = value;
                 retitle();
@@ -1590,7 +1616,7 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
         // with settings of their own keep the expander; the rest — a break, a
         // stop — are one line, and clicking them only selects them.
         const fields = this._buildStepFields(step);
-        const props = { title: this._describe(step), subtitle: this._stepSubtitle(step) };
+        const props = { title: this._rowTitle(step), subtitle: this._stepSubtitle(step) };
         const row: Adw.ActionRow | Adw.ExpanderRow = fields.length > 0 || inline
             ? this._expander(stepKey, props,
                 inline ? children[0].steps.length > 0 : children.length > 0)
@@ -1651,7 +1677,7 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
         // The title is the sentence these controls are words of, so it is
         // rewritten in place rather than by rebuilding the page — a rebuild
         // would close the dropdown you are still looking at.
-        const retitle = () => row.set_title(this._describe(step));
+        const retitle = () => row.set_title(this._rowTitle(step));
 
         // The "When …" this step runs under, if any: what its rail says, and
         // what a press step can take its edge from — see `_pressSuffixes`.
@@ -1715,16 +1741,18 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
                     this._save();
                 }));
             this._pressSuffixes(suffixes, step, follows, retitle, {
-                action: _('Whether to click, hold down, or release'),
+                actions: clickActionLabels(),
+                action: _('A whole click, or one half of one: press it and leave it down, or release what is down'),
                 hold: _('How long the button stays down'),
             });
             break;
 
         // The same words a click has, for the same reason: which, what, and
-        // for how long — "Press ctrl+c", "Hold down shift".
+        // for how long — "Type ctrl+c", "Press shift".
         case 'key':
             this._pressSuffixes(suffixes, step, follows, retitle, {
-                action: _('Whether to press, hold down, or release'),
+                actions: keyActionLabels(),
+                action: _('A whole keystroke, or one half of one: press it and leave it down, or release what is down'),
                 hold: _('How long the key stays down'),
             });
             break;
@@ -1852,6 +1880,15 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
         }));
 
         this._selectable(row, `after:${step.id}`, macro.id);
+
+        // Right-click anywhere on the row. On the row rather than on a button
+        // of its own: a step's line is already full, and this is the gesture
+        // people try on a list without being told to.
+        const secondary = new Gtk.GestureClick({ button: Gdk.BUTTON_SECONDARY });
+        secondary.connect('pressed', (_gesture, _presses, x: number, y: number) => {
+            this._stepMenu(macro, step, row, x, y);
+        });
+        row.add_controller(secondary);
 
         if (row instanceof Adw.ExpanderRow) {
             for (const child of fields) {
@@ -2145,6 +2182,25 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
         return [row, ...rows];
     }
 
+    /**
+     * The toggle that makes a check outline the area it is reading while it
+     * reads it. Both checks that look at a piece of the screen have one, and
+     * both mean the same thing by it, so they share the button.
+     */
+    private _flashToggle(condition: LlmCondition | ColorCondition): Gtk.ToggleButton {
+        const flash = new Gtk.ToggleButton({
+            label: _('Flash'),
+            active: condition.flash === true,
+            tooltip_text: _('Flash a green outline over the checked area for a second whenever this check runs'),
+            valign: Gtk.Align.CENTER,
+        });
+        flash.connect('toggled', () => {
+            condition.flash = flash.get_active();
+            this._save();
+        });
+        return flash;
+    }
+
     private _buildConditionRows(
         condition: Condition,
         replace: (next: Condition) => void,
@@ -2156,6 +2212,7 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
 
         switch (condition.type) {
             case 'always':
+            case 'never':
                 break;
 
             case 'llm': {
@@ -2196,65 +2253,64 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
                     });
                     areaRow.add_suffix(clear);
                 }
-                const flash = new Gtk.ToggleButton({
-                    label: _('Flash'),
-                    active: condition.flash === true,
-                    tooltip_text: _('Flash a green outline over the checked area for a second whenever this check runs'),
-                    valign: Gtk.Align.CENTER,
-                });
-                flash.connect('toggled', () => {
-                    condition.flash = flash.get_active();
-                    save();
-                });
-                areaRow.add_suffix(flash);
+                areaRow.add_suffix(this._flashToggle(condition));
                 rows.push(areaRow);
 
                 break;
             }
 
-            case 'color':
-                rows.push(this._numbersRow(_('Area (x, y, width, height)'),
+            case 'color': {
+                // The colour leads, because it is what this condition is about
+                // and so it is the line the type chooser joins. Tolerance sits
+                // on it for the same reason: on its own line the number said
+                // nothing about what it measured.
+                const colourRow = entryRow(_('Colour (#rrggbb)'), condition.color, text => {
+                    condition.color = text.trim();
+                    save();
+                });
+                // Redrawn as the field changes rather than as it commits: the
+                // commit is on a delay, and a swatch that lags what you typed
+                // by half a second is a swatch you stop trusting.
+                const swatch = colorSwatch(() => colourRow.get_text() ?? '',
+                    _('What this colour looks like'));
+                colourRow.connect('changed', () => swatch.queue_draw());
+                colourRow.add_suffix(swatch);
+                colourRow.add_suffix(spinSuffix(condition.tolerance, 0, 442,
+                    _('Tolerance: how far off this colour a pixel may be and still count'),
+                    value => {
+                        condition.tolerance = value;
+                        save();
+                    }));
+                const read = new Gtk.Button({
+                    label: _('Read'),
+                    tooltip_text: _('Fill this in with the colour that area has on the screen right now — over an area, its average'),
+                    valign: Gtk.Align.CENTER,
+                });
+                read.connect('clicked', () => this._readColorFor(condition));
+                colourRow.add_suffix(read);
+                rows.push(colourRow);
+
+                const areaRow = this._numbersRow(_('Area (x, y, width, height)'),
                     [condition.x, condition.y, condition.w, condition.h],
                     ([x, y, w, h]) => {
-                        condition.x = x;
-                        condition.y = y;
-                        condition.w = Math.max(1, w);
-                        condition.h = Math.max(1, h);
+                        this._setColorArea(condition, { x, y, w, h });
                         rebuild();
                     },
                     ([x, y, w, h]) => this._showMarker(x, y, Math.max(1, w), Math.max(1, h)),
-                    // The size stays: what you are pointing at is which pixel to
-                    // look at, not how big a patch of it to take.
-                    (x, y, [, , w, h]) => [x, y, w, h]));
-                {
-                    // Tolerance sits on the colour it is a tolerance of: on its
-                    // own line the number said nothing about what it measured.
-                    const colourRow = entryRow(_('Colour (#rrggbb)'), condition.color, text => {
-                        condition.color = text.trim();
-                        save();
+                    {
+                        tooltip: _('Click a pixel on the screen, or drag over an area: where it is and what colour it is both land here'),
+                        run: () => this._pickColorFor(condition),
                     });
-                    colourRow.add_suffix(spinSuffix(condition.tolerance, 0, 442,
-                        _('Tolerance: how far off this colour a pixel may be and still count'),
-                        value => {
-                            condition.tolerance = value;
-                            save();
-                        }));
-                    rows.push(colourRow);
-                }
-                // Coverage is meaningless for a single pixel, which is the
-                // default shape, so it only appears once there is an area.
-                if (condition.w * condition.h > 1) {
-                    rows.push(spinRow(_('Required coverage (%)'), Math.round(condition.coverage * 100), 1, 100, 1, value => {
-                        condition.coverage = value / 100;
-                        save();
-                    }));
-                }
+                areaRow.add_suffix(this._flashToggle(condition));
+                rows.push(areaRow);
+
                 break;
+            }
 
             case 'not': {
                 const nested = this._expander(`${key}:not`, {
                     title: _('Inverted condition'),
-                    subtitle: describeCondition(condition.of),
+                    subtitle: withColorSwatches(describeCondition(condition.of)),
                 });
                 for (const child of this._buildConditionSection(_('Type'), condition.of, next => {
                     condition.of = next;
@@ -2274,7 +2330,7 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
                 // sit directly under it, each still folding on its own.
                 const addRow = new Adw.ActionRow({ title: _('Add a sub-condition') });
                 const model = new Gtk.StringList();
-                const addable = CONDITION_TYPES.filter(type => type !== 'always');
+                const addable = GROUPABLE_TYPES;
                 for (const type of addable) {
                     model.append(CONDITION_TYPE_LABELS[type]);
                 }
@@ -2290,7 +2346,7 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
 
                 condition.of.forEach((child, index) => {
                     const childRow = this._expander(`${key}:${index}`, {
-                        title: `${index + 1}. ${describeCondition(child)}`,
+                        title: withColorSwatches(`${index + 1}. ${describeCondition(child)}`),
                     });
                     childRow.add_suffix(iconButton('user-trash-symbolic', _('Remove'), () => {
                         condition.of.splice(index, 1);
@@ -2625,6 +2681,74 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
     }
 
     /**
+     * The menu a step's row opens on a right click.
+     *
+     * One entry, because there is one thing the row cannot already say. The ▶
+     * beside a step runs that step alone; Run at the top of the macro starts
+     * from the selected row, which is wherever you last clicked and rarely the
+     * step you are looking at. "Run from here" is the middle of those two:
+     * this step, and everything after it.
+     */
+    private _stepMenu(macro: Macro, step: Step, row: Gtk.Widget, x: number, y: number): void {
+        const box = new Gtk.Box({
+            orientation: Gtk.Orientation.VERTICAL,
+            margin_top: 6,
+            margin_bottom: 6,
+            margin_start: 6,
+            margin_end: 6,
+        });
+        const popover = new Gtk.Popover({ child: box, position: Gtk.PositionType.BOTTOM });
+
+        const run = new Gtk.Button({
+            label: _('Run from here'),
+            tooltip_text: _('Start the macro at this step and carry on from it'),
+            css_classes: ['flat'],
+        });
+        run.connect('clicked', () => {
+            // Down before the window goes, or the popover is left behind over
+            // a minimised window and comes back with it.
+            popover.popdown();
+            this._runFrom(macro, step);
+        });
+        box.append(run);
+
+        popover.set_parent(row);
+        popover.set_pointing_to(new Gdk.Rectangle({
+            x: Math.round(x), y: Math.round(y), width: 1, height: 1,
+        }));
+        // A popover parented by hand is unparented by hand, and not from inside
+        // the signal that is still using it — hence the idle.
+        popover.connect('closed', () => {
+            GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
+                popover.unparent();
+                return GLib.SOURCE_REMOVE;
+            });
+        });
+        popover.popup();
+    }
+
+    /**
+     * Start this macro at this step. The mark moves here too: it is what the
+     * editor highlights and where a pause would continue from, so leaving it
+     * pointing at some other row would make the next press disagree with this
+     * one. The step is named in the request as well, so the run does not depend
+     * on the mark's write arriving first.
+     */
+    private _runFrom(macro: Macro, step: Step): void {
+        this._selectTarget(macro.id, `after:${step.id}`);
+        this._save();
+        this._window?.minimize();
+        this._askShell('run-macro', { macroId: macro.id, action: 'run', at: step.id }, {
+            onResult: answer => {
+                if (!answer.ok) {
+                    this._window?.present();
+                    this._toast(answer.message ?? _('it did not run'));
+                }
+            },
+        });
+    }
+
+    /**
      * Do one step on the real screen, right now. The window gets out of the way
      * first for anything aimed at a position, or the click would land on this
      * window instead of on whatever you are pointing it at; a wait has nothing
@@ -2668,11 +2792,10 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
         });
     }
 
-    /** Drag a rectangle on the real screen to set an LLM condition's area. */
     /**
-     * Get out of the way, wait for a click on the real screen, and hand back
-     * where it landed. The window comes back either way; a pick that caught
-     * nothing says so rather than leaving the field looking picked.
+     * Get out of the way, let the picker take a click on the real screen, and
+     * hand back where it landed. The window comes back either way; a pick that
+     * caught nothing says so rather than leaving the field looking picked.
      */
     private _pickPointInto(onPoint: (point: { x: number; y: number }) => void): void {
         this._askShell('pick-point', {}, {
@@ -2681,7 +2804,7 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
                 if (answer.ok && typeof answer.x === 'number' && typeof answer.y === 'number') {
                     onPoint({ x: answer.x, y: answer.y });
                 } else {
-                    this._toast(`${_('nothing was picked')}: ${answer.message ?? _('it timed out')}`);
+                    this._toast(`${_('nothing was picked')}: ${answer.message ?? _('it was cancelled')}`);
                 }
             },
         });
@@ -2697,6 +2820,65 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
                 }
             },
         });
+    }
+
+    /** Move a colour check onto an area, from the field or from the screen. */
+    private _setColorArea(condition: ColorCondition, region: Region): void {
+        condition.x = region.x;
+        condition.y = region.y;
+        condition.w = Math.max(1, region.w);
+        condition.h = Math.max(1, region.h);
+    }
+
+    /**
+     * Point at the screen and take a whole colour check off it: a click is the
+     * pixel it landed on, a drag is the rectangle, the colour that rectangle is
+     * made of, and how much of it that colour covers. Nothing here waits for
+     * the daemon — the picker is the shell's own overlay, the same one the
+     * model's area comes from.
+     */
+    private _pickColorFor(condition: ColorCondition): void {
+        this._askShell('pick-color', {}, {
+            minimize: true,
+            onResult: answer => {
+                const region = answer.region as Region | undefined;
+                if (!answer.ok || !region) {
+                    this._toast(`${_('nothing was picked')}: ${answer.message ?? _('it was cancelled')}`);
+                    return;
+                }
+                this._setColorArea(condition, region);
+                this._applyMeasuredColor(condition, answer);
+                this._saveAndRebuild();
+            },
+        });
+    }
+
+    /** What the area this check already points at looks like right now. */
+    private _readColorFor(condition: ColorCondition): void {
+        const region: Region = {
+            x: condition.x,
+            y: condition.y,
+            w: Math.max(1, condition.w),
+            h: Math.max(1, condition.h),
+        };
+        this._askShell('pick-color', { region }, {
+            minimize: true,
+            onResult: answer => {
+                if (!answer.ok || typeof answer.color !== 'string') {
+                    this._toast(`${_('could not read that colour')}: ${answer.message ?? _('unknown reason')}`);
+                    return;
+                }
+                this._applyMeasuredColor(condition, answer);
+                this._saveAndRebuild();
+            },
+        });
+    }
+
+    /** The colour the shell read off that area, into the check. */
+    private _applyMeasuredColor(condition: ColorCondition, answer: Record<string, any>): void {
+        if (typeof answer.color === 'string') {
+            condition.color = answer.color;
+        }
     }
 
     /** Flash an X, or a rectangle, at these coordinates. */

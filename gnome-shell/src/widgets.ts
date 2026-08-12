@@ -9,7 +9,10 @@
  * anywhere else.
  */
 
+import type giCairo from '@girs/gjs/cairo';
+
 import Adw from 'gi://Adw';
+import Gdk from 'gi://Gdk';
 import GLib from 'gi://GLib';
 import Gtk from 'gi://Gtk';
 import Pango from 'gi://Pango';
@@ -311,6 +314,70 @@ export function suffixEntry(
     });
     entry.connect('changed', () => onChange(entry.get_text() ?? ''));
     return entry;
+}
+
+/** The block of colour beside a hex field, in pixels. */
+const SWATCH_W = 28;
+const SWATCH_H = 20;
+
+/**
+ * What the colour in a field actually looks like, beside the field: `#22aa33`
+ * is a number, and a number is not a colour you can recognise. Painted rather
+ * than styled, so it can follow the text as it is typed without a stylesheet
+ * per row, and read through a callback rather than given a value, so it shows
+ * what is in the field now and not what was in it when the row was built.
+ *
+ * Text that is not a colour — half-typed, or a word — draws as an empty
+ * outline. It says "nothing yet" without claiming a colour that is not there.
+ */
+export function colorSwatch(read: () => string, tooltip: string): Gtk.DrawingArea {
+    const area = new Gtk.DrawingArea({
+        // Both: the content size is what it asks for, the request is what it
+        // will not be squeezed below. A block of colour that a full row has
+        // shrunk to nothing is not saying anything.
+        content_width: SWATCH_W,
+        content_height: SWATCH_H,
+        width_request: SWATCH_W,
+        height_request: SWATCH_H,
+        tooltip_text: tooltip,
+        valign: Gtk.Align.CENTER,
+    });
+    // GTK hands over the plain introspected context; the methods a drawing
+    // callback is written in are the ones GJS puts on it, which the generated
+    // type does not know about.
+    area.set_draw_func((_area, context, width, height) => {
+        // `$dispose` is GJS's own, and not in the generated type either: the
+        // context holds a drawing surface, and letting the collector decide
+        // when to let go of it is how a redraw on every keystroke adds up.
+        const cr = context as giCairo.Context & { $dispose(): void };
+        const rgba = new Gdk.RGBA();
+        if (rgba.parse(read().trim())) {
+            cr.setSourceRGB(rgba.red, rgba.green, rgba.blue);
+            cr.rectangle(0, 0, width, height);
+            cr.fill();
+        }
+        // Always outlined: a colour close to the row's own — white, or the
+        // grey of a dark theme — is a block with no edges without it.
+        cr.setSourceRGBA(0.5, 0.5, 0.5, 0.7);
+        cr.setLineWidth(1);
+        cr.rectangle(0.5, 0.5, width - 1, height - 1);
+        cr.stroke();
+        cr.$dispose();
+    });
+    return area;
+}
+
+/**
+ * The same thing for a line of text: every colour named in it gets a block of
+ * that colour after it, so a summary reading `pixel 840,512 ≈ #22aa33` says
+ * which green it means. Returns Pango markup, which is what row titles and
+ * subtitles are read as — so the text around it is escaped here, it being a
+ * macro's name and a model prompt, which is to say anything at all.
+ */
+export function withColorSwatches(text: string): string {
+    return GLib.markup_escape_text(text, -1).replace(
+        /#(?:[0-9a-f]{6}|[0-9a-f]{3})\b/gi,
+        hex => `${hex} <span bgcolor="${hex}" fgcolor="${hex}">██</span>`);
 }
 
 export function iconButton(iconName: string, tooltip: string, onClick: () => void): Gtk.Button {

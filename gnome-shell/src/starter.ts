@@ -43,7 +43,6 @@ export function starterMacro(): Macro {
                                     h: 1,
                                     color: '#22aa33',
                                     tolerance: 24,
-                                    coverage: 1,
                                 },
                                 then: [
                                     {

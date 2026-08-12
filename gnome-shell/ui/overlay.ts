@@ -23,12 +23,50 @@ let markerTimeoutId = 0;
  */
 let markerActors: St.Widget[] = [];
 
+/** Whether the compositor is currently being held in composited mode for us. */
+let compositingHeld = false;
+
+/**
+ * Ask the compositor to keep compositing, or let it stop again.
+ *
+ * A fullscreen window that has a monitor to itself is handed straight to the
+ * display: no compositing pass runs at all, and nothing the shell draws over
+ * that window appears — not because it is behind it, but because nobody is
+ * drawing. That is the whole of "the marker works everywhere except over the
+ * game", and no amount of restacking fixes it. The shell's own transient
+ * chrome — the OSD, the magnifier, the screenshot UI — asks for exactly this,
+ * in a dozen places. The picker never had the problem because a full-screen
+ * actor covers the window, which brings compositing back on its own.
+ *
+ * Mutter counts the requests, so ours has to be balanced exactly once; the
+ * flag is what guarantees that, rather than trusting each caller to pair up.
+ */
+function holdCompositing(on: boolean): void {
+    if (on === compositingHeld) {
+        return;
+    }
+    // Structurally typed and optional: this is the compositor's own API, but
+    // the extension outlives shell versions, and a method that moved must
+    // cost the marker its brightness, not its existence.
+    const compositor = global.compositor as unknown as {
+        disable_unredirect?: () => void;
+        enable_unredirect?: () => void;
+    };
+    if (on) {
+        compositor.disable_unredirect?.();
+    } else {
+        compositor.enable_unredirect?.();
+    }
+    compositingHeld = on;
+}
+
 /** Take down whatever marker is showing, if any. */
 export function clearMarker(): void {
     if (markerTimeoutId) {
         GLib.source_remove(markerTimeoutId);
         markerTimeoutId = 0;
     }
+    holdCompositing(false);
     for (const actor of markerActors) {
         // Parent-checked: an actor is tracked from the moment it is built, which
         // may be before it reached the chrome.
@@ -58,11 +96,21 @@ function presentMarker(actors: St.Widget[], durationMs: number): void {
         clearMarker();
         return GLib.SOURCE_REMOVE;
     });
+    // addTopChrome, not addChrome: addChrome puts the actor *below*
+    // `global.top_window_group`, which is where a fullscreen window lives — so
+    // a marker aimed into a fullscreen game was drawn behind that game, and
+    // pointing at something you cannot see is the one thing a marker must not
+    // do. The picker overlay has always gone in above everything, which is why
+    // it worked over the same window this did not.
+    //
     // No options: shell 50 dropped `affectsInputRegion` and derives the input
     // region from reactivity instead, and no marker actor is reactive.
     for (const actor of actors) {
-        Main.layoutManager.addChrome(actor);
+        Main.layoutManager.addTopChrome(actor);
     }
+    // Last, and only once the actors are up: turning compositing back on is
+    // what makes them appear at all over a fullscreen window.
+    holdCompositing(true);
 }
 
 /**
@@ -109,24 +157,46 @@ export function showMarker(x: number, y: number, w?: number, h?: number, duratio
 /** How long the flash while a check reads an area stays. */
 const FLASH_DURATION_MS = 1000;
 
+/** Smaller than this and an outline is not something you would see. */
+const FLASH_MIN_SIZE = 24;
+
 /**
  * A green outline over the area a running check is reading, gone again within
  * the second; no region means the whole screen. That convention is resolved
  * here, where the stage lives, so callers pass a condition's region through.
  */
 export function flashRegion(region?: Region | null): void {
-    const { x, y, w, h } = region ?? { x: 0, y: 0, w: global.stage.width, h: global.stage.height };
+    const area = region ?? { x: 0, y: 0, w: global.stage.width, h: global.stage.height };
+    // A colour check on a single pixel would otherwise flash a single pixel.
+    // The box grows around the area rather than out of its corner, so the spot
+    // it is pointing at stays in the middle of it.
+    const w = Math.max(Math.round(area.w), FLASH_MIN_SIZE);
+    const h = Math.max(Math.round(area.h), FLASH_MIN_SIZE);
     const box = new St.Widget({ style_class: 'macroclickwerk-marker-flash', reactive: false });
-    box.set_position(Math.round(x), Math.round(y));
-    box.set_size(Math.round(w), Math.round(h));
+    box.set_position(
+        Math.round(area.x) - Math.round((w - area.w) / 2),
+        Math.round(area.y) - Math.round((h - area.h) / 2),
+    );
+    box.set_size(w, h);
     presentMarker([box], FLASH_DURATION_MS);
+}
+
+export interface PickOptions {
+    /** What the picker says it is for while it waits. */
+    hint?: string;
+    /**
+     * Whether a click that did not drag is a 1×1 region rather than nothing.
+     * A colour pick wants that — one pixel is the ordinary case there — and an
+     * area to look at does not: a stray click would set an empty rectangle.
+     */
+    point?: boolean;
 }
 
 /**
  * Drag a rectangle over the screen. Resolves null when cancelled with Escape or
  * a right click.
  */
-export function pickRegion(): Promise<Region | null> {
+export function pickRegion(options: PickOptions = {}): Promise<Region | null> {
     return new Promise(resolve => {
         const overlay = new St.Widget({
             style_class: 'macroclickwerk-picker',
@@ -143,7 +213,8 @@ export function pickRegion(): Promise<Region | null> {
 
         const hint = new St.Label({
             style_class: 'macroclickwerk-picker-hint',
-            text: 'Drag to select the area the model should look at — Escape to cancel',
+            text: options.hint
+                ?? 'Drag to select the area the model should look at — Escape to cancel',
         });
         overlay.add_child(hint);
         hint.set_position(
@@ -224,7 +295,15 @@ export function pickRegion(): Promise<Region | null> {
                 w: Math.round(Math.abs(x - startX)),
                 h: Math.round(Math.abs(y - startY)),
             };
-            finish(region.w < 4 || region.h < 4 ? null : region);
+            // Too small to have been a drag. Where the press landed is still a
+            // place on the screen, so a picker that takes points takes it —
+            // from the press, which is where you aimed, not from the release,
+            // which is wherever the pointer had drifted by then.
+            if (region.w < 4 || region.h < 4) {
+                finish(options.point ? { x: startX, y: startY, w: 1, h: 1 } : null);
+                return Clutter.EVENT_STOP;
+            }
+            finish(region);
             return Clutter.EVENT_STOP;
         });
 

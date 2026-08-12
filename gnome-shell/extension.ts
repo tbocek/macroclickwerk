@@ -21,13 +21,15 @@ import { MacroStore, type Config } from './src/store.js';
 import { starterMacro } from './src/starter.js';
 import {
     childLists, describeStep, findStep, lastPointerEndpoint, reachesEnd,
-    resolveRecordTarget, resolveRunStart, type Macro, type RecordTarget, type Step,
+    resolveRecordTarget, resolveRunStart, type Macro, type RecordTarget, type Region, type Step,
 } from './src/model.js';
 import { clearProblems, onProblemsChanged, problemCount, reportProblem } from './src/problems.js';
 import { EV_KEY } from './src/keymap.js';
 import { TriggerEngine, parseTriggers } from './src/triggers.js';
 import { MacroPopup } from './ui/popup.js';
 import { clearMarker, flashRegion, pickRegion, showMarker } from './ui/overlay.js';
+import { captureRegion } from './src/screenshot.js';
+import { averageColor, formatColor } from './src/colours.js';
 
 const KEYBINDINGS = [
     'run-macro', 'record-toggle', 'capture-step', 'panic-stop',
@@ -39,6 +41,26 @@ const KEYBINDINGS = [
  * keep up with the eye.
  */
 const RUNNING_PUBLISH_MS = 100;
+
+/**
+ * How long to let the screen become what it will be before a colour is read
+ * off it. Something has just been asked to get out of the way — the
+ * preferences window, or the picker's own dimmed overlay — and neither is gone
+ * in the frame that asked. Sampling too early reads the thing that was leaving.
+ */
+const SETTLE_BEFORE_SAMPLE_MS = 250;
+
+/** How long a pick shows you what it just took. */
+const PICK_CONFIRM_MS = 1000;
+
+function settle(ms: number): Promise<void> {
+    return new Promise(resolve => {
+        GLib.timeout_add(GLib.PRIORITY_DEFAULT, ms, () => {
+            resolve();
+            return GLib.SOURCE_REMOVE;
+        });
+    });
+}
 
 /** Where preferences wants a captured step to land. */
 interface CaptureTarget {
@@ -98,6 +120,13 @@ export default class MacroclickwerkExtension extends Extension {
             this._store.addMacro(macro);
             this._store.activeMacroId = macro.id;
         }
+
+        // Nothing is running in a shell that has only just started, whatever
+        // the last one left in the key. `disable` clears it on the way out, but
+        // a session that ends takes the process with it and never gets there —
+        // so a logout during a run left the editor showing that run for ever
+        // after, offering Pause on a macro no longer capable of being paused.
+        this._publishRunningPaths();
 
         const config = this._store.config;
         this._daemon = new DaemonClient(config.controlSocket, config.eventSocket);
@@ -578,12 +607,19 @@ export default class MacroclickwerkExtension extends Extension {
     }
 
     /** Start one macro, from the selected step when the selection is in it. */
-    private _runMacro(macro: Macro): boolean {
+    /**
+     * `at` names the step to begin at, for a caller that has one in mind —
+     * the editor's "run from here". Naming it in the request beats leaving it
+     * to the mark: the mark is a second settings write, and a run that depends
+     * on two writes landing in order is a run that starts in the wrong place
+     * when they do not.
+     */
+    private _runMacro(macro: Macro, at?: string): boolean {
         const runner = this._runnerFor(macro.id);
         if (!runner || runner.running) {
             return false;
         }
-        void runner.run(macro, this._resumeStepFor(macro));
+        void runner.run(macro, at || this._resumeStepFor(macro));
         return true;
     }
 
@@ -719,44 +755,56 @@ export default class MacroclickwerkExtension extends Extension {
     }
 
     /**
-     * Wait for one click and report where it landed. The same gesture as
-     * capturing a step, minus the step: a coordinate in the editor is easier to
-     * go and point at than to read off the screen and type in, and this is how
-     * an existing one is corrected without recording the step again.
+     * Click a position and report where that was — the picker overlay, the same
+     * one an area is dragged out on, taking a click as the point it landed on.
+     *
+     * It used to wait for the daemon to report a real click and then ask the
+     * stage where the pointer was. That reads a position rather than choosing
+     * one, and it broke against exactly the applications this tool exists for:
+     * a game holds the pointer, so the stage's answer is wherever the lock
+     * froze the cursor, and the prompt saying a click was wanted was drawn
+     * behind the fullscreen window that had it. The overlay takes the grab,
+     * which hands the pointer back, and the coordinate is the click's own.
      */
     private async _pickPoint(): Promise<object> {
-        const fail = (message: string, hint?: string) => {
-            reportProblem('Recording', `could not pick a position: ${message}`, { hint });
-            return { ok: false, message };
-        };
-
-        if (!this._recorder || !this._daemon) {
-            return fail('the extension is not ready yet');
-        }
-        if (this._recorder.busy) {
-            return fail(this._recorder.recording ? 'stop the recording first' : 'already waiting for a click');
-        }
-
         this._indicator?.menu.close(true);
-        Main.notify('Macroclickwerk', 'Click the position, or move the pointer there and hold still.');
+        const point = await pickRegion({
+            point: true,
+            hint: 'Click the position — Escape to cancel',
+        });
+        if (!point) {
+            return { ok: false, message: 'nothing was picked' };
+        }
+        // The same X the Show button draws, briefly: what landed in the field,
+        // said on the screen the field is about.
+        showMarker(point.x, point.y, undefined, undefined, PICK_CONFIRM_MS);
+        return { ok: true, x: point.x, y: point.y };
+    }
 
-        let step: Step | null = null;
-        try {
-            step = await this._recorder.captureOne();
-        } catch (error) {
-            return fail((error as Error).message,
-                'Check that the macroclickwerk service is running: systemctl status macroclickwerk');
+    /**
+     * A place on the screen and the colour it has, which for a colour check are
+     * one answer rather than two: a click takes the pixel, a drag takes the
+     * rectangle and the average over it — the same average the check reads when
+     * it runs. With a region already given, the pick is skipped and only the
+     * colour is read, which is the editor asking what that area looks like now.
+     */
+    private async _pickColor(given: Region | null): Promise<object> {
+        const region = given ?? await pickRegion({
+            point: true,
+            hint: 'Click a pixel for its colour, or drag over an area for its average — Escape to cancel',
+        });
+        if (!region) {
+            return { ok: false, message: 'nothing was picked' };
         }
 
-        // A click gives its position and a pointer that stopped gives where it
-        // stopped; either way what came back is a point on the screen.
-        if (!step || step.kind === 'click' && step.mode !== 'abs'
-            || !('x' in step) || typeof step.x !== 'number' || typeof step.y !== 'number') {
-            return fail('nothing was picked before it timed out',
-                'Click somewhere, or move the pointer and hold it still, while it waits.');
-        }
-
-        return { ok: true, x: Math.round(step.x), y: Math.round(step.y) };
+        await settle(SETTLE_BEFORE_SAMPLE_MS);
+        const pixbuf = await captureRegion(region.x, region.y, region.w, region.h);
+        // The average, which is the same thing the check reads when it runs —
+        // one number to store, the same number to compare against.
+        const color = formatColor(averageColor(pixbuf));
+        // Only now: the outline is over the very pixels that were just read.
+        flashRegion(region);
+        return { ok: true, region, color };
     }
 
     /**
@@ -794,7 +842,7 @@ export default class MacroclickwerkExtension extends Extension {
      * stop throws that place away. It is the same pair the panel offers, where
      * the switch pauses and the Stop item below it does not.
      */
-    private _runOneMacro(request: { macroId?: string; action?: string }): object {
+    private _runOneMacro(request: { macroId?: string; action?: string; at?: string }): object {
         const macro = request.macroId ? this._store?.getMacro(request.macroId) : null;
         if (!macro) {
             return { ok: false, message: 'that macro is no longer there' };
@@ -814,14 +862,25 @@ export default class MacroclickwerkExtension extends Extension {
             } else {
                 this._clearMark();
             }
-            runner?.stop(this._runningMacros().length === 1);
+            if (runner) {
+                runner.stop(this._runningMacros().length === 1);
+            } else {
+                // Nothing is running under that id, so whatever the published
+                // state says about it is out of date. Say so here, because the
+                // run loop that would normally publish it is not there to: an
+                // editor left showing Pause for a run that does not exist has
+                // no way back, every press being answered by a stop that stops
+                // nothing and republishes nothing.
+                this._runningPaths.delete(macro.id);
+                this._publishRunningPaths();
+            }
             this._popup?.refresh();
             return {
                 ok: true,
                 message: paused ? `Paused “${macro.name}”` : `Stopped “${macro.name}”`,
             };
         }
-        if (!this._runMacro(macro)) {
+        if (!this._runMacro(macro, request.at)) {
             return { ok: false, message: 'it is already running' };
         }
         return { ok: true, message: `Running “${macro.name}”` };
@@ -1021,7 +1080,21 @@ export default class MacroclickwerkExtension extends Extension {
             return; // our own state; nothing to redo here
         }
         if (key === 'pick-region-request') {
-            void this._answerRequest('pick-region', async () => ({ region: await pickRegion() }));
+            void this._answerRequest('pick-region', async () => {
+                const region = await pickRegion();
+                // Flashed back at you: the picker is gone by the time the
+                // editor shows the numbers, and this says which rectangle they
+                // are before you have to trust them.
+                if (region) {
+                    flashRegion(region);
+                }
+                return { region };
+            });
+            return;
+        }
+        if (key === 'pick-color-request') {
+            void this._answerRequest<{ serial?: number; region?: Region | null }>(
+                'pick-color', request => this._pickColor(request.region ?? null));
             return;
         }
         if (key === 'pick-point-request') {
@@ -1047,7 +1120,7 @@ export default class MacroclickwerkExtension extends Extension {
             return;
         }
         if (key === 'run-macro-request') {
-            void this._answerRequest<{ serial?: number; macroId?: string; action?: string }>(
+            void this._answerRequest<{ serial?: number; macroId?: string; action?: string; at?: string }>(
                 'run-macro', request => this._runOneMacro(request));
             return;
         }

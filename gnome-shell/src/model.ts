@@ -20,6 +20,15 @@ export interface AlwaysCondition {
     type: 'always';
 }
 
+/**
+ * The other half of `always`. It is also what an empty document means nowhere:
+ * a condition is missing only in the "no test, run it" direction, so this one
+ * has to be asked for by name.
+ */
+export interface NeverCondition {
+    type: 'never';
+}
+
 export interface LlmCondition {
     type: 'llm';
     prompt: string;
@@ -30,8 +39,9 @@ export interface LlmCondition {
 }
 
 /**
- * A colour check over a screen area. A 1×1 area with full coverage is the
- * single-pixel case, so there is one condition here rather than two.
+ * A colour check over a screen area: what that area averages to, against the
+ * colour it averaged to when it was picked, within `tolerance`. A 1×1 area
+ * averages to its own pixel, so the single-pixel check is the same check.
  */
 export interface ColorCondition {
     type: 'color';
@@ -40,9 +50,10 @@ export interface ColorCondition {
     w: number;
     h: number;
     color: string;
+    /** How far the average may be from `color`, as an RGB distance. */
     tolerance: number;
-    /** Fraction of pixels that must match, 0..1. */
-    coverage: number;
+    /** Flash a green outline over the checked area whenever this check runs. */
+    flash?: boolean;
 }
 
 export interface AndCondition {
@@ -62,6 +73,7 @@ export interface NotCondition {
 
 export type Condition =
     | AlwaysCondition
+    | NeverCondition
     | LlmCondition
     | ColorCondition
     | AndCondition
@@ -315,7 +327,7 @@ export function newCondition(type: ConditionType): Condition {
             return {
                 type: 'color',
                 x: 0, y: 0, w: 1, h: 1,
-                color: '#22aa33', tolerance: 24, coverage: 1,
+                color: '#22aa33', tolerance: 24,
             };
         case 'and':
             return { type: 'and', of: [] };
@@ -323,6 +335,8 @@ export function newCondition(type: ConditionType): Condition {
             return { type: 'or', of: [] };
         case 'not':
             return { type: 'not', of: { type: 'always' } };
+        case 'never':
+            return { type: 'never' };
         case 'always':
         default:
             return { type: 'always' };
@@ -906,7 +920,6 @@ function migrateCondition(cond: Condition | null | undefined): Condition | null 
             h: 1,
             color: legacy.color ?? '#000000',
             tolerance: legacy.tolerance ?? 24,
-            coverage: 1,
         };
     }
     if (legacy.type === 'regionColor') {
@@ -918,11 +931,18 @@ function migrateCondition(cond: Condition | null | undefined): Condition | null 
             h: Math.max(1, legacy.h ?? 1),
             color: legacy.color ?? '#000000',
             tolerance: legacy.tolerance ?? 24,
-            coverage: legacy.coverage ?? 1,
         };
     }
 
-    if (cond.type === 'and' || cond.type === 'or') {
+    if (cond.type === 'color') {
+        // A colour check counted pixels near the target and demanded a share of
+        // them. It now compares the area's average against the target, which
+        // needs no share — and asked individual pixels to match a mean, which
+        // is a colour they need not have, so the share was unreachable more
+        // often than not. Dropped rather than ignored: a number nothing reads
+        // is a number the next reader has to work out is dead.
+        delete (cond as { coverage?: number }).coverage;
+    } else if (cond.type === 'and' || cond.type === 'or') {
         cond.of = cond.of.map(child => migrateCondition(child)!).filter(Boolean);
     } else if (cond.type === 'not') {
         cond.of = migrateCondition(cond.of) ?? { type: 'always' };
@@ -1139,12 +1159,14 @@ export function describeCondition(cond: Condition | null | undefined): string {
     switch (cond.type) {
         case 'always':
             return 'always';
+        case 'never':
+            return 'never';
         case 'llm':
             return `LLM: "${truncate(cond.prompt)}"`;
         case 'color':
             return cond.w * cond.h === 1
-                ? `pixel ${cond.x},${cond.y} ≈ ${cond.color}`
-                : `${Math.round((cond.coverage ?? 0) * 100)}% of ${cond.w}×${cond.h} @ ${cond.x},${cond.y} ≈ ${cond.color}`;
+                ? `pixel ${cond.x},${cond.y} ≈ ${cond.color} ±${cond.tolerance}`
+                : `avg of ${cond.w}×${cond.h} @ ${cond.x},${cond.y} ≈ ${cond.color} ±${cond.tolerance}`;
         case 'and':
             return cond.of.length ? cond.of.map(describeCondition).join(' and ') : 'always';
         case 'or':
@@ -1167,8 +1189,15 @@ export function prettySource(source: string, edge: EventEdge = 'either'): string
 }
 
 /** How a key or pad step reads. Absent is the follow, and follows just press. */
+/**
+ * A key step's verb. The whole gesture is a Type, which leaves "press" free for
+ * the half that goes down and stays there — so a keyboard names its halves
+ * exactly as a mouse does, and neither of them holds anything: a hold wants an
+ * unhold to go with it, and what ends this one is the Release sitting beside it
+ * in the same list.
+ */
 function pressVerb(action?: 'tap' | 'down' | 'up'): string {
-    return action === 'down' ? 'Hold down' : action === 'up' ? 'Release' : 'Press';
+    return action === 'down' ? 'Press' : action === 'up' ? 'Release' : 'Type';
 }
 
 function formatMs(ms: number): string {
@@ -1200,7 +1229,12 @@ export function describeStep(
             // Absent is the follow, and a follow reads as the plain word: what
             // it does is whatever the event did, which the event's own line
             // above it already says.
-            const verb = step.action === 'down' ? 'Hold down'
+            //
+            // Only the whole gesture differs between a mouse and a keyboard —
+            // one clicks, the other types. The halves are a press and a
+            // release on both, which is a pair with two visible ends; see
+            // `pressVerb`.
+            const verb = step.action === 'down' ? 'Press'
                 : step.action === 'up' ? 'Release' : 'Click';
             return step.mode === 'abs' ? `${verb} ${step.button} @ ${step.x ?? 0},${step.y ?? 0}`
                 : step.mode === 'prev' ? `${verb} ${step.button} @ previous`
@@ -1279,6 +1313,7 @@ export const STEP_KIND_LABELS: Record<StepKind, string> = {
 
 export const CONDITION_TYPE_LABELS: Record<ConditionType, string> = {
     always: 'Always true',
+    never: 'Never true',
     llm: 'Ask the LLM about a screenshot',
     color: 'Screen colour',
     and: 'All of…',

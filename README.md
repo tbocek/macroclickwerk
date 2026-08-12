@@ -10,16 +10,19 @@ recorded event trains — and `on event`, which parks the run until a button or
 key of your choosing is pressed (or, if you say so, released) and swallows
 that event, so a side button can mean "do the next steps" instead of what it
 normally does. Two of them on the two edges of one button make a hold: on
-left press → hold E, on left release → release E. Around them you can put `loop` and `if` blocks. A loop
+left press → press E, on left release → release E. Around them you can put `loop` and `if` blocks. A loop
 only counts — forever, or a fixed number of times; you leave it with `break`
 inside an `if`, which keeps every condition in one place:
 
-- **screen colour** — "the pixel at 840,512 is green ±24", or "60% of this
-  40×40 area is green". Sub-5 ms, deterministic, no network.
+- **screen colour** — "the pixel at 840,512 is green ±24", or "this 40×40 area
+  averages to green ±30". Sub-5 ms, deterministic, no network. Both the spot
+  and the colour come off the screen itself: **Pick** takes a click as one
+  pixel and a drag as an area, and stores what that area averages to.
 - **ask a local vision model** — a screenshot plus your own prompt ("Is the button
   on the left green?"), answered yes/no by an OpenAI-compatible endpoint running
   on your machine.
-- **and / or / not** over the above.
+- **and / or / not** over the above, and **always** / **never** for a branch
+  that is not deciding anything today.
 
 The macro that ships on first run is the one this was built for:
 
@@ -28,7 +31,7 @@ repeat forever:
     if the model says the left button is green:
         click at x,y
         if a colour check passes:
-            press E
+            type E
     wait 10s
 ```
 
@@ -53,9 +56,11 @@ repeat forever:
 - **Macros that drive each other** — a `start` step restarts a macro from the
   top *or from any step you pick*, so a watcher can send another macro straight
   to the part that matters; `stop` ends one.
-- **See what a check is looking at** — a **Flash** toggle on a screen-check
-  draws a green outline over the checked area for a second every time it runs,
-  taken just after the screenshot so it is never in the picture the model sees.
+- **See what a check is looking at** — a **Flash** toggle on either screen
+  check draws a green outline over the checked area for a second every time it
+  runs, drawn just after the screen is read so it is never part of what was
+  measured or of the picture the model sees. Picking an area flashes it back at
+  you too, so the numbers that land in the field are never taken on trust.
 - **Emergency stop** that aborts mid-macro and releases every held key.
 - **Triggers** — a mouse button or key the daemon takes over, and what happens
   in its place: press another key (side button becomes E), or start, pause or
@@ -68,7 +73,7 @@ repeat forever:
   they capture what the screen saw, not what the mouse did. The same machinery
   drives the **on event step**: put it in a macro and the run parks there until
   the button is pressed, consuming the press — `repeat forever: [on event
-  side button, click …, press E]` is a side button that plays a sequence. A
+  side button, click …, type E]` is a side button that plays a sequence. A
   run parked on a button outranks a standing trigger on the same button.
 
 ## How it fits together
@@ -89,6 +94,17 @@ A move to a fixed coordinate is atomic: the extension asks the compositor's own
 seat to warp the pointer there — one call, exact position, no acceleration
 curve involved — and verifies with `global.get_pointer()`. There is no visible
 glide and nothing to configure; mouse settings are never touched.
+
+Arriving and being *seen* to arrive are not the same thing, so a positioned
+click waits 50 ms after the move before the button goes down. The compositor
+moves the pointer immediately; an application under it learns where the pointer
+now is on its own schedule, which for anything drawing frames is once a frame.
+Press in the same millisecond as the warp and a game still holds the position
+from before it — so the thing being dragged, aimed or placed goes where the
+pointer *was*, which reads as the click landing in the wrong place while every
+coordinate involved is correct. A person moving a mouse and clicking never gets
+close to being that quick. The wait is skipped when the pointer was already
+there, so a macro clicking the same button in a loop pays it once.
 
 If a target swallows the warp (a pointer-confining grab), the extension falls
 back to walking there over uinput: nudge, re-read the pointer, nudge again
@@ -373,6 +389,14 @@ same row — the window stays out of the way until you stop (`Ctrl+Shift+R`, the
 panel menu, or picking **Multiple steps** again). `Ctrl+Shift+M` captures one
 step without opening Settings, into whichever row is selected.
 
+**Right-click any step** for **Run from here**: the macro starts at that step
+and carries on from it, which is how you try the second half of something
+without sitting through the first. It sits between the two buttons that were
+already there — the **▶** on a step runs that step *alone*, and **Run** at the
+top starts from the selected row, which is wherever you last clicked and rarely
+the step you are looking at. Running from here moves the selection here too, so
+the mark, the highlight and where a pause would continue from all agree.
+
 The **▶** on a step does that one step immediately, on the real screen: the
 window drops out of the way, the step runs, and the window comes back. It is the
 quickest way to check that a click really lands where you meant it to, without
@@ -396,12 +420,31 @@ Coordinates are single fields — `100, 200` for a point, `10, 20, 40, 40` for a
 area — each with a **Show** button that flashes a red X (or an outline) at that
 spot on the real screen for a couple of seconds, so you can check a number
 without running anything. Next to it, **Pick** fills the field by pointing: the
-window gets out of the way, you click where you mean, and the position lands in
-the field — the same gesture as recording one step, without adding one, which is
-how you correct a coordinate that has moved. On an area it moves the corner and
-leaves the size alone. A pick that catches nothing before it times out says so
-and leaves the field as it was. A step's title follows its coordinates, so a
-click that now goes somewhere else says where.
+window gets out of the way, the screen dims, and where you click lands in the
+field — which is how you correct a coordinate that has moved without recording
+the step again. Escape leaves the field as it was, and what was picked is
+flashed back at you. A step's title follows its coordinates, so a click that now
+goes somewhere else says where. An area is picked by dragging one out on the
+same overlay, described with the condition it belongs to below.
+
+Every one of these — the picker, the red X, the green flash — is drawn above
+*everything*, fullscreen windows included. That is worth stating because it is
+where the interesting applications are, and getting it takes two separate
+things. A game running fullscreen sits in the shell's top window group, above
+ordinary desktop chrome, so anything drawn the ordinary way is drawn behind it.
+And a fullscreen window that has a monitor to itself is handed straight to the
+display with no compositing pass at all, so even something stacked above it is
+not drawn — the compositor has to be asked to keep compositing for as long as
+the marker is up, which is what the shell's own on-screen chrome does.
+
+Picking a position asks the compositor for the click rather than asking where
+the pointer is, for the same reason: an application that holds the pointer —
+any game with mouse-look — has frozen it somewhere of its own choosing, and the
+picker takes the grab back before asking. A macro that *runs* has no such
+luxury: it has to drive the real pointer to the coordinate, so a step aimed at
+a fixed position fails outright against a game that has the pointer locked
+rather than clicking wherever it got stuck. Relative motion still works there,
+because relative motion is exactly what a locked pointer accepts.
 
 Where a click or a move goes is one row: the numbers, **Pick**, **Show**, and
 buttons for not using coordinates at all. On a click the mouse button means
@@ -422,11 +465,45 @@ history.
 
 Screen areas for `llm` conditions can also be chosen with **Pick**, which drops
 the window out of the way and lets you drag a rectangle over the screen;
-**Screen** goes back to checking the whole screen. The **Flash** toggle on the
-same row draws a green outline over the checked area for a second every time
-the check runs, so you can watch a running macro look where you meant it to.
-The flash fires just after the screenshot is taken, so it is never in the
-picture the model is asked about.
+**Screen** goes back to checking the whole screen. Whatever you drag out is
+flashed back at you once the window returns, so the numbers in the field never
+have to be taken on trust.
+
+A colour condition's **Pick** is the same overlay, and it brings the colour
+back with it: click a pixel and the check is that pixel and the colour it has;
+drag a rectangle and the check is that area and what it averages to.
+
+The check is then one colour against one colour — what that area averages to
+now, against what it averaged to when you picked it, within the tolerance
+beside the field. There is no third number, and there used to be: a share of
+the pixels that had to match. It is gone because it asked individual pixels to
+match an *average*, and an average is a colour that need not be anywhere in the
+area — a green button with a dark glyph on it and a white badge under it
+averages to a green that is neither the button nor the glyph nor the badge, so
+the share was routinely zero and the check could not come true however the
+screen looked. Averaging both sides asks a question the numbers can answer, and
+one number is left to tune.
+
+Tolerance is a distance in RGB, not a slack per channel: 30 is roughly 17 per
+channel if all three move together. Generous enough for antialiasing, a shadow,
+a frame caught mid-animation; nowhere near enough to survive the thing you are
+watching disappearing.
+
+**Read** beside the colour takes that average again without moving the area,
+for when the button you are watching has changed shade since you picked it.
+
+`#22aa33` is a number, and a number is not a colour anyone recognises, so a
+block of it sits beside the field — following the text as you type it, and
+drawn as an empty outline while what you have typed is not a colour yet. The
+same block follows every colour a summary line names, so a folded `If avg of
+40×40 @ 1,2 ≈ #123456 ±30` says which blue it means without being opened.
+
+The **Flash** toggle on the area row draws a green outline over the checked
+area for a second every time the check runs, so you can watch a running macro
+look where you meant it to. Both checks have one. The flash fires just after
+the screen is read, never before: the outline's own green would otherwise be
+part of the colour the check measured, and part of the picture the model is
+asked about.
 
 At the top of the Macros page, **Backup** has an **Export** and an **Import**,
 each offering **Macros** or **Settings** — two files, because they move for

@@ -1,6 +1,7 @@
 import {
     parseDocument, stringifyDocument, newStep, describeStep, describeCondition,
     insertStep, moveStep, moveStepNested, parentOf, removeStep, cloneStep, walk, findStep, newMacro,
+    newCondition,
     resolveRecordTarget,
     resolveRunStart,
     macroEnabled,
@@ -387,6 +388,18 @@ check('an empty action is left empty, which is what following looks like',
 check('the hold time is left alone, for if the event goes away', held[2].holdMs === 200);
 check('a follower reads as a plain click',
       describeStep(held[2]) === 'Click left at pointer', describeStep(held[2]));
+// The row and the dropdown on it have to agree, and only the whole gesture is
+// named differently between the two kinds: a mouse clicks, a keyboard types,
+// and both halve into a press and a release.
+check('half a click is a press', describeStep(held[0]) === 'Press left at pointer',
+      describeStep(held[0]));
+check('half a keystroke is a press too', describeStep(held[4]) === 'Press F',
+      describeStep(held[4]));
+check('a whole keystroke is a type', describeStep(held[3]) === 'Type E',
+      describeStep(held[3]));
+check('the other half is a release either way',
+      describeStep({ ...held[0], action: 'up' }) === 'Release left at pointer'
+      && describeStep({ ...held[4], action: 'up' }) === 'Release F');
 check('and a step that names an action keeps it', held[4].action === 'down');
 
 // The whole-click mode is gone: an event now waits for the press, the release,
@@ -426,12 +439,32 @@ const colDoc = JSON.stringify({ version: 1, macros: [{ id: 'm', name: 'c', body:
     { id: 'c', kind: 'if', cond: { type: 'and', of: [{ type: 'pixel', x: 1, y: 1, color: '#fff', tolerance: 2 }] }, then: [], else: [] },
 ] }] });
 const cols = parseDocument(colDoc).macros[0].body;
-check('pixel becomes 1x1 colour', cols[0].cond.type === 'color' && cols[0].cond.w === 1 && cols[0].cond.coverage === 1);
+check('pixel becomes 1x1 colour', cols[0].cond.type === 'color' && cols[0].cond.w === 1);
 check('pixel keeps its position', cols[0].cond.x === 5 && cols[0].cond.y === 6 && cols[0].cond.color === '#abcdef');
-check('regionColor becomes colour', cols[1].cond.type === 'color' && cols[1].cond.w === 30 && cols[1].cond.coverage === 0.5);
+check('regionColor becomes colour', cols[1].cond.type === 'color' && cols[1].cond.w === 30);
+// The share of pixels a colour check used to demand is gone, and gone from the
+// documents that carried it: it asked pixels to match an average, which is a
+// colour they need not have, so the demand was routinely unmeetable.
+check('the coverage share is dropped on the way in',
+      cols[1].cond.coverage === undefined, JSON.stringify(cols[1].cond));
 check('nested condition migrated', cols[2].cond.of[0].type === 'color');
 check('1x1 colour describes as a pixel', describeCondition(cols[0].cond).startsWith('pixel'), describeCondition(cols[0].cond));
-check('area colour describes as coverage', describeCondition(cols[1].cond).includes('30×40'), describeCondition(cols[1].cond));
+check('area colour describes as an average', describeCondition(cols[1].cond).startsWith('avg of 30×40'),
+      describeCondition(cols[1].cond));
+check('and both shapes say their tolerance', describeCondition(cols[0].cond).includes('±9')
+      && describeCondition(cols[1].cond).includes('±7'), describeCondition(cols[0].cond));
+check('colour check remembers its flash', parseDocument(JSON.stringify({ version: 1, macros: [{ id: 'm', name: 'c', body: [
+    { id: 'a', kind: 'if', cond: { type: 'color', x: 1, y: 2, w: 3, h: 4, color: '#abcdef', tolerance: 9, flash: true }, then: [], else: [] },
+] }] })).macros[0].body[0].cond.flash === true);
+
+// never is a condition of its own, not a missing one: it survives a round trip
+const neverDoc = parseDocument(JSON.stringify({ version: 1, macros: [{ id: 'm', name: 'n', body: [
+    { id: 'a', kind: 'if', cond: { type: 'never' }, then: [], else: [] },
+] }] }));
+check('never survives parsing', neverDoc.macros[0].body[0].cond.type === 'never');
+check('never describes as never', describeCondition(neverDoc.macros[0].body[0].cond) === 'never',
+      describeCondition(neverDoc.macros[0].body[0].cond));
+check('never is not always', describeCondition(newCondition('never')) !== describeCondition(newCondition('always')));
 
 // llm verdict parsing
 check('verdict json', parseVerdict('{"match": true, "reason": "green"}').match === true);
