@@ -410,13 +410,22 @@ same overlay, described with the condition it belongs to below.
 
 Every one of these — the picker, the red X, the green flash — is drawn above
 *everything*, fullscreen windows included. That is worth stating because it is
-where the interesting applications are: a game running fullscreen sits in the
-shell's top window group, above ordinary desktop chrome, so anything drawn the
-ordinary way is drawn behind it and a marker you cannot see is a marker that
-does not work. Picking a position asks the compositor for the click rather than
-asking where the pointer is, for the same reason: an application that holds the
-pointer — any game with mouse-look — has frozen it somewhere of its own
-choosing, and the picker takes the grab back before asking.
+where the interesting applications are, and getting it takes two separate
+things. A game running fullscreen sits in the shell's top window group, above
+ordinary desktop chrome, so anything drawn the ordinary way is drawn behind it.
+And a fullscreen window that has a monitor to itself is handed straight to the
+display with no compositing pass at all, so even something stacked above it is
+not drawn — the compositor has to be asked to keep compositing for as long as
+the marker is up, which is what the shell's own on-screen chrome does.
+
+Picking a position asks the compositor for the click rather than asking where
+the pointer is, for the same reason: an application that holds the pointer —
+any game with mouse-look — has frozen it somewhere of its own choosing, and the
+picker takes the grab back before asking. A macro that *runs* has no such
+luxury: it has to drive the real pointer to the coordinate, so a step aimed at
+a fixed position fails outright against a game that has the pointer locked
+rather than clicking wherever it got stuck. Relative motion still works there,
+because relative motion is exactly what a locked pointer accepts.
 
 Where a click or a move goes is one row: the numbers, **Pick**, **Show**, and
 buttons for not using coordinates at all. On a click the mouse button means

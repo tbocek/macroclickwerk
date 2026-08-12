@@ -23,12 +23,50 @@ let markerTimeoutId = 0;
  */
 let markerActors: St.Widget[] = [];
 
+/** Whether the compositor is currently being held in composited mode for us. */
+let compositingHeld = false;
+
+/**
+ * Ask the compositor to keep compositing, or let it stop again.
+ *
+ * A fullscreen window that has a monitor to itself is handed straight to the
+ * display: no compositing pass runs at all, and nothing the shell draws over
+ * that window appears — not because it is behind it, but because nobody is
+ * drawing. That is the whole of "the marker works everywhere except over the
+ * game", and no amount of restacking fixes it. The shell's own transient
+ * chrome — the OSD, the magnifier, the screenshot UI — asks for exactly this,
+ * in a dozen places. The picker never had the problem because a full-screen
+ * actor covers the window, which brings compositing back on its own.
+ *
+ * Mutter counts the requests, so ours has to be balanced exactly once; the
+ * flag is what guarantees that, rather than trusting each caller to pair up.
+ */
+function holdCompositing(on: boolean): void {
+    if (on === compositingHeld) {
+        return;
+    }
+    // Structurally typed and optional: this is the compositor's own API, but
+    // the extension outlives shell versions, and a method that moved must
+    // cost the marker its brightness, not its existence.
+    const compositor = global.compositor as unknown as {
+        disable_unredirect?: () => void;
+        enable_unredirect?: () => void;
+    };
+    if (on) {
+        compositor.disable_unredirect?.();
+    } else {
+        compositor.enable_unredirect?.();
+    }
+    compositingHeld = on;
+}
+
 /** Take down whatever marker is showing, if any. */
 export function clearMarker(): void {
     if (markerTimeoutId) {
         GLib.source_remove(markerTimeoutId);
         markerTimeoutId = 0;
     }
+    holdCompositing(false);
     for (const actor of markerActors) {
         // Parent-checked: an actor is tracked from the moment it is built, which
         // may be before it reached the chrome.
@@ -70,6 +108,9 @@ function presentMarker(actors: St.Widget[], durationMs: number): void {
     for (const actor of actors) {
         Main.layoutManager.addTopChrome(actor);
     }
+    // Last, and only once the actors are up: turning compositing back on is
+    // what makes them appear at all over a fullscreen window.
+    holdCompositing(true);
 }
 
 /**
