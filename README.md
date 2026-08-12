@@ -14,10 +14,10 @@ left press → press E, on left release → release E. Around them you can put `
 only counts — forever, or a fixed number of times; you leave it with `break`
 inside an `if`, which keeps every condition in one place:
 
-- **screen colour** — "the pixel at 840,512 is green ±24", or "60% of this
-  40×40 area is green". Sub-5 ms, deterministic, no network. Both the spot and
-  the colour come off the screen itself: **Pick** takes a click as one pixel
-  and a drag as the area with the average colour over it.
+- **screen colour** — "the pixel at 840,512 is green ±24", or "this 40×40 area
+  averages to green ±30". Sub-5 ms, deterministic, no network. Both the spot
+  and the colour come off the screen itself: **Pick** takes a click as one
+  pixel and a drag as an area, and stores what that area averages to.
 - **ask a local vision model** — a screenshot plus your own prompt ("Is the button
   on the left green?"), answered yes/no by an OpenAI-compatible endpoint running
   on your machine.
@@ -451,20 +451,33 @@ flashed back at you once the window returns, so the numbers in the field never
 have to be taken on trust.
 
 A colour condition's **Pick** is the same overlay, and it brings the colour
-back with it: click a pixel and the check is that pixel and the colour it has,
-drag a rectangle and the check is that area and the average colour over it —
-the same average the check itself measures. Growing a check from one pixel to
-an area drops the required coverage from every pixel to most of them, which is
-the only demand a patch of real screen — antialiased edges, a gradient, a bit
-of text — can meet. **Read** beside the colour leaves the area alone and fills
-in what it looks like right now, for when the button you are watching has
-changed shade since you picked it.
+back with it: click a pixel and the check is that pixel and the colour it has;
+drag a rectangle and the check is that area and what it averages to.
+
+The check is then one colour against one colour — what that area averages to
+now, against what it averaged to when you picked it, within the tolerance
+beside the field. There is no third number, and there used to be: a share of
+the pixels that had to match. It is gone because it asked individual pixels to
+match an *average*, and an average is a colour that need not be anywhere in the
+area — a green button with a dark glyph on it and a white badge under it
+averages to a green that is neither the button nor the glyph nor the badge, so
+the share was routinely zero and the check could not come true however the
+screen looked. Averaging both sides asks a question the numbers can answer, and
+one number is left to tune.
+
+Tolerance is a distance in RGB, not a slack per channel: 30 is roughly 17 per
+channel if all three move together. Generous enough for antialiasing, a shadow,
+a frame caught mid-animation; nowhere near enough to survive the thing you are
+watching disappearing.
+
+**Read** beside the colour takes that average again without moving the area,
+for when the button you are watching has changed shade since you picked it.
 
 `#22aa33` is a number, and a number is not a colour anyone recognises, so a
 block of it sits beside the field — following the text as you type it, and
 drawn as an empty outline while what you have typed is not a colour yet. The
-same block follows every colour a summary line names, so a folded `If 60% of
-40×40 @ 1,2 ≈ #123456` says which blue it means without being opened.
+same block follows every colour a summary line names, so a folded `If avg of
+40×40 @ 1,2 ≈ #123456 ±30` says which blue it means without being opened.
 
 The **Flash** toggle on the area row draws a green outline over the checked
 area for a second every time the check runs, so you can watch a running macro

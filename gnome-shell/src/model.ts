@@ -39,8 +39,9 @@ export interface LlmCondition {
 }
 
 /**
- * A colour check over a screen area. A 1×1 area with full coverage is the
- * single-pixel case, so there is one condition here rather than two.
+ * A colour check over a screen area: what that area averages to, against the
+ * colour it averaged to when it was picked, within `tolerance`. A 1×1 area
+ * averages to its own pixel, so the single-pixel check is the same check.
  */
 export interface ColorCondition {
     type: 'color';
@@ -49,9 +50,8 @@ export interface ColorCondition {
     w: number;
     h: number;
     color: string;
+    /** How far the average may be from `color`, as an RGB distance. */
     tolerance: number;
-    /** Fraction of pixels that must match, 0..1. */
-    coverage: number;
     /** Flash a green outline over the checked area whenever this check runs. */
     flash?: boolean;
 }
@@ -327,7 +327,7 @@ export function newCondition(type: ConditionType): Condition {
             return {
                 type: 'color',
                 x: 0, y: 0, w: 1, h: 1,
-                color: '#22aa33', tolerance: 24, coverage: 1,
+                color: '#22aa33', tolerance: 24,
             };
         case 'and':
             return { type: 'and', of: [] };
@@ -920,7 +920,6 @@ function migrateCondition(cond: Condition | null | undefined): Condition | null 
             h: 1,
             color: legacy.color ?? '#000000',
             tolerance: legacy.tolerance ?? 24,
-            coverage: 1,
         };
     }
     if (legacy.type === 'regionColor') {
@@ -932,11 +931,18 @@ function migrateCondition(cond: Condition | null | undefined): Condition | null 
             h: Math.max(1, legacy.h ?? 1),
             color: legacy.color ?? '#000000',
             tolerance: legacy.tolerance ?? 24,
-            coverage: legacy.coverage ?? 1,
         };
     }
 
-    if (cond.type === 'and' || cond.type === 'or') {
+    if (cond.type === 'color') {
+        // A colour check counted pixels near the target and demanded a share of
+        // them. It now compares the area's average against the target, which
+        // needs no share — and asked individual pixels to match a mean, which
+        // is a colour they need not have, so the share was unreachable more
+        // often than not. Dropped rather than ignored: a number nothing reads
+        // is a number the next reader has to work out is dead.
+        delete (cond as { coverage?: number }).coverage;
+    } else if (cond.type === 'and' || cond.type === 'or') {
         cond.of = cond.of.map(child => migrateCondition(child)!).filter(Boolean);
     } else if (cond.type === 'not') {
         cond.of = migrateCondition(cond.of) ?? { type: 'always' };
@@ -1159,8 +1165,8 @@ export function describeCondition(cond: Condition | null | undefined): string {
             return `LLM: "${truncate(cond.prompt)}"`;
         case 'color':
             return cond.w * cond.h === 1
-                ? `pixel ${cond.x},${cond.y} ≈ ${cond.color}`
-                : `${Math.round((cond.coverage ?? 0) * 100)}% of ${cond.w}×${cond.h} @ ${cond.x},${cond.y} ≈ ${cond.color}`;
+                ? `pixel ${cond.x},${cond.y} ≈ ${cond.color} ±${cond.tolerance}`
+                : `avg of ${cond.w}×${cond.h} @ ${cond.x},${cond.y} ≈ ${cond.color} ±${cond.tolerance}`;
         case 'and':
             return cond.of.length ? cond.of.map(describeCondition).join(' and ') : 'always';
         case 'or':

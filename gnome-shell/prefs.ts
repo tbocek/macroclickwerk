@@ -68,9 +68,6 @@ const CONDITION_TYPES: ConditionType[] = ['always', 'never', 'llm', 'color', 'an
  */
 const GROUPABLE_TYPES = CONDITION_TYPES.filter(type => type !== 'always' && type !== 'never');
 
-/** What a colour check asks of an area the first time it is given one. */
-const AREA_COVERAGE = 0.6;
-
 const MACROS_FILE = 'macroclickwerk-macros.json';
 const SETTINGS_FILE = 'macroclickwerk-settings.json';
 
@@ -2298,14 +2295,6 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
                 areaRow.add_suffix(this._flashToggle(condition));
                 rows.push(areaRow);
 
-                // Coverage is meaningless for a single pixel, which is the
-                // default shape, so it only appears once there is an area.
-                if (condition.w * condition.h > 1) {
-                    rows.push(spinRow(_('Required coverage (%)'), Math.round(condition.coverage * 100), 1, 100, 1, value => {
-                        condition.coverage = value / 100;
-                        save();
-                    }));
-                }
                 break;
             }
 
@@ -2756,29 +2745,20 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
         });
     }
 
-    /**
-     * Move a colour check onto an area, whether that came from the field or
-     * from the screen. Growing past one pixel brings the coverage threshold
-     * down with it: every pixel matching is the right demand of the single
-     * pixel a new check starts as, and a demand no patch of real screen —
-     * antialiased edges, a gradient, a bit of text — ever meets.
-     */
+    /** Move a colour check onto an area, from the field or from the screen. */
     private _setColorArea(condition: ColorCondition, region: Region): void {
-        const wasPixel = condition.w * condition.h === 1;
         condition.x = region.x;
         condition.y = region.y;
         condition.w = Math.max(1, region.w);
         condition.h = Math.max(1, region.h);
-        if (wasPixel && condition.w * condition.h > 1 && condition.coverage >= 1) {
-            condition.coverage = AREA_COVERAGE;
-        }
     }
 
     /**
-     * Point at the screen and take both halves of a colour check off it: a
-     * click is the pixel it landed on, a drag is the rectangle and its average
-     * colour. Nothing here waits for the daemon — the picker is the shell's own
-     * overlay, the same one the model's area comes from.
+     * Point at the screen and take a whole colour check off it: a click is the
+     * pixel it landed on, a drag is the rectangle, the colour that rectangle is
+     * made of, and how much of it that colour covers. Nothing here waits for
+     * the daemon — the picker is the shell's own overlay, the same one the
+     * model's area comes from.
      */
     private _pickColorFor(condition: ColorCondition): void {
         this._askShell('pick-color', {}, {
@@ -2790,9 +2770,7 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
                     return;
                 }
                 this._setColorArea(condition, region);
-                if (typeof answer.color === 'string') {
-                    condition.color = answer.color;
-                }
+                this._applyMeasuredColor(condition, answer);
                 this._saveAndRebuild();
             },
         });
@@ -2813,10 +2791,17 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
                     this._toast(`${_('could not read that colour')}: ${answer.message ?? _('unknown reason')}`);
                     return;
                 }
-                condition.color = answer.color;
+                this._applyMeasuredColor(condition, answer);
                 this._saveAndRebuild();
             },
         });
+    }
+
+    /** The colour the shell read off that area, into the check. */
+    private _applyMeasuredColor(condition: ColorCondition, answer: Record<string, any>): void {
+        if (typeof answer.color === 'string') {
+            condition.color = answer.color;
+        }
     }
 
     /** Flash an X, or a rectangle, at these coordinates. */

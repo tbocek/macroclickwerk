@@ -8,17 +8,8 @@ import { describeCondition } from './model.js';
 import { LlmClient, LlmError, type LlmSettings } from './llm.js';
 import { reportProblem } from './problems.js';
 import type { Config } from './store.js';
-import {
-    averageColor,
-    captureRegion,
-    captureScreen,
-    colorCoverage,
-    colorDistance,
-    encodeForLlm,
-    formatColor,
-    parseColor,
-    readPixel,
-} from './screenshot.js';
+import { captureRegion, captureScreen, encodeForLlm } from './screenshot.js';
+import { averageColor, colorDistance, formatColor, parseColor } from './colours.js';
 
 export interface EvaluationTrace {
     condition: string;
@@ -125,32 +116,28 @@ export class ConditionEvaluator {
     }
 
     /**
-     * One capture covers both cases: a 1×1 area is the single-pixel check, and
-     * reporting the colour actually found is far more useful there than a
-     * coverage percentage.
+     * One colour against one colour: what the area averages to now, against
+     * what it averaged to when it was picked, within the tolerance.
+     *
+     * One path covers both shapes — a 1×1 area averages to its own pixel — and
+     * that is the point. This used to count pixels near the target and demand a
+     * percentage of them, which asked individual pixels to match a *mean*: a
+     * mean is a colour that need not be anywhere in the area, so the count was
+     * routinely zero and the check could not come true however the screen
+     * looked. Comparing an average to an average asks a question the numbers
+     * can actually answer.
      */
     private async _evaluateColor(condition: ColorCondition): Promise<{ result: boolean; detail: string }> {
         const w = Math.max(1, condition.w);
         const h = Math.max(1, condition.h);
         const pixbuf = await captureRegion(condition.x, condition.y, w, h);
-        const target = parseColor(condition.color);
 
-        let outcome: { result: boolean; detail: string };
-        if (w * h === 1) {
-            const actual = readPixel(pixbuf, 0, 0);
-            const distance = colorDistance(actual, target);
-            outcome = {
-                result: distance <= condition.tolerance,
-                detail: `found ${formatColor(actual)}, distance ${distance.toFixed(1)} vs tolerance ${condition.tolerance}`,
-            };
-        } else {
-            const coverage = colorCoverage(pixbuf, target, condition.tolerance);
-            outcome = {
-                result: coverage >= condition.coverage,
-                detail: `found ${formatColor(averageColor(pixbuf))} on average, ` +
-                    `${(coverage * 100).toFixed(1)}% matched, need ${(condition.coverage * 100).toFixed(0)}%`,
-            };
-        }
+        const actual = averageColor(pixbuf);
+        const distance = colorDistance(actual, parseColor(condition.color));
+        const outcome = {
+            result: distance <= condition.tolerance,
+            detail: `found ${formatColor(actual)}, distance ${distance.toFixed(1)} vs tolerance ${condition.tolerance}`,
+        };
 
         // After the capture — a green outline over the area is exactly the sort
         // of thing a colour check would then measure — and after the scan,

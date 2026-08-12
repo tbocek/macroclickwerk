@@ -439,14 +439,22 @@ const colDoc = JSON.stringify({ version: 1, macros: [{ id: 'm', name: 'c', body:
     { id: 'c', kind: 'if', cond: { type: 'and', of: [{ type: 'pixel', x: 1, y: 1, color: '#fff', tolerance: 2 }] }, then: [], else: [] },
 ] }] });
 const cols = parseDocument(colDoc).macros[0].body;
-check('pixel becomes 1x1 colour', cols[0].cond.type === 'color' && cols[0].cond.w === 1 && cols[0].cond.coverage === 1);
+check('pixel becomes 1x1 colour', cols[0].cond.type === 'color' && cols[0].cond.w === 1);
 check('pixel keeps its position', cols[0].cond.x === 5 && cols[0].cond.y === 6 && cols[0].cond.color === '#abcdef');
-check('regionColor becomes colour', cols[1].cond.type === 'color' && cols[1].cond.w === 30 && cols[1].cond.coverage === 0.5);
+check('regionColor becomes colour', cols[1].cond.type === 'color' && cols[1].cond.w === 30);
+// The share of pixels a colour check used to demand is gone, and gone from the
+// documents that carried it: it asked pixels to match an average, which is a
+// colour they need not have, so the demand was routinely unmeetable.
+check('the coverage share is dropped on the way in',
+      cols[1].cond.coverage === undefined, JSON.stringify(cols[1].cond));
 check('nested condition migrated', cols[2].cond.of[0].type === 'color');
 check('1x1 colour describes as a pixel', describeCondition(cols[0].cond).startsWith('pixel'), describeCondition(cols[0].cond));
-check('area colour describes as coverage', describeCondition(cols[1].cond).includes('30×40'), describeCondition(cols[1].cond));
+check('area colour describes as an average', describeCondition(cols[1].cond).startsWith('avg of 30×40'),
+      describeCondition(cols[1].cond));
+check('and both shapes say their tolerance', describeCondition(cols[0].cond).includes('±9')
+      && describeCondition(cols[1].cond).includes('±7'), describeCondition(cols[0].cond));
 check('colour check remembers its flash', parseDocument(JSON.stringify({ version: 1, macros: [{ id: 'm', name: 'c', body: [
-    { id: 'a', kind: 'if', cond: { type: 'color', x: 1, y: 2, w: 3, h: 4, color: '#abcdef', tolerance: 9, coverage: 0.5, flash: true }, then: [], else: [] },
+    { id: 'a', kind: 'if', cond: { type: 'color', x: 1, y: 2, w: 3, h: 4, color: '#abcdef', tolerance: 9, flash: true }, then: [], else: [] },
 ] }] })).macros[0].body[0].cond.flash === true);
 
 // never is a condition of its own, not a missing one: it survives a round trip

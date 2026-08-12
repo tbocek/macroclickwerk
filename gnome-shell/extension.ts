@@ -28,7 +28,8 @@ import { EV_KEY } from './src/keymap.js';
 import { TriggerEngine, parseTriggers } from './src/triggers.js';
 import { MacroPopup } from './ui/popup.js';
 import { clearMarker, flashRegion, pickRegion, showMarker } from './ui/overlay.js';
-import { averageColor, captureRegion, formatColor } from './src/screenshot.js';
+import { captureRegion } from './src/screenshot.js';
+import { averageColor, formatColor } from './src/colours.js';
 
 const KEYBINDINGS = [
     'run-macro', 'record-toggle', 'capture-step', 'panic-stop',
@@ -791,6 +792,8 @@ export default class MacroclickwerkExtension extends Extension {
 
         await settle(SETTLE_BEFORE_SAMPLE_MS);
         const pixbuf = await captureRegion(region.x, region.y, region.w, region.h);
+        // The average, which is the same thing the check reads when it runs —
+        // one number to store, the same number to compare against.
         const color = formatColor(averageColor(pixbuf));
         // Only now: the outline is over the very pixels that were just read.
         flashRegion(region);
