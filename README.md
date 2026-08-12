@@ -95,6 +95,17 @@ seat to warp the pointer there — one call, exact position, no acceleration
 curve involved — and verifies with `global.get_pointer()`. There is no visible
 glide and nothing to configure; mouse settings are never touched.
 
+Arriving and being *seen* to arrive are not the same thing, so a positioned
+click waits 50 ms after the move before the button goes down. The compositor
+moves the pointer immediately; an application under it learns where the pointer
+now is on its own schedule, which for anything drawing frames is once a frame.
+Press in the same millisecond as the warp and a game still holds the position
+from before it — so the thing being dragged, aimed or placed goes where the
+pointer *was*, which reads as the click landing in the wrong place while every
+coordinate involved is correct. A person moving a mouse and clicking never gets
+close to being that quick. The wait is skipped when the pointer was already
+there, so a macro clicking the same button in a loop pays it once.
+
 If a target swallows the warp (a pointer-confining grab), the extension falls
 back to walking there over uinput: nudge, re-read the pointer, nudge again
 until it is within a pixel. The move and the click that follows it hold the

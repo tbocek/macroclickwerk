@@ -90,6 +90,14 @@ const MAX_WARP_ITERATIONS = 3;
 // The relative fallback fights the acceleration curve, so a move may need a
 // few more passes; each is one daemon round trip, so a higher ceiling is cheap.
 const MAX_MOVE_ITERATIONS = 12;
+/**
+ * How long a positioned click waits after arriving before pressing. Three
+ * frames at 60Hz, near enough: long enough for the application under the
+ * pointer to have noticed where the pointer now is, short enough not to be felt
+ * in a macro that clicks its way through a hundred of them. A person moving a
+ * mouse and clicking never gets close to being this quick.
+ */
+const SETTLE_BEFORE_CLICK_MS = 50;
 const PAUSE_POLL_MS = 120;
 
 export class MacroRunner {
@@ -587,7 +595,7 @@ export class MacroRunner {
         // move left off is the whole point, and another macro nudging the pointer
         // between the two would land it somewhere else entirely.
         await this._daemon.exclusive(async lease => {
-            const arrived = await this._moveToTarget(step, lease);
+            const { arrived, moved } = await this._moveToTarget(step, lease);
             if (this._cancelled) {
                 return;
             }
@@ -599,6 +607,23 @@ export class MacroRunner {
             // somewhere else entirely.
             if (!arrived) {
                 throw new Error(this._motionFailure(step));
+            }
+            // Arriving is not the same as having been seen to arrive. The
+            // compositor moves the pointer immediately; the application under
+            // it learns where the pointer is on its own schedule, which for
+            // anything drawing frames is once a frame. Press in the same
+            // millisecond as the warp and a game still holds the position from
+            // before it — so the thing being dragged, aimed or placed goes
+            // where the pointer *was*, which looks like the click landing in
+            // the wrong place while every coordinate involved is correct.
+            //
+            // Only after a move that actually moved: clicking twice in the
+            // same spot has nothing to wait for.
+            if (moved) {
+                await this._sleep(SETTLE_BEFORE_CLICK_MS);
+                if (this._cancelled) {
+                    return;
+                }
             }
             await press(lease);
         });
@@ -618,7 +643,7 @@ export class MacroRunner {
             return;
         }
         // Only the move to hold together here — there is nothing after it.
-        const arrived = await this._daemon.exclusive(lease => this._moveToTarget(step, lease));
+        const { arrived } = await this._daemon.exclusive(lease => this._moveToTarget(step, lease));
         if (!arrived && !this._cancelled) {
             // A move that did not move is the whole step, so it fails outright
             // rather than reporting success from the wrong place and leaving
@@ -648,18 +673,24 @@ export class MacroRunner {
      * nowhere to go and stays put, which for a click means clicking where the
      * pointer already is.
      */
-    private async _moveToTarget(step: ClickStep | MoveStep, lease: Playback): Promise<boolean> {
+    private async _moveToTarget(
+        step: ClickStep | MoveStep, lease: Playback,
+    ): Promise<{ arrived: boolean; moved: boolean }> {
         const target = step.mode === 'prev'
             ? this._prevPointer
             : { x: step.x ?? 0, y: step.y ?? 0 };
         if (!target) {
-            return true;   // a 'prev' with nowhere to go stays put, as it always has
+            // A 'prev' with nowhere to go stays put, as it always has.
+            return { arrived: true, moved: false };
         }
+        const [px, py] = global.get_pointer();
         if (!this._prevPinned) {
-            const [px, py] = global.get_pointer();
             this._prevPointer = { x: px, y: py };
         }
-        return this._moveAbs(target.x, target.y, lease);
+        // Read before the move, and to the same tolerance the move itself
+        // settles for: "already there" has to mean what "arrived" means.
+        const moved = Math.abs(target.x - px) > 1 || Math.abs(target.y - py) > 1;
+        return { arrived: await this._moveAbs(target.x, target.y, lease), moved };
     }
 
     private async _playRelative(dx: number, dy: number, via?: Playback): Promise<void> {
