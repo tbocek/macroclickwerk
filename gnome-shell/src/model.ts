@@ -1216,7 +1216,13 @@ export function describeStep(
             // Absent is the follow, and a follow reads as the plain word: what
             // it does is whatever the event did, which the event's own line
             // above it already says.
-            const verb = step.action === 'down' ? 'Hold down'
+            //
+            // The half that stays down is a press, not a hold: "hold" wants an
+            // unhold to go with it, and what ends this is the release sitting
+            // beside it in the same list. A key cannot borrow that pairing —
+            // its whole press is already "press" — which is why `pressVerb`
+            // below still says "hold down".
+            const verb = step.action === 'down' ? 'Press'
                 : step.action === 'up' ? 'Release' : 'Click';
             return step.mode === 'abs' ? `${verb} ${step.button} @ ${step.x ?? 0},${step.y ?? 0}`
                 : step.mode === 'prev' ? `${verb} ${step.button} @ previous`

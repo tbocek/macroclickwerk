@@ -159,8 +159,8 @@ const mouseButtonLabels = (): Record<MouseButton, string> => ({
     extra: _('Extra'),
 });
 
-/** What a key step can do, in the order it is offered. */
-const KEY_ACTIONS = ['tap', 'down', 'up'] as const;
+/** What a click or a key step can do, in the order it is offered. */
+const PRESS_ACTIONS = ['tap', 'down', 'up'] as const;
 
 /**
  * Built on demand, for the same reason mouseButtonLabels is. One word each,
@@ -168,7 +168,19 @@ const KEY_ACTIONS = ['tap', 'down', 'up'] as const;
  * entry, and "Press and keep held" made every row in the window wider than it
  * had room for. The line these sit on already reads "Hold down ctrl+c", so the
  * sentence was being said twice; the tooltip keeps the long form.
+ *
+ * A mouse and a keyboard name the same three things differently. The whole
+ * gesture is a *click* on a mouse, which leaves "press" free for the half that
+ * goes down and stays there — and press/release is a pair anyone can see the
+ * ends of. A key's whole gesture is already called a press, so its held half
+ * has to borrow "hold" instead.
  */
+const clickActionLabels = (): Record<string, string> => ({
+    tap: _('Click'),
+    down: _('Press'),
+    up: _('Release'),
+});
+
 const keyActionLabels = (): Record<string, string> => ({
     tap: _('Press'),
     down: _('Hold'),
@@ -1557,7 +1569,7 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
         step: ClickStep | KeyStep,
         follows: OnEventStep | null,
         retitle: () => void,
-        words: { action: string; hold: string },
+        words: { actions: Record<string, string>; action: string; hold: string },
     ): void {
         if (follows) {
             suffixes.append(this._followToggle(step, follows));
@@ -1565,7 +1577,7 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
                 return;
             }
         }
-        suffixes.append(chooser(KEY_ACTIONS, keyActionLabels(), step.action ?? 'tap',
+        suffixes.append(chooser(PRESS_ACTIONS, words.actions, step.action ?? 'tap',
             words.action, value => {
                 step.action = value;
                 retitle();
@@ -1731,7 +1743,8 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
                     this._save();
                 }));
             this._pressSuffixes(suffixes, step, follows, retitle, {
-                action: _('Whether to click, hold down, or release'),
+                actions: clickActionLabels(),
+                action: _('A whole click, or one half of one: press it and leave it down, or release what is down'),
                 hold: _('How long the button stays down'),
             });
             break;
@@ -1740,7 +1753,8 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
         // for how long — "Press ctrl+c", "Hold down shift".
         case 'key':
             this._pressSuffixes(suffixes, step, follows, retitle, {
-                action: _('Whether to press, hold down, or release'),
+                actions: keyActionLabels(),
+                action: _('A whole press, or one half of one: hold it down, or release what is held'),
                 hold: _('How long the key stays down'),
             });
             break;
