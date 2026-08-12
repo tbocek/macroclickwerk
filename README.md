@@ -442,6 +442,12 @@ of text — can meet. **Read** beside the colour leaves the area alone and fills
 in what it looks like right now, for when the button you are watching has
 changed shade since you picked it.
 
+`#22aa33` is a number, and a number is not a colour anyone recognises, so a
+block of it sits beside the field — following the text as you type it, and
+drawn as an empty outline while what you have typed is not a colour yet. The
+same block follows every colour a summary line names, so a folded `If 60% of
+40×40 @ 1,2 ≈ #123456` says which blue it means without being opened.
+
 The **Flash** toggle on the area row draws a green outline over the checked
 area for a second every time the check runs, so you can watch a running macro
 look where you meant it to. Both checks have one. The flash fires just after

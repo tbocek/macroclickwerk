@@ -54,9 +54,9 @@ import { buildInstruction, testConnection } from './src/llm.js';
 import { comboCodes, isArmed, parseTriggers, type Trigger } from './src/triggers.js';
 import { keyName } from './src/keymap.js';
 import {
-    chooser, clearClasses, comboRow, commitNumbers, debounce, descendants, entryRow,
-    iconButton, infoButton, passwordRow, setClass, spinRow, spinSuffix, suffixEntry,
-    toggleButton,
+    chooser, clearClasses, colorSwatch, comboRow, commitNumbers, debounce, descendants,
+    entryRow, iconButton, infoButton, passwordRow, setClass, spinRow, spinSuffix,
+    suffixEntry, toggleButton, withColorSwatches,
 } from './src/widgets.js';
 
 const CONDITION_TYPES: ConditionType[] = ['always', 'never', 'llm', 'color', 'and', 'or', 'not'];
@@ -1461,13 +1461,23 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
     }
 
     /**
+     * A step's title as a row shows it, which is not quite as it reads: a row
+     * title is Pango markup, so any colour the step names is followed by a
+     * block of that colour — and everything else in it is escaped, `_describe`
+     * being free to return an ampersand from a macro's name or a prompt.
+     */
+    private _rowTitle(step: Step): string {
+        return withColorSwatches(this._describe(step));
+    }
+
+    /**
      * The title says what the step does, so a setting that changes that has to
      * put it right — a click that now goes somewhere else must not still be
      * headed "Click left @ 100,200". Updated in place: rebuilding would take the
      * field you are typing in with it.
      */
     private _refreshStepTitle(step: Step): void {
-        this._stepRows.get(step.id)?.row.set_title(this._describe(step));
+        this._stepRows.get(step.id)?.row.set_title(this._rowTitle(step));
     }
 
     /** "3 steps", "empty" — the same phrasing wherever a body is counted. */
@@ -1596,7 +1606,7 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
         // with settings of their own keep the expander; the rest — a break, a
         // stop — are one line, and clicking them only selects them.
         const fields = this._buildStepFields(step);
-        const props = { title: this._describe(step), subtitle: this._stepSubtitle(step) };
+        const props = { title: this._rowTitle(step), subtitle: this._stepSubtitle(step) };
         const row: Adw.ActionRow | Adw.ExpanderRow = fields.length > 0 || inline
             ? this._expander(stepKey, props,
                 inline ? children[0].steps.length > 0 : children.length > 0)
@@ -1657,7 +1667,7 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
         // The title is the sentence these controls are words of, so it is
         // rewritten in place rather than by rebuilding the page — a rebuild
         // would close the dropdown you are still looking at.
-        const retitle = () => row.set_title(this._describe(step));
+        const retitle = () => row.set_title(this._rowTitle(step));
 
         // The "When …" this step runs under, if any: what its rail says, and
         // what a press step can take its edge from — see `_pressSuffixes`.
@@ -2237,6 +2247,13 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
                     condition.color = text.trim();
                     save();
                 });
+                // Redrawn as the field changes rather than as it commits: the
+                // commit is on a delay, and a swatch that lags what you typed
+                // by half a second is a swatch you stop trusting.
+                const swatch = colorSwatch(() => colourRow.get_text() ?? '',
+                    _('What this colour looks like'));
+                colourRow.connect('changed', () => swatch.queue_draw());
+                colourRow.add_suffix(swatch);
                 colourRow.add_suffix(spinSuffix(condition.tolerance, 0, 442,
                     _('Tolerance: how far off this colour a pixel may be and still count'),
                     value => {
@@ -2280,7 +2297,7 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
             case 'not': {
                 const nested = this._expander(`${key}:not`, {
                     title: _('Inverted condition'),
-                    subtitle: describeCondition(condition.of),
+                    subtitle: withColorSwatches(describeCondition(condition.of)),
                 });
                 for (const child of this._buildConditionSection(_('Type'), condition.of, next => {
                     condition.of = next;
@@ -2316,7 +2333,7 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
 
                 condition.of.forEach((child, index) => {
                     const childRow = this._expander(`${key}:${index}`, {
-                        title: `${index + 1}. ${describeCondition(child)}`,
+                        title: withColorSwatches(`${index + 1}. ${describeCondition(child)}`),
                     });
                     childRow.add_suffix(iconButton('user-trash-symbolic', _('Remove'), () => {
                         condition.of.splice(index, 1);
