@@ -1183,8 +1183,15 @@ export function prettySource(source: string, edge: EventEdge = 'either'): string
 }
 
 /** How a key or pad step reads. Absent is the follow, and follows just press. */
+/**
+ * A key step's verb. The whole gesture is a Type, which leaves "press" free for
+ * the half that goes down and stays there — so a keyboard names its halves
+ * exactly as a mouse does, and neither of them holds anything: a hold wants an
+ * unhold to go with it, and what ends this one is the Release sitting beside it
+ * in the same list.
+ */
 function pressVerb(action?: 'tap' | 'down' | 'up'): string {
-    return action === 'down' ? 'Hold down' : action === 'up' ? 'Release' : 'Press';
+    return action === 'down' ? 'Press' : action === 'up' ? 'Release' : 'Type';
 }
 
 function formatMs(ms: number): string {
@@ -1217,11 +1224,10 @@ export function describeStep(
             // it does is whatever the event did, which the event's own line
             // above it already says.
             //
-            // The half that stays down is a press, not a hold: "hold" wants an
-            // unhold to go with it, and what ends this is the release sitting
-            // beside it in the same list. A key cannot borrow that pairing —
-            // its whole press is already "press" — which is why `pressVerb`
-            // below still says "hold down".
+            // Only the whole gesture differs between a mouse and a keyboard —
+            // one clicks, the other types. The halves are a press and a
+            // release on both, which is a pair with two visible ends; see
+            // `pressVerb`.
             const verb = step.action === 'down' ? 'Press'
                 : step.action === 'up' ? 'Release' : 'Click';
             return step.mode === 'abs' ? `${verb} ${step.button} @ ${step.x ?? 0},${step.y ?? 0}`

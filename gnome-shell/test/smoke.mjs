@@ -388,13 +388,15 @@ check('an empty action is left empty, which is what following looks like',
 check('the hold time is left alone, for if the event goes away', held[2].holdMs === 200);
 check('a follower reads as a plain click',
       describeStep(held[2]) === 'Click left at pointer', describeStep(held[2]));
-// The row and the dropdown on it have to agree, and a mouse and a keyboard
-// name the halves differently: press/release for a button, hold/release for a
-// key, whose whole gesture already answers to "press".
+// The row and the dropdown on it have to agree, and only the whole gesture is
+// named differently between the two kinds: a mouse clicks, a keyboard types,
+// and both halve into a press and a release.
 check('half a click is a press', describeStep(held[0]) === 'Press left at pointer',
       describeStep(held[0]));
-check('half a key press is a hold', describeStep(held[4]) === 'Hold down F',
+check('half a keystroke is a press too', describeStep(held[4]) === 'Press F',
       describeStep(held[4]));
+check('a whole keystroke is a type', describeStep(held[3]) === 'Type E',
+      describeStep(held[3]));
 check('the other half is a release either way',
       describeStep({ ...held[0], action: 'up' }) === 'Release left at pointer'
       && describeStep({ ...held[4], action: 'up' }) === 'Release F');

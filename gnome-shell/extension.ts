@@ -49,6 +49,9 @@ const RUNNING_PUBLISH_MS = 100;
  */
 const SETTLE_BEFORE_SAMPLE_MS = 250;
 
+/** How long a pick shows you what it just took. */
+const PICK_CONFIRM_MS = 1000;
+
 function settle(ms: number): Promise<void> {
     return new Promise(resolve => {
         GLib.timeout_add(GLib.PRIORITY_DEFAULT, ms, () => {
@@ -737,44 +740,30 @@ export default class MacroclickwerkExtension extends Extension {
     }
 
     /**
-     * Wait for one click and report where it landed. The same gesture as
-     * capturing a step, minus the step: a coordinate in the editor is easier to
-     * go and point at than to read off the screen and type in, and this is how
-     * an existing one is corrected without recording the step again.
+     * Click a position and report where that was — the picker overlay, the same
+     * one an area is dragged out on, taking a click as the point it landed on.
+     *
+     * It used to wait for the daemon to report a real click and then ask the
+     * stage where the pointer was. That reads a position rather than choosing
+     * one, and it broke against exactly the applications this tool exists for:
+     * a game holds the pointer, so the stage's answer is wherever the lock
+     * froze the cursor, and the prompt saying a click was wanted was drawn
+     * behind the fullscreen window that had it. The overlay takes the grab,
+     * which hands the pointer back, and the coordinate is the click's own.
      */
     private async _pickPoint(): Promise<object> {
-        const fail = (message: string, hint?: string) => {
-            reportProblem('Recording', `could not pick a position: ${message}`, { hint });
-            return { ok: false, message };
-        };
-
-        if (!this._recorder || !this._daemon) {
-            return fail('the extension is not ready yet');
-        }
-        if (this._recorder.busy) {
-            return fail(this._recorder.recording ? 'stop the recording first' : 'already waiting for a click');
-        }
-
         this._indicator?.menu.close(true);
-        Main.notify('Macroclickwerk', 'Click the position, or move the pointer there and hold still.');
-
-        let step: Step | null = null;
-        try {
-            step = await this._recorder.captureOne();
-        } catch (error) {
-            return fail((error as Error).message,
-                'Check that the macroclickwerk service is running: systemctl status macroclickwerk');
+        const point = await pickRegion({
+            point: true,
+            hint: 'Click the position — Escape to cancel',
+        });
+        if (!point) {
+            return { ok: false, message: 'nothing was picked' };
         }
-
-        // A click gives its position and a pointer that stopped gives where it
-        // stopped; either way what came back is a point on the screen.
-        if (!step || step.kind === 'click' && step.mode !== 'abs'
-            || !('x' in step) || typeof step.x !== 'number' || typeof step.y !== 'number') {
-            return fail('nothing was picked before it timed out',
-                'Click somewhere, or move the pointer and hold it still, while it waits.');
-        }
-
-        return { ok: true, x: Math.round(step.x), y: Math.round(step.y) };
+        // The same X the Show button draws, briefly: what landed in the field,
+        // said on the screen the field is about.
+        showMarker(point.x, point.y, undefined, undefined, PICK_CONFIRM_MS);
+        return { ok: true, x: point.x, y: point.y };
     }
 
     /**

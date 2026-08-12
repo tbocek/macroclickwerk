@@ -169,11 +169,12 @@ const PRESS_ACTIONS = ['tap', 'down', 'up'] as const;
  * had room for. The line these sit on already reads "Hold down ctrl+c", so the
  * sentence was being said twice; the tooltip keeps the long form.
  *
- * A mouse and a keyboard name the same three things differently. The whole
- * gesture is a *click* on a mouse, which leaves "press" free for the half that
- * goes down and stays there — and press/release is a pair anyone can see the
- * ends of. A key's whole gesture is already called a press, so its held half
- * has to borrow "hold" instead.
+ * A mouse and a keyboard differ in one word of the three: the whole gesture is
+ * a *click* on a mouse and a *type* on a keyboard. Naming it separately is what
+ * leaves "press" free for the half that goes down and stays there, so both
+ * kinds can name their halves press and release — a pair with two ends you can
+ * see. Nothing is a "hold": a hold implies an unhold, and the button that ends
+ * it is the Release two entries down the same list.
  */
 const clickActionLabels = (): Record<string, string> => ({
     tap: _('Click'),
@@ -182,8 +183,8 @@ const clickActionLabels = (): Record<string, string> => ({
 });
 
 const keyActionLabels = (): Record<string, string> => ({
-    tap: _('Press'),
-    down: _('Hold'),
+    tap: _('Type'),
+    down: _('Press'),
     up: _('Release'),
 });
 
@@ -598,7 +599,7 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
             return [parsed?.[0] ?? 0, parsed?.[1] ?? 0];
         };
         const pick = iconButton('find-location-symbolic',
-            _('Go to the spot and click: that position lands here'),
+            _('Click the spot on the screen: that position lands here'),
             () => this._pickPointInto(({ x, y }) => entry.set_text(`${x}, ${y}`)));
         const show = iconButton('view-reveal-symbolic',
             _('Flash this position on the screen for a couple of seconds'),
@@ -1750,11 +1751,11 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
             break;
 
         // The same words a click has, for the same reason: which, what, and
-        // for how long — "Press ctrl+c", "Hold down shift".
+        // for how long — "Type ctrl+c", "Press shift".
         case 'key':
             this._pressSuffixes(suffixes, step, follows, retitle, {
                 actions: keyActionLabels(),
-                action: _('A whole press, or one half of one: hold it down, or release what is held'),
+                action: _('A whole keystroke, or one half of one: press it and leave it down, or release what is down'),
                 hold: _('How long the key stays down'),
             });
             break;
@@ -2725,11 +2726,10 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
         });
     }
 
-    /** Drag a rectangle on the real screen to set an LLM condition's area. */
     /**
-     * Get out of the way, wait for a click on the real screen, and hand back
-     * where it landed. The window comes back either way; a pick that caught
-     * nothing says so rather than leaving the field looking picked.
+     * Get out of the way, let the picker take a click on the real screen, and
+     * hand back where it landed. The window comes back either way; a pick that
+     * caught nothing says so rather than leaving the field looking picked.
      */
     private _pickPointInto(onPoint: (point: { x: number; y: number }) => void): void {
         this._askShell('pick-point', {}, {
@@ -2738,7 +2738,7 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
                 if (answer.ok && typeof answer.x === 'number' && typeof answer.y === 'number') {
                     onPoint({ x: answer.x, y: answer.y });
                 } else {
-                    this._toast(`${_('nothing was picked')}: ${answer.message ?? _('it timed out')}`);
+                    this._toast(`${_('nothing was picked')}: ${answer.message ?? _('it was cancelled')}`);
                 }
             },
         });

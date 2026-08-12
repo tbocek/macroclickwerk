@@ -10,7 +10,7 @@ recorded event trains — and `on event`, which parks the run until a button or
 key of your choosing is pressed (or, if you say so, released) and swallows
 that event, so a side button can mean "do the next steps" instead of what it
 normally does. Two of them on the two edges of one button make a hold: on
-left press → hold E, on left release → release E. Around them you can put `loop` and `if` blocks. A loop
+left press → press E, on left release → release E. Around them you can put `loop` and `if` blocks. A loop
 only counts — forever, or a fixed number of times; you leave it with `break`
 inside an `if`, which keeps every condition in one place:
 
@@ -31,7 +31,7 @@ repeat forever:
     if the model says the left button is green:
         click at x,y
         if a colour check passes:
-            press E
+            type E
     wait 10s
 ```
 
@@ -73,7 +73,7 @@ repeat forever:
   they capture what the screen saw, not what the mouse did. The same machinery
   drives the **on event step**: put it in a macro and the run parks there until
   the button is pressed, consuming the press — `repeat forever: [on event
-  side button, click …, press E]` is a side button that plays a sequence. A
+  side button, click …, type E]` is a side button that plays a sequence. A
   run parked on a button outranks a standing trigger on the same button.
 
 ## How it fits together
@@ -401,13 +401,22 @@ Coordinates are single fields — `100, 200` for a point, `10, 20, 40, 40` for a
 area — each with a **Show** button that flashes a red X (or an outline) at that
 spot on the real screen for a couple of seconds, so you can check a number
 without running anything. Next to it, **Pick** fills the field by pointing: the
-window gets out of the way, you click where you mean, and the position lands in
-the field — the same gesture as recording one step, without adding one, which is
-how you correct a coordinate that has moved. A pick that catches nothing before
-it times out says so and leaves the field as it was. A step's title follows its
-coordinates, so a click that now goes somewhere else says where. An area is
-picked by dragging one out instead, described with the condition it belongs to
-below.
+window gets out of the way, the screen dims, and where you click lands in the
+field — which is how you correct a coordinate that has moved without recording
+the step again. Escape leaves the field as it was, and what was picked is
+flashed back at you. A step's title follows its coordinates, so a click that now
+goes somewhere else says where. An area is picked by dragging one out on the
+same overlay, described with the condition it belongs to below.
+
+Every one of these — the picker, the red X, the green flash — is drawn above
+*everything*, fullscreen windows included. That is worth stating because it is
+where the interesting applications are: a game running fullscreen sits in the
+shell's top window group, above ordinary desktop chrome, so anything drawn the
+ordinary way is drawn behind it and a marker you cannot see is a marker that
+does not work. Picking a position asks the compositor for the click rather than
+asking where the pointer is, for the same reason: an application that holds the
+pointer — any game with mouse-look — has frozen it somewhere of its own
+choosing, and the picker takes the grab back before asking.
 
 Where a click or a move goes is one row: the numbers, **Pick**, **Show**, and
 buttons for not using coordinates at all. On a click the mouse button means

@@ -58,10 +58,17 @@ function presentMarker(actors: St.Widget[], durationMs: number): void {
         clearMarker();
         return GLib.SOURCE_REMOVE;
     });
+    // addTopChrome, not addChrome: addChrome puts the actor *below*
+    // `global.top_window_group`, which is where a fullscreen window lives — so
+    // a marker aimed into a fullscreen game was drawn behind that game, and
+    // pointing at something you cannot see is the one thing a marker must not
+    // do. The picker overlay has always gone in above everything, which is why
+    // it worked over the same window this did not.
+    //
     // No options: shell 50 dropped `affectsInputRegion` and derives the input
     // region from reactivity instead, and no marker actor is reactive.
     for (const actor of actors) {
-        Main.layoutManager.addChrome(actor);
+        Main.layoutManager.addTopChrome(actor);
     }
 }
 
