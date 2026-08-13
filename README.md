@@ -352,11 +352,12 @@ off the menu or close it.
 
 Build a macro by recording it (`Ctrl+Shift+R`), then open Settings to adjust it.
 Recorded steps go on the row you selected. Click any row in any macro and it is
-tinted to show it: a step, and the recording is dropped in right after it; an
-**Add step here** row inside a loop, or a **Yes** or **No** header, and the
+tinted blue to show it: a step, and the recording is dropped in right after it;
+an **Add step here** row inside a loop, or a **Yes** or **No** header, and the
 recording goes at the end of that
-body. Selecting nothing leaves **The end of the macro**, which is where a
-recording goes by default. Choose the body of a loop and a recording lands inside
+body. Having selected nothing, the first step of the macro is selected for you,
+which is where a run would start anyway; a macro with no steps yet leaves **The
+end of the macro**. Choose the body of a loop and a recording lands inside
 the loop instead of after it — which is what you want in a macro that is one
 endless loop, and until now meant recording at the end and moving every step in
 by hand. Appending to the end of a macro that never gets there still tells you

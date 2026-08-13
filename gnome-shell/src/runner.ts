@@ -14,7 +14,9 @@ import {
     EV_REL,
     KEY_CODES,
     REL_HWHEEL,
+    REL_HWHEEL_HI_RES,
     REL_WHEEL,
+    REL_WHEEL_HI_RES,
     REL_X,
     REL_Y,
     keyCode,
@@ -99,6 +101,28 @@ const MAX_MOVE_ITERATIONS = 12;
  */
 const SETTLE_BEFORE_CLICK_MS = 50;
 const PAUSE_POLL_MS = 120;
+/**
+ * One wheel click, in the 120ths a high-resolution wheel counts in.
+ *
+ * A wheel that can do fine steps reports every click twice — REL_WHEEL 1 and
+ * REL_WHEEL_HI_RES 120 in the same report — and the device we play through
+ * always says it can, because it inherits that from the mouse it was cloned
+ * from and would claim it anyway. Saying so and then sending only the coarse
+ * half is the one combination nothing listens to: libinput hands a device like
+ * that to no one, since the compositor takes the high-resolution scroll and
+ * ignores the legacy axis, and the shim that would fill the missing half in
+ * skips virtual devices. The click goes out, is read, and lands nowhere — no
+ * error, no warning, nothing on screen.
+ */
+const WHEEL_CLICK_V120 = 120;
+/**
+ * Between one wheel click and the next. A wheel turned by hand is a train of
+ * separate clicks tens of milliseconds apart, and what reads them often reads
+ * once a frame: fifty clicks in a single report is fifty to a browser and one
+ * to a game. Slow enough to be a turn of the wheel rather than a jump, quick
+ * enough that a hundred clicks is half a second.
+ */
+const SCROLL_CLICK_GAP_MS = 5;
 
 export class MacroRunner {
     private _daemon: DaemonClient;
@@ -790,14 +814,45 @@ export class MacroRunner {
         return false;
     }
 
+    /**
+     * Scroll, a click at a time: both halves of each click in one report, the
+     * next click a moment later, the way a wheel under a finger arrives.
+     */
     private async _doScroll(step: ScrollStep): Promise<void> {
+        const dx = Math.round(step.dx ?? 0);
+        const dy = Math.round(step.dy ?? 0);
+        const clicks = Math.max(Math.abs(dx), Math.abs(dy));
         const events: RawEvent[] = [];
-        if (step.dx) {
-            events.push({ dt: 0, type: EV_REL, code: REL_HWHEEL, value: Math.round(step.dx), syn: !step.dy });
+
+        for (let i = 0; i < clicks; i++) {
+            // A diagonal scroll stays diagonal: each report carries a click of
+            // whichever wheels still have travel left in them.
+            const x = i < Math.abs(dx) ? Math.sign(dx) : 0;
+            const y = i < Math.abs(dy) ? Math.sign(dy) : 0;
+            const report: RawEvent[] = [];
+            if (x) {
+                report.push({ dt: 0, type: EV_REL, code: REL_HWHEEL, value: x, syn: false });
+                report.push({
+                    dt: 0, type: EV_REL, code: REL_HWHEEL_HI_RES,
+                    value: x * WHEEL_CLICK_V120, syn: false,
+                });
+            }
+            if (y) {
+                report.push({ dt: 0, type: EV_REL, code: REL_WHEEL, value: y, syn: false });
+                report.push({
+                    dt: 0, type: EV_REL, code: REL_WHEEL_HI_RES,
+                    value: y * WHEEL_CLICK_V120, syn: false,
+                });
+            }
+            // The halves are one click said twice, so they close together: a SYN
+            // between them would be a click and then another click.
+            report[report.length - 1].syn = true;
+            if (events.length > 0) {
+                report[0].dt = SCROLL_CLICK_GAP_MS * 1000;
+            }
+            events.push(...report);
         }
-        if (step.dy) {
-            events.push({ dt: 0, type: EV_REL, code: REL_WHEEL, value: Math.round(step.dy), syn: true });
-        }
+
         await this._play(events);
     }
 
