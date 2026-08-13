@@ -75,6 +75,13 @@ struct captured_device {
     char realname[256];   // what the device called itself when it was opened
     char clone_node[32];  // the clone's /dev/input/eventN node
     bool watched;         // something other than us is reading the clone
+    // Who was reading it, and on which of their descriptors, when we last
+    // looked. Somebody still holding that exact descriptor open is the answer
+    // to "is this clone watched" for the price of one readlink — see
+    // scan_clone_watchers, which otherwise reads every descriptor on the
+    // machine.
+    pid_t watcher_pid;
+    int watcher_fd;
     int forward_failures; // forwards that failed and forced an ungrab
     bool grab_denied;     // last grab attempt failed; logged once, retried quietly
     bool grab_deferred;   // waiting for a held key before grabbing; logged once
@@ -1425,9 +1432,48 @@ static void rescan(bool verbose) {
  * clones inside the kernel, invisibly to this scan, which is fine: with no
  * userspace reader there is no session to protect and no grab to want).
  */
+/**
+ * Is the reader we found last time still on the same descriptor? A process may
+ * close an fd and have the number handed to something else, so the answer has
+ * to be what that descriptor points at now, not merely that it exists.
+ */
+static bool watcher_still_reading(const struct captured_device *d) {
+    if (d->watcher_pid <= 0 || d->clone_node[0] == '\0') {
+        return false;
+    }
+    char link[64], target[64];
+    snprintf(link, sizeof link, "/proc/%d/fd/%d", (int)d->watcher_pid, d->watcher_fd);
+    ssize_t n = readlink(link, target, sizeof target - 1);
+    if (n <= 0) {
+        return false;
+    }
+    target[n] = '\0';
+    return strcmp(target, d->clone_node) == 0;
+}
+
 static void scan_clone_watchers(void) {
     bool watched[MAX_DEVICES] = { false };
+    pid_t watcher_pid[MAX_DEVICES] = { 0 };
+    int watcher_fd[MAX_DEVICES] = { 0 };
     const pid_t self = getpid();
+
+    // The walk below reads every open descriptor on the machine, and it runs
+    // once a second forever. On a desktop that is thousands of readlinks a
+    // second to re-learn something that changes when a session starts or ends:
+    // measurably, most of what this daemon ever costs. So ask the cheap
+    // question first — are the readers we already know about still there — and
+    // walk only when the answer is no, which is at startup and when a session
+    // goes away. Nothing new can appear while every clone already has a reader:
+    // a second reader of the same clone changes no answer here.
+    bool all_still_read = true;
+    for (int i = 0; i < device_count && all_still_read; i++) {
+        if (devices[i].clone_node[0] != '\0' && !watcher_still_reading(&devices[i])) {
+            all_still_read = false;
+        }
+    }
+    if (all_still_read && device_count > 0) {
+        return;
+    }
 
     DIR *proc = opendir("/proc");
     if (!proc) {
@@ -1464,6 +1510,9 @@ static void scan_clone_watchers(void) {
                 if (devices[i].clone_node[0] != '\0' &&
                     strcmp(target, devices[i].clone_node) == 0) {
                     watched[i] = true;
+                    // Where to look next time instead of doing any of this.
+                    watcher_pid[i] = (pid_t)pid;
+                    watcher_fd[i] = (int)strtol(fdentry->d_name, NULL, 10);
                 }
             }
         }
@@ -1474,6 +1523,8 @@ static void scan_clone_watchers(void) {
     pthread_mutex_lock(&devices_mutex);
     for (int i = 0; i < device_count; i++) {
         devices[i].watched = watched[i];
+        devices[i].watcher_pid = watcher_pid[i];
+        devices[i].watcher_fd = watcher_fd[i];
     }
     pthread_mutex_unlock(&devices_mutex);
 }

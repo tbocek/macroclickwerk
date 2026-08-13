@@ -457,6 +457,8 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
     // "end:<macroId>" is the end of a macro, "after:<stepId>" a step,
     // "in:<stepId>:<branch>" a body.
     private _targetRows = new Map<string, Gtk.Widget>();
+    /** The same rows, by widget: what `_innermostRow` tests a press against. */
+    private _selectableRows = new Set<Gtk.Widget>();
     private _recordControls: Gtk.Widget[] = [];
     /** Shared dropdown models: the choices never differ between rows. */
     private _stepKindsModel?: Gtk.StringList;
@@ -943,6 +945,7 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
         // Every row just went away, so nothing is highlighted any more either.
         this._stepRows.clear();
         this._targetRows.clear();
+        this._selectableRows.clear();
         this._markedRow = undefined;
         this._runButtons.clear();
         this._stopButtons.clear();
@@ -1232,9 +1235,39 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
      */
     private _selectable(row: Gtk.Widget, target: string, macroId: string): void {
         const click = new Gtk.GestureClick({ button: Gdk.BUTTON_PRIMARY });
-        click.connect('pressed', () => this._selectTarget(macroId, target));
+        click.connect('pressed', (_gesture, _presses, x: number, y: number) => {
+            if (this._innermostRow(row, x, y) === row) {
+                this._selectTarget(macroId, target);
+            }
+        });
         row.add_controller(click);
         this._targetRows.set(target, row);
+        this._selectableRows.add(row);
+    }
+
+    /**
+     * Of the rows a press landed in, the one actually pointed at.
+     *
+     * Rows contain rows — the steps of a loop body are children of the loop's
+     * own row — so one press runs the gesture on every row it is inside, in
+     * that order, and the outermost has the last word. That is how clicking a
+     * wait marked the loop three levels above it instead.
+     *
+     * Settled by asking what is under the pointer rather than by claiming the
+     * press: a claim here would be taking it from the drag that starts on the
+     * grip and from the chevron that folds a body, which are the two things on
+     * a row that answer to being held rather than tapped. So every row the
+     * press passes through asks this, and all but the nearest stand aside.
+     */
+    private _innermostRow(row: Gtk.Widget, x: number, y: number): Gtk.Widget | null {
+        let widget = row.pick(x, y, Gtk.PickFlags.DEFAULT);
+        while (widget) {
+            if (this._selectableRows.has(widget)) {
+                return widget;
+            }
+            widget = widget.get_parent();
+        }
+        return null;
     }
 
     /**

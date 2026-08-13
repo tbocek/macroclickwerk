@@ -197,8 +197,11 @@ journal to say so. `journalctl -u macroclickwerk -f` shows `captured`, `reattach
 and `detached` as they happen.
 
 The daemon takes an exclusive grab on those devices — but only while something
-else is actually reading the clone, which it checks once a second by looking
-for the clone's node in `/proc/*/fd`. Grabbing reroutes a device through this
+else is actually reading the clone, which it checks once a second. Usually that
+costs one `readlink` per device, against the exact descriptor the reader was
+found on last time; only when a clone has no reader does it walk `/proc/*/fd`
+looking for one, which is at startup and after a session ends. Grabbing
+reroutes a device through this
 process, so it never happens on faith: at boot, before any compositor is up,
 nothing is grabbed and input flows directly; when the session's compositor
 picks the clones up, the grabs engage; when it goes away, they let go. A
