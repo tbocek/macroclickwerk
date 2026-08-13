@@ -172,6 +172,12 @@ export class MacroRunner {
      * two different things to fix.
      */
     private _warnedEmptyLoops = new Set<string>();
+    /**
+     * Buttons and keys this run has put down and not lifted: the down half of a
+     * press split across steps, and the modifiers held around a key. In the
+     * order they went down, so they can come up in the other one.
+     */
+    private _held = new Set<number>();
 
     constructor(
         daemon: DaemonClient,
@@ -258,6 +264,7 @@ export class MacroRunner {
         this._prevPinned = false;
         this._inputEdge = null;
         this._warnedEmptyLoops.clear();
+        this._held.clear();
         this._resume = resumeAt ? pathToStep(macro.body, resumeAt) : [];
         this._callbacks.onRunningChanged?.(true);
 
@@ -284,6 +291,7 @@ export class MacroRunner {
             } else {
                 reason = 'error';
                 failure = error as Error;
+                await this._releaseHeld();
                 reportProblem('Macro', `“${macro.name}” stopped: ${failure.message}`, {
                     where: this._failedAt,
                     error: failure,
@@ -332,6 +340,7 @@ export class MacroRunner {
         } catch (error) {
             result = { ok: false, message: (error as Error).message };
             this._status(`Failed: ${result.message}`);
+            await this._releaseHeld();
             reportProblem('Step', result.message, {
                 where: describeStep(step, this._callbacks.macroName),
                 error: error as Error,
@@ -343,6 +352,39 @@ export class MacroRunner {
             this._callbacks.onRunningChanged?.(false);
         }
         return result;
+    }
+
+    /**
+     * Let go of whatever this run still has down.
+     *
+     * A run that ends by failing has no steps left to reach its own release
+     * with, and a button left down is not a line in a log: it is a mouse button
+     * that is still held on the desktop. A game reads that as the drag going on
+     * — the pointer stays grabbed for as long as it does, which means the next
+     * run cannot move the pointer either, and fails in the same place, and
+     * leaves the same button down. One failed step turns into a macro that can
+     * never run again until something lets go.
+     *
+     * Only what this run pressed. The daemon's own stop lifts every key on the
+     * machine, which is right for the panic shortcut and wrong here, where
+     * another macro may be halfway through holding something of its own.
+     */
+    private async _releaseHeld(): Promise<void> {
+        const codes = [...this._held].reverse();
+        this._held.clear();
+        if (codes.length === 0) {
+            return;
+        }
+        try {
+            // Straight to the daemon: `_play` gives up once the run is
+            // cancelled, and this is the one train that has to go out anyway.
+            await this._daemon.play(codes.map(code => ({ dt: 0, type: EV_KEY, code, value: 0 })));
+        } catch (error) {
+            reportProblem('Daemon', `could not release a held button: ${(error as Error).message}`, {
+                hint: 'A mouse button or key the macro pressed may still be down. Press the ' +
+                    'panic shortcut to let go of it.',
+            });
+        }
     }
 
     /**
@@ -603,13 +645,22 @@ export class MacroRunner {
         const code = BUTTON_CODES[step.button] ?? BUTTON_CODES.left;
         const hold = Math.max(0, step.holdMs ?? 20) * 1000;
         const action = this._pressAction(step.action);
-        const press = (via?: Playback) => this._play(
-            action === 'tap' ? [
-                { dt: 0, type: EV_KEY, code, value: 1 },
-                { dt: hold, type: EV_KEY, code, value: 0 },
-            ] : [
-                { dt: 0, type: EV_KEY, code, value: action === 'down' ? 1 : 0 },
-            ], via);
+        const press = async (via?: Playback) => {
+            await this._play(
+                action === 'tap' ? [
+                    { dt: 0, type: EV_KEY, code, value: 1 },
+                    { dt: hold, type: EV_KEY, code, value: 0 },
+                ] : [
+                    { dt: 0, type: EV_KEY, code, value: action === 'down' ? 1 : 0 },
+                ], via);
+            // A tap is its own release and leaves nothing behind; the halves
+            // are what a failed run has to be able to undo.
+            if (action === 'down') {
+                this._held.add(code);
+            } else if (action === 'up') {
+                this._held.delete(code);
+            }
+        };
 
         if (step.mode === 'current') {
             await press();
@@ -888,6 +939,21 @@ export class MacroRunner {
         }
 
         await this._play(events);
+
+        // A 'down' leaves the key and everything held around it down; an 'up'
+        // is what was going to lift them. See `_releaseHeld` for what happens
+        // when the step that would have lifted them is never reached.
+        if (action === 'down') {
+            for (const mod of mods) {
+                this._held.add(mod);
+            }
+            this._held.add(code);
+        } else if (action === 'up') {
+            this._held.delete(code);
+            for (const mod of mods) {
+                this._held.delete(mod);
+            }
+        }
     }
 
     private async _doText(step: TextStep): Promise<void> {
