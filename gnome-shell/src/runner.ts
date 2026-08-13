@@ -14,7 +14,9 @@ import {
     EV_REL,
     KEY_CODES,
     REL_HWHEEL,
+    REL_HWHEEL_HI_RES,
     REL_WHEEL,
+    REL_WHEEL_HI_RES,
     REL_X,
     REL_Y,
     keyCode,
@@ -99,6 +101,40 @@ const MAX_MOVE_ITERATIONS = 12;
  */
 const SETTLE_BEFORE_CLICK_MS = 50;
 const PAUSE_POLL_MS = 120;
+/**
+ * How far a nudge has to ask for before what came of it says anything about the
+ * acceleration curve. Under this, rounding and the pointer's own sub-pixel
+ * position are most of the answer.
+ */
+const MEASURABLE_NUDGE_PX = 8;
+/**
+ * A ceiling on how much of a multiplier the walk will believe. Acceleration
+ * curves top out at a few times; anything past this is something else moving
+ * the pointer, and dividing by it would leave the walk creeping.
+ */
+const MAX_POINTER_GAIN = 6;
+/**
+ * One wheel click, in the 120ths a high-resolution wheel counts in.
+ *
+ * A wheel that can do fine steps reports every click twice — REL_WHEEL 1 and
+ * REL_WHEEL_HI_RES 120 in the same report — and the device we play through
+ * always says it can, because it inherits that from the mouse it was cloned
+ * from and would claim it anyway. Saying so and then sending only the coarse
+ * half is the one combination nothing listens to: libinput hands a device like
+ * that to no one, since the compositor takes the high-resolution scroll and
+ * ignores the legacy axis, and the shim that would fill the missing half in
+ * skips virtual devices. The click goes out, is read, and lands nowhere — no
+ * error, no warning, nothing on screen.
+ */
+const WHEEL_CLICK_V120 = 120;
+/**
+ * Between one wheel click and the next. A wheel turned by hand is a train of
+ * separate clicks tens of milliseconds apart, and what reads them often reads
+ * once a frame: fifty clicks in a single report is fifty to a browser and one
+ * to a game. Slow enough to be a turn of the wheel rather than a jump, quick
+ * enough that a hundred clicks is half a second.
+ */
+const SCROLL_CLICK_GAP_MS = 5;
 
 export class MacroRunner {
     private _daemon: DaemonClient;
@@ -148,6 +184,12 @@ export class MacroRunner {
      * two different things to fix.
      */
     private _warnedEmptyLoops = new Set<string>();
+    /**
+     * Buttons and keys this run has put down and not lifted: the down half of a
+     * press split across steps, and the modifiers held around a key. In the
+     * order they went down, so they can come up in the other one.
+     */
+    private _held = new Set<number>();
 
     constructor(
         daemon: DaemonClient,
@@ -234,6 +276,7 @@ export class MacroRunner {
         this._prevPinned = false;
         this._inputEdge = null;
         this._warnedEmptyLoops.clear();
+        this._held.clear();
         this._resume = resumeAt ? pathToStep(macro.body, resumeAt) : [];
         this._callbacks.onRunningChanged?.(true);
 
@@ -260,6 +303,7 @@ export class MacroRunner {
             } else {
                 reason = 'error';
                 failure = error as Error;
+                await this._releaseHeld();
                 reportProblem('Macro', `“${macro.name}” stopped: ${failure.message}`, {
                     where: this._failedAt,
                     error: failure,
@@ -308,6 +352,7 @@ export class MacroRunner {
         } catch (error) {
             result = { ok: false, message: (error as Error).message };
             this._status(`Failed: ${result.message}`);
+            await this._releaseHeld();
             reportProblem('Step', result.message, {
                 where: describeStep(step, this._callbacks.macroName),
                 error: error as Error,
@@ -319,6 +364,39 @@ export class MacroRunner {
             this._callbacks.onRunningChanged?.(false);
         }
         return result;
+    }
+
+    /**
+     * Let go of whatever this run still has down.
+     *
+     * A run that ends by failing has no steps left to reach its own release
+     * with, and a button left down is not a line in a log: it is a mouse button
+     * that is still held on the desktop. A game reads that as the drag going on
+     * — the pointer stays grabbed for as long as it does, which means the next
+     * run cannot move the pointer either, and fails in the same place, and
+     * leaves the same button down. One failed step turns into a macro that can
+     * never run again until something lets go.
+     *
+     * Only what this run pressed. The daemon's own stop lifts every key on the
+     * machine, which is right for the panic shortcut and wrong here, where
+     * another macro may be halfway through holding something of its own.
+     */
+    private async _releaseHeld(): Promise<void> {
+        const codes = [...this._held].reverse();
+        this._held.clear();
+        if (codes.length === 0) {
+            return;
+        }
+        try {
+            // Straight to the daemon: `_play` gives up once the run is
+            // cancelled, and this is the one train that has to go out anyway.
+            await this._daemon.play(codes.map(code => ({ dt: 0, type: EV_KEY, code, value: 0 })));
+        } catch (error) {
+            reportProblem('Daemon', `could not release a held button: ${(error as Error).message}`, {
+                hint: 'A mouse button or key the macro pressed may still be down. Press the ' +
+                    'panic shortcut to let go of it.',
+            });
+        }
     }
 
     /**
@@ -579,13 +657,22 @@ export class MacroRunner {
         const code = BUTTON_CODES[step.button] ?? BUTTON_CODES.left;
         const hold = Math.max(0, step.holdMs ?? 20) * 1000;
         const action = this._pressAction(step.action);
-        const press = (via?: Playback) => this._play(
-            action === 'tap' ? [
-                { dt: 0, type: EV_KEY, code, value: 1 },
-                { dt: hold, type: EV_KEY, code, value: 0 },
-            ] : [
-                { dt: 0, type: EV_KEY, code, value: action === 'down' ? 1 : 0 },
-            ], via);
+        const press = async (via?: Playback) => {
+            await this._play(
+                action === 'tap' ? [
+                    { dt: 0, type: EV_KEY, code, value: 1 },
+                    { dt: hold, type: EV_KEY, code, value: 0 },
+                ] : [
+                    { dt: 0, type: EV_KEY, code, value: action === 'down' ? 1 : 0 },
+                ], via);
+            // A tap is its own release and leaves nothing behind; the halves
+            // are what a failed run has to be able to undo.
+            if (action === 'down') {
+                this._held.add(code);
+            } else if (action === 'up') {
+                this._held.delete(code);
+            }
+        };
 
         if (step.mode === 'current') {
             await press();
@@ -734,12 +821,21 @@ export class MacroRunner {
             }
         }
 
-        // The walk is a closed loop — every pass measures and re-aims — so it
-        // absorbs a scale factor or an acceleration curve on its own: those
-        // overshoot by a proportion, and a proportion of a shrinking error
-        // shrinks. What it cannot absorb is being pinned. A pointer held by
+        // The walk is a closed loop — every pass measures and re-aims — but a
+        // loop only closes if each correction is smaller than the error it
+        // corrects, and pointer acceleration is what decides that. Ask for the
+        // whole remaining distance in one nudge and the compositor reads that
+        // as a fast movement and multiplies it: aim 1200 to the left, travel
+        // 3000, and the correction back is larger than the error was. An
+        // overshoot of more than double never settles — the pointer swings past
+        // the target, then past it the other way, until the stall check calls
+        // it held. So what a nudge is actually worth is measured rather than
+        // assumed, and the next one is divided by it.
+        //
+        // What the loop still cannot absorb is being pinned. A pointer held by
         // something else stops at the same spot pass after pass, and the
         // distance left over stops falling.
+        let gain = 1;
         let stalled = 0;
         let previous = Number.POSITIVE_INFINITY;
         for (let i = 0; i < MAX_MOVE_ITERATIONS; i++) {
@@ -762,8 +858,22 @@ export class MacroRunner {
                 break;
             }
             previous = distance;
-            await this._playRelative(dx, dy, via);
+            const askX = Math.round(dx / gain);
+            const askY = Math.round(dy / gain);
+            await this._playRelative(askX, askY, via);
             await this._sleep(6);
+
+            // Only ever raised, and only by a nudge big enough to have measured
+            // anything. A nudge that fell short did not do so because the
+            // pointer is slow: it ran into an edge or into whatever is holding
+            // it, and dividing the next one by less than one would answer that
+            // by asking for several times the distance left.
+            const [ax, ay] = global.get_pointer();
+            const asked = Math.abs(askX) + Math.abs(askY);
+            const moved = Math.abs(ax - px) + Math.abs(ay - py);
+            if (asked >= MEASURABLE_NUDGE_PX && moved > asked) {
+                gain = Math.min(MAX_POINTER_GAIN, moved / asked);
+            }
         }
 
         // The loop checks before nudging, so the last nudge of all would go
@@ -790,14 +900,45 @@ export class MacroRunner {
         return false;
     }
 
+    /**
+     * Scroll, a click at a time: both halves of each click in one report, the
+     * next click a moment later, the way a wheel under a finger arrives.
+     */
     private async _doScroll(step: ScrollStep): Promise<void> {
+        const dx = Math.round(step.dx ?? 0);
+        const dy = Math.round(step.dy ?? 0);
+        const clicks = Math.max(Math.abs(dx), Math.abs(dy));
         const events: RawEvent[] = [];
-        if (step.dx) {
-            events.push({ dt: 0, type: EV_REL, code: REL_HWHEEL, value: Math.round(step.dx), syn: !step.dy });
+
+        for (let i = 0; i < clicks; i++) {
+            // A diagonal scroll stays diagonal: each report carries a click of
+            // whichever wheels still have travel left in them.
+            const x = i < Math.abs(dx) ? Math.sign(dx) : 0;
+            const y = i < Math.abs(dy) ? Math.sign(dy) : 0;
+            const report: RawEvent[] = [];
+            if (x) {
+                report.push({ dt: 0, type: EV_REL, code: REL_HWHEEL, value: x, syn: false });
+                report.push({
+                    dt: 0, type: EV_REL, code: REL_HWHEEL_HI_RES,
+                    value: x * WHEEL_CLICK_V120, syn: false,
+                });
+            }
+            if (y) {
+                report.push({ dt: 0, type: EV_REL, code: REL_WHEEL, value: y, syn: false });
+                report.push({
+                    dt: 0, type: EV_REL, code: REL_WHEEL_HI_RES,
+                    value: y * WHEEL_CLICK_V120, syn: false,
+                });
+            }
+            // The halves are one click said twice, so they close together: a SYN
+            // between them would be a click and then another click.
+            report[report.length - 1].syn = true;
+            if (events.length > 0) {
+                report[0].dt = SCROLL_CLICK_GAP_MS * 1000;
+            }
+            events.push(...report);
         }
-        if (step.dy) {
-            events.push({ dt: 0, type: EV_REL, code: REL_WHEEL, value: Math.round(step.dy), syn: true });
-        }
+
         await this._play(events);
     }
 
@@ -833,6 +974,21 @@ export class MacroRunner {
         }
 
         await this._play(events);
+
+        // A 'down' leaves the key and everything held around it down; an 'up'
+        // is what was going to lift them. See `_releaseHeld` for what happens
+        // when the step that would have lifted them is never reached.
+        if (action === 'down') {
+            for (const mod of mods) {
+                this._held.add(mod);
+            }
+            this._held.add(code);
+        } else if (action === 'up') {
+            this._held.delete(code);
+            for (const mod of mods) {
+                this._held.delete(mod);
+            }
+        }
     }
 
     private async _doText(step: TextStep): Promise<void> {

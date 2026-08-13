@@ -197,8 +197,11 @@ journal to say so. `journalctl -u macroclickwerk -f` shows `captured`, `reattach
 and `detached` as they happen.
 
 The daemon takes an exclusive grab on those devices — but only while something
-else is actually reading the clone, which it checks once a second by looking
-for the clone's node in `/proc/*/fd`. Grabbing reroutes a device through this
+else is actually reading the clone, which it checks once a second. Usually that
+costs one `readlink` per device, against the exact descriptor the reader was
+found on last time; only when a clone has no reader does it walk `/proc/*/fd`
+looking for one, which is at startup and after a session ends. Grabbing
+reroutes a device through this
 process, so it never happens on faith: at boot, before any compositor is up,
 nothing is grabbed and input flows directly; when the session's compositor
 picks the clones up, the grabs engage; when it goes away, they let go. A
@@ -326,7 +329,11 @@ the step it was on, so the switch reads **Continue** and the next press picks up
 there rather than at the top. Several at once are in several places and there is
 only one mark, so rather than be wrong about which, the next press starts them
 all from the top. **Stop** in the popup, and the emergency shortcut, throw the
-place away too.
+place away too, and so does the ■ beside a macro's name in the editor. That one
+stands next to the ▶ whether or not anything is running, because the half of it
+that puts the selection back on the first step is worth pressing on its own:
+it is how you say "start from the beginning again" to a macro you last ran
+halfway through.
 
 You can also choose the step yourself: select it. The selected row is the one
 mark the editor has — a recording lands there, and a run starts there — so
@@ -352,11 +359,12 @@ off the menu or close it.
 
 Build a macro by recording it (`Ctrl+Shift+R`), then open Settings to adjust it.
 Recorded steps go on the row you selected. Click any row in any macro and it is
-tinted to show it: a step, and the recording is dropped in right after it; an
-**Add step here** row inside a loop, or a **Yes** or **No** header, and the
+tinted blue to show it: a step, and the recording is dropped in right after it;
+an **Add step here** row inside a loop, or a **Yes** or **No** header, and the
 recording goes at the end of that
-body. Selecting nothing leaves **The end of the macro**, which is where a
-recording goes by default. Choose the body of a loop and a recording lands inside
+body. Having selected nothing, the first step of the macro is selected for you,
+which is where a run would start anyway; a macro with no steps yet leaves **The
+end of the macro**. Choose the body of a loop and a recording lands inside
 the loop instead of after it — which is what you want in a macro that is one
 endless loop, and until now meant recording at the end and moving every step in
 by hand. Appending to the end of a macro that never gets there still tells you

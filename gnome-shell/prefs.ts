@@ -288,15 +288,26 @@ const EDITOR_CSS = `
 .macroclickwerk-running-icon { color: @accent_bg_color; }
 .macroclickwerk-running-parent-icon { color: alpha(@accent_bg_color, 0.7); }
 
-/* Where recorded steps land. Faint while it is only a choice; unmistakable
-   while the recording is actually running and the next click goes in here. A
-   row that opens gets the rail only — a fill would run down everything inside
-   it and read as though all of that were selected too. */
+/* The selected row: where Run starts and where recorded steps land. The same
+   blue as the running step, quieter — one is where the run is now, the other
+   where the next one begins, and they are the same idea a beat apart. Red
+   instead while the recording is actually running and the next click goes in
+   here. A row that opens gets the rail only — a fill would run down everything
+   inside it and read as though all of that were selected too. */
 .macroclickwerk-record-target {
-    background-color: alpha(@error_color, 0.10);
-    box-shadow: inset 4px 0 0 alpha(@error_color, 0.55);
+    background-color: alpha(@accent_bg_color, 0.13);
+    box-shadow: inset 4px 0 0 alpha(@accent_bg_color, 0.65);
 }
-.macroclickwerk-record-target-block { box-shadow: inset 4px 0 0 alpha(@error_color, 0.55); }
+.macroclickwerk-record-target-block { box-shadow: inset 4px 0 0 alpha(@accent_bg_color, 0.65); }
+/* A rail alone is easy to miss on a row that already has one for the branch it
+   is in, so a row that opens is filled too — but only across its own header.
+   That is the line you pointed at; what it holds is a list of other lines, each
+   of which can be selected on its own. libadwaita builds an expander as
+   row.expander > box > list > row.header, and the body it reveals is in the
+   sibling the selector stops short of. */
+.macroclickwerk-record-target-block > box > list > row.header {
+    background-color: alpha(@accent_bg_color, 0.13);
+}
 .macroclickwerk-recording-now {
     background-color: alpha(@error_color, 0.28);
     box-shadow: inset 4px 0 0 @error_color;
@@ -443,10 +454,8 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
     private _highlighted: string[] = [];
     /** Settings watchers held for the life of the window, dropped when it closes. */
     private _watchers: number[] = [];
-    /** The ▶/■ beside each macro's name, by macro id. */
+    /** The ▶ beside each macro's name, by macro id: it becomes a pause. */
     private _runButtons = new Map<string, Gtk.Button>();
-    /** The Stop beside each ▶, shown only while that macro is running. */
-    private _stopButtons = new Map<string, Gtk.Button>();
 
     // The selected row: click one and a recording goes there, and the macro
     // holding it continues from there. One across the whole page, in whichever
@@ -455,6 +464,8 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
     // "end:<macroId>" is the end of a macro, "after:<stepId>" a step,
     // "in:<stepId>:<branch>" a body.
     private _targetRows = new Map<string, Gtk.Widget>();
+    /** The same rows, by widget: what `_innermostRow` tests a press against. */
+    private _selectableRows = new Set<Gtk.Widget>();
     private _recordControls: Gtk.Widget[] = [];
     /** Shared dropdown models: the choices never differ between rows. */
     private _stepKindsModel?: Gtk.StringList;
@@ -941,9 +952,9 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
         // Every row just went away, so nothing is highlighted any more either.
         this._stepRows.clear();
         this._targetRows.clear();
+        this._selectableRows.clear();
         this._markedRow = undefined;
         this._runButtons.clear();
-        this._stopButtons.clear();
         this._recordControls = [];
         this._branchRows.clear();
         this._highlighted = [];
@@ -1027,11 +1038,6 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
         for (const [macroId, button] of this._runButtons) {
             this._setRunButton(button, running.has(macroId));
         }
-        // Nothing to stop until something runs, so the button is not there to
-        // be pressed — the same rule the panel's Stop item follows.
-        for (const [macroId, button] of this._stopButtons) {
-            button.set_visible(running.has(macroId));
-        }
     }
 
     private _setRunButton(button: Gtk.Button, running: boolean): void {
@@ -1056,19 +1062,31 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
     }
 
     /**
-     * Paint the list a recording goes into, and turn it red while one is
-     * actually running — the point of showing it here at all is that the panel
-     * icon is a long way from the body you chose.
+     * Paint the mark: on the row Run starts from and a recording goes into,
+     * turning red while a recording is actually running — the point of showing
+     * it here at all is that the panel icon is a long way from the body you
+     * chose.
      */
     private _applyRecordTarget(): void {
         clearClasses(this._markedRow, RECORD_CLASSES);
 
-        // A selection nothing on the page answers to — none yet, or one left in a
-        // macro that has since gone — falls back to the end of the macro being
-        // worked on, which is where the shell would put a recording anyway.
+        // A selection nothing on the page answers to — none yet, or one left in
+        // a macro that has since gone — becomes the first step of the macro
+        // being worked on, so a macro opened for the first time says out loud
+        // that it starts at the top. Written back rather than only painted:
+        // this is the step Run begins at, and a mark shown on one row while the
+        // run obeys another would be worse than no mark at all.
+        const macro = this._store.activeMacro;
+        const first = macro?.body[0];
+        if (macro && first && !this._targetRows.has(this._settings.get_string('record-into'))) {
+            this._selectTarget(macro.id, `after:${first.id}`);
+        }
+
+        // A macro with nothing in it yet has only its "add step here" row to
+        // offer, which is where a recording would land anyway.
         const target = this._settings.get_string('record-into');
         const row = this._targetRows.get(target)
-            ?? this._targetRows.get(`end:${this._store.activeMacro?.id ?? ''}`);
+            ?? this._targetRows.get(`end:${macro?.id ?? ''}`);
         this._markedRow = row;
 
         const recording = this._settings.get_string('recording') !== '';
@@ -1205,15 +1223,64 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
     }
 
     /**
-     * Rows are not clicked into a selection any more — placing things is what
-     * dragging is for, and the roaming red mark repainted the rails on every
-     * click. But the mark itself still has moments: a paused run writes where
-     * it continues, a recording lands somewhere, and both are shown on the row
-     * in question. So rows only register under their target names here, for
-     * the painter to find.
+     * Register a row under its target name, for the painter to find, and make a
+     * click on it the selection. One mark with two jobs: it is where a
+     * recording lands, and it is the step Run starts from — so pointing at a
+     * row is how you say "start here", and the blue on it is the answer.
+     *
+     * On the default bubble phase, which is the whole difference from the last
+     * time rows took a click. A press that a button, a dropdown or an entry on
+     * the row has already claimed never reaches here, so nudging a spin button
+     * no longer drags the mark along with it — that roaming was why the click
+     * was taken away in the first place.
      */
-    private _selectable(row: Gtk.Widget, target: string, _macroId: string): void {
+    private _selectable(row: Gtk.Widget, target: string, macroId: string): void {
+        const click = new Gtk.GestureClick({ button: Gdk.BUTTON_PRIMARY });
+        click.connect('pressed', (_gesture, _presses, x: number, y: number) => {
+            if (this._innermostRow(row, x, y) === row) {
+                this._selectTarget(macroId, target);
+            }
+        });
+        row.add_controller(click);
         this._targetRows.set(target, row);
+        this._selectableRows.add(row);
+    }
+
+    /**
+     * Of the rows a press landed in, the one actually pointed at.
+     *
+     * Rows contain rows — the steps of a loop body are children of the loop's
+     * own row — so one press runs the gesture on every row it is inside, in
+     * that order, and the outermost has the last word. That is how clicking a
+     * wait marked the loop three levels above it instead.
+     *
+     * Settled by asking what is under the pointer rather than by claiming the
+     * press: a claim here would be taking it from the drag that starts on the
+     * grip and from the chevron that folds a body, which are the two things on
+     * a row that answer to being held rather than tapped. So every row the
+     * press passes through asks this, and all but the nearest stand aside.
+     */
+    private _innermostRow(row: Gtk.Widget, x: number, y: number): Gtk.Widget | null {
+        let widget = row.pick(x, y, Gtk.PickFlags.DEFAULT);
+        while (widget) {
+            if (this._selectableRows.has(widget)) {
+                return widget;
+            }
+            widget = widget.get_parent();
+        }
+        return null;
+    }
+
+    /**
+     * Put the mark back on a macro's first step — where a run starts when it
+     * has not been told otherwise. Said in the editor rather than left to the
+     * shell's own forgetting, so the blue lands on the macro whose button was
+     * pressed rather than on whichever one was last worked on. A macro with no
+     * steps has only its end to point at.
+     */
+    private _selectTop(macro: Macro): void {
+        const first = macro.body[0];
+        this._selectTarget(macro.id, first ? `after:${first.id}` : `end:${macro.id}`);
     }
 
     /**
@@ -1388,14 +1455,19 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
                 this._runningMacroIds().includes(macro.id) ? 'pause' : 'run'));
         this._runButtons.set(macro.id, runButton);
 
-        // Beside it only while there is something to stop. Both end the run;
-        // the difference is where the next ▶ begins — here, or at the top —
-        // and that is a choice worth two buttons rather than one that guesses.
+        // Beside it always, not only while something is running. Both buttons
+        // end a run; the difference is where the next ▶ begins — here, or at
+        // the top — and that is a choice worth two buttons rather than one that
+        // guesses. Left standing when nothing is running because the second
+        // half of what it does still applies: it is how you say "back to the
+        // top" to a macro you last ran halfway through, without hunting for the
+        // first row to click on.
         const stopButton = iconButton('media-playback-stop-symbolic',
-            _('Stop — the next ▶ starts from the top'),
-            () => this._runMacroNow(macro.id, 'stop'));
-        stopButton.set_visible(this._runningMacroIds().includes(macro.id));
-        this._stopButtons.set(macro.id, stopButton);
+            _('Stop — ends the run, and the next ▶ starts from the top'),
+            () => {
+                this._runMacroNow(macro.id, 'stop');
+                this._selectTop(macro);
+            });
 
         const enabled = new Gtk.Switch({
             active: macroEnabled(macro),

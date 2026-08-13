@@ -124,6 +124,12 @@ function magnitudeOf(value: number): number {
  * the finer the value, the finer the nudge. Off-band values round onto the
  * band in the direction pressed, and crossing a boundary lands exactly on it:
  * down from 100 is 90, not 0.
+ *
+ * Zero is a boundary like the rest, not a floor: − at 0 is −1, the mirror of +
+ * at 0 being 1. What a field may hold is its own range's business — one that
+ * counts milliseconds stops at 0 because it is bounded there, and a scroll,
+ * which is signed, carries on down. A step that refused to go below 0 left the
+ * only way into a negative number being to type it.
  */
 function bandedUp(value: number): number {
     if (value < 0) {
@@ -141,7 +147,7 @@ function bandedDown(value: number): number {
         return -bandedUp(-value);
     }
     if (value <= 1) {
-        return 0;
+        return value - 1;
     }
     const step = magnitudeOf(Math.max(value - 1, 1));
     return (Math.ceil(value / step - 1e-9) - 1) * step;

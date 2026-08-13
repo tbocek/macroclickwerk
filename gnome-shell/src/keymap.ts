@@ -12,6 +12,10 @@ export const REL_X = 0;
 export const REL_Y = 1;
 export const REL_HWHEEL = 6;
 export const REL_WHEEL = 8;
+// The same two wheels said in 120ths of a click. Modern mice report both halves
+// of every click, and so must we: see WHEEL_CLICK_V120 in the runner.
+export const REL_WHEEL_HI_RES = 11;
+export const REL_HWHEEL_HI_RES = 12;
 
 export const BTN_LEFT = 0x110;
 export const BTN_RIGHT = 0x111;
