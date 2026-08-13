@@ -329,7 +329,11 @@ the step it was on, so the switch reads **Continue** and the next press picks up
 there rather than at the top. Several at once are in several places and there is
 only one mark, so rather than be wrong about which, the next press starts them
 all from the top. **Stop** in the popup, and the emergency shortcut, throw the
-place away too.
+place away too, and so does the ■ beside a macro's name in the editor. That one
+stands next to the ▶ whether or not anything is running, because the half of it
+that puts the selection back on the first step is worth pressing on its own:
+it is how you say "start from the beginning again" to a macro you last ran
+halfway through.
 
 You can also choose the step yourself: select it. The selected row is the one
 mark the editor has — a recording lands there, and a run starts there — so

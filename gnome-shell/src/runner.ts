@@ -102,6 +102,18 @@ const MAX_MOVE_ITERATIONS = 12;
 const SETTLE_BEFORE_CLICK_MS = 50;
 const PAUSE_POLL_MS = 120;
 /**
+ * How far a nudge has to ask for before what came of it says anything about the
+ * acceleration curve. Under this, rounding and the pointer's own sub-pixel
+ * position are most of the answer.
+ */
+const MEASURABLE_NUDGE_PX = 8;
+/**
+ * A ceiling on how much of a multiplier the walk will believe. Acceleration
+ * curves top out at a few times; anything past this is something else moving
+ * the pointer, and dividing by it would leave the walk creeping.
+ */
+const MAX_POINTER_GAIN = 6;
+/**
  * One wheel click, in the 120ths a high-resolution wheel counts in.
  *
  * A wheel that can do fine steps reports every click twice — REL_WHEEL 1 and
@@ -809,12 +821,21 @@ export class MacroRunner {
             }
         }
 
-        // The walk is a closed loop — every pass measures and re-aims — so it
-        // absorbs a scale factor or an acceleration curve on its own: those
-        // overshoot by a proportion, and a proportion of a shrinking error
-        // shrinks. What it cannot absorb is being pinned. A pointer held by
+        // The walk is a closed loop — every pass measures and re-aims — but a
+        // loop only closes if each correction is smaller than the error it
+        // corrects, and pointer acceleration is what decides that. Ask for the
+        // whole remaining distance in one nudge and the compositor reads that
+        // as a fast movement and multiplies it: aim 1200 to the left, travel
+        // 3000, and the correction back is larger than the error was. An
+        // overshoot of more than double never settles — the pointer swings past
+        // the target, then past it the other way, until the stall check calls
+        // it held. So what a nudge is actually worth is measured rather than
+        // assumed, and the next one is divided by it.
+        //
+        // What the loop still cannot absorb is being pinned. A pointer held by
         // something else stops at the same spot pass after pass, and the
         // distance left over stops falling.
+        let gain = 1;
         let stalled = 0;
         let previous = Number.POSITIVE_INFINITY;
         for (let i = 0; i < MAX_MOVE_ITERATIONS; i++) {
@@ -837,8 +858,22 @@ export class MacroRunner {
                 break;
             }
             previous = distance;
-            await this._playRelative(dx, dy, via);
+            const askX = Math.round(dx / gain);
+            const askY = Math.round(dy / gain);
+            await this._playRelative(askX, askY, via);
             await this._sleep(6);
+
+            // Only ever raised, and only by a nudge big enough to have measured
+            // anything. A nudge that fell short did not do so because the
+            // pointer is slow: it ran into an edge or into whatever is holding
+            // it, and dividing the next one by less than one would answer that
+            // by asking for several times the distance left.
+            const [ax, ay] = global.get_pointer();
+            const asked = Math.abs(askX) + Math.abs(askY);
+            const moved = Math.abs(ax - px) + Math.abs(ay - py);
+            if (asked >= MEASURABLE_NUDGE_PX && moved > asked) {
+                gain = Math.min(MAX_POINTER_GAIN, moved / asked);
+            }
         }
 
         // The loop checks before nudging, so the last nudge of all would go

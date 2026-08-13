@@ -299,6 +299,15 @@ const EDITOR_CSS = `
     box-shadow: inset 4px 0 0 alpha(@accent_bg_color, 0.65);
 }
 .macroclickwerk-record-target-block { box-shadow: inset 4px 0 0 alpha(@accent_bg_color, 0.65); }
+/* A rail alone is easy to miss on a row that already has one for the branch it
+   is in, so a row that opens is filled too — but only across its own header.
+   That is the line you pointed at; what it holds is a list of other lines, each
+   of which can be selected on its own. libadwaita builds an expander as
+   row.expander > box > list > row.header, and the body it reveals is in the
+   sibling the selector stops short of. */
+.macroclickwerk-record-target-block > box > list > row.header {
+    background-color: alpha(@accent_bg_color, 0.13);
+}
 .macroclickwerk-recording-now {
     background-color: alpha(@error_color, 0.28);
     box-shadow: inset 4px 0 0 @error_color;
@@ -445,10 +454,8 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
     private _highlighted: string[] = [];
     /** Settings watchers held for the life of the window, dropped when it closes. */
     private _watchers: number[] = [];
-    /** The ▶/■ beside each macro's name, by macro id. */
+    /** The ▶ beside each macro's name, by macro id: it becomes a pause. */
     private _runButtons = new Map<string, Gtk.Button>();
-    /** The Stop beside each ▶, shown only while that macro is running. */
-    private _stopButtons = new Map<string, Gtk.Button>();
 
     // The selected row: click one and a recording goes there, and the macro
     // holding it continues from there. One across the whole page, in whichever
@@ -948,7 +955,6 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
         this._selectableRows.clear();
         this._markedRow = undefined;
         this._runButtons.clear();
-        this._stopButtons.clear();
         this._recordControls = [];
         this._branchRows.clear();
         this._highlighted = [];
@@ -1031,11 +1037,6 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
         const running = new Set(paths.map(entry => entry.macro));
         for (const [macroId, button] of this._runButtons) {
             this._setRunButton(button, running.has(macroId));
-        }
-        // Nothing to stop until something runs, so the button is not there to
-        // be pressed — the same rule the panel's Stop item follows.
-        for (const [macroId, button] of this._stopButtons) {
-            button.set_visible(running.has(macroId));
         }
     }
 
@@ -1271,6 +1272,18 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
     }
 
     /**
+     * Put the mark back on a macro's first step — where a run starts when it
+     * has not been told otherwise. Said in the editor rather than left to the
+     * shell's own forgetting, so the blue lands on the macro whose button was
+     * pressed rather than on whichever one was last worked on. A macro with no
+     * steps has only its end to point at.
+     */
+    private _selectTop(macro: Macro): void {
+        const first = macro.body[0];
+        this._selectTarget(macro.id, first ? `after:${first.id}` : `end:${macro.id}`);
+    }
+
+    /**
      * Make a row's spot the selection: which macro is being worked on, and
      * where recordings land. Written only on change, so re-selecting the same
      * row does not churn `changed::` signals.
@@ -1442,14 +1455,19 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
                 this._runningMacroIds().includes(macro.id) ? 'pause' : 'run'));
         this._runButtons.set(macro.id, runButton);
 
-        // Beside it only while there is something to stop. Both end the run;
-        // the difference is where the next ▶ begins — here, or at the top —
-        // and that is a choice worth two buttons rather than one that guesses.
+        // Beside it always, not only while something is running. Both buttons
+        // end a run; the difference is where the next ▶ begins — here, or at
+        // the top — and that is a choice worth two buttons rather than one that
+        // guesses. Left standing when nothing is running because the second
+        // half of what it does still applies: it is how you say "back to the
+        // top" to a macro you last ran halfway through, without hunting for the
+        // first row to click on.
         const stopButton = iconButton('media-playback-stop-symbolic',
-            _('Stop — the next ▶ starts from the top'),
-            () => this._runMacroNow(macro.id, 'stop'));
-        stopButton.set_visible(this._runningMacroIds().includes(macro.id));
-        this._stopButtons.set(macro.id, stopButton);
+            _('Stop — ends the run, and the next ▶ starts from the top'),
+            () => {
+                this._runMacroNow(macro.id, 'stop');
+                this._selectTop(macro);
+            });
 
         const enabled = new Gtk.Switch({
             active: macroEnabled(macro),
