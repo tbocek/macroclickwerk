@@ -4,5 +4,5 @@
   "uuid": "macroclickwerk@tbocek.github.com",
   "settings-schema": "org.gnome.shell.extensions.macroclickwerk",
   "url": "https://github.com/tbocek/macroclickwerk",
-  "shell-version": ["50"]
+  "shell-version": ["51"]
 }

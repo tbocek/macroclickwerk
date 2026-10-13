@@ -7,19 +7,15 @@ import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import GObject from 'gi://GObject';
 import Gtk from 'gi://Gtk';
-import Pango from 'gi://Pango';
 
 import { ExtensionPreferences, gettext as _ } from 'resource:///org/gnome/Shell/Extensions/js/extensions/prefs.js';
 
 import {
-    CONDITION_TYPE_LABELS,
     AUTHORABLE_STEP_KINDS as STEP_KINDS,
-    STEP_KIND_LABELS,
     type ClickStep,
     type ColorCondition,
     type Condition,
     type ConditionType,
-    type EventEdge,
     type KeyStep,
     type LlmCondition,
     type Macro,
@@ -31,13 +27,11 @@ import {
     type StepKind,
     EVENT_EDGES,
     childLists,
-    describeCondition,
     describeStep,
     emptyDocument,
     findStep,
     eventFollows,
     macroEnabled,
-    moveStepNested,
     moveStepTo,
     newCondition,
     newId,
@@ -55,11 +49,26 @@ import { comboCodes, isArmed, parseTriggers, type Trigger } from './src/triggers
 import { keyName } from './src/keymap.js';
 import {
     chooser, clearClasses, colorSwatch, comboRow, commitNumbers, debounce, descendants,
-    entryRow, iconButton, infoButton, passwordRow, setClass, spinRow, spinSuffix,
-    suffixEntry, toggleButton, withColorSwatches,
+    entryRow, fitToText, glyphToggle, iconButton, infoButton, numberEntry, passwordRow, setClass,
+    spinRow, suffixEntry, toggleButton, withColorSwatches,
 } from './src/widgets.js';
 
 const CONDITION_TYPES: ConditionType[] = ['always', 'never', 'llm', 'color', 'and', 'or', 'not'];
+
+/**
+ * What a condition checks, in a word: the chooser sits on a line beside the
+ * prompt or the colour it is about, which says the rest. Built on demand, for
+ * the gettext reason `scaleLabels` gives.
+ */
+const conditionTypeLabels = (): Record<ConditionType, string> => ({
+    always: _('Always'),
+    never: _('Never'),
+    llm: _('LLM'),
+    color: _('Colour'),
+    and: _('All of'),
+    or: _('Any of'),
+    not: _('Not'),
+});
 
 /**
  * The two constants say all there is to say on their own, so inside an "all of"
@@ -187,13 +196,51 @@ const keyActionLabels = (): Record<string, string> => ({
 
 /** Which edge a "When …" waits for. Built on demand, as the others are. */
 const eventEdgeLabels = (): Record<string, string> => ({
-    either: _('Press or release'),
+    either: _('Either'),
     press: _('Press'),
     release: _('Release'),
 });
 
 /**
- * The kinds worth a play button: one action each, over as soon as it is done.
+ * What a "When …" waits on, as its own line says it: the line already reads
+ * "When", so "click" and "button" are both said once too often. The triggers
+ * page has rows to spare and keeps the long form.
+ */
+const eventSourceLabels = (): Record<string, string> => ({
+    BTN_LEFT: _('Left'),
+    BTN_RIGHT: _('Right'),
+    BTN_MIDDLE: _('Middle'),
+    BTN_SIDE: _('Side'),
+    BTN_EXTRA: _('Extra'),
+    custom: _('Key…'),
+});
+
+/**
+ * A step's title is the word the line starts with, and the controls after it
+ * finish the sentence — "Mouse [Left] [Click] [20ms] [840, 512]". The full
+ * sentence the title used to be is the same controls read aloud, so saying it
+ * twice cost the room the controls need to fit on one line. An `if` keeps its
+ * sentence: its condition is the one thing not on its line.
+ */
+const stepTitles = (): Record<StepKind, string> => ({
+    click: _('Mouse'),
+    move: _('Move'),
+    scroll: _('Scroll'),
+    key: _('Key'),
+    text: _('Text'),
+    wait: _('Wait'),
+    onevent: _('When'),
+    loop: _('Repeat'),
+    if: _('If'),
+    break: _('Break'),
+    continue: _('Continue'),
+    start: _('Start'),
+    stop: _('Stop'),
+});
+
+/**
+ * The kinds worth running on their own, from a step's right-click menu: one
+ * action each, over as soon as it is done.
  * A loop or an `if` would drag its whole body along, and an endless loop would
  * drag the session with it — from a window that has no Stop. `break` and the
  * rest only mean something inside a run, so on their own they do nothing.
@@ -212,24 +259,23 @@ function evdevKeyName(name: string): string {
 
 /**
  * Only `then` and `else` get a header row of their own — a loop has one body
- * and shows it in the loop's own row, so of `body` only the hint is used, on
- * that row.
+ * and shows it in the loop's own row.
  */
 const BRANCH_STYLE: Record<BranchKind, { icon: string; title: string; hint: string }> = {
     body: {
         icon: 'media-playlist-repeat-symbolic',
         title: 'Body',
-        hint: 'runs on every iteration',
+        hint: 'Runs on every iteration',
     },
     then: {
         icon: 'object-select-symbolic',
         title: 'Yes',
-        hint: 'runs when the check holds',
+        hint: 'Runs when the check holds',
     },
     else: {
         icon: 'window-close-symbolic',
         title: 'No',
-        hint: 'runs when it does not',
+        hint: 'Runs when it does not',
     },
 };
 
@@ -273,12 +319,15 @@ const EDITOR_CSS = `
     background-color: alpha(@warning_color, 0.06);
 }
 
-/* A "When …" and the steps that take their edge from it are one gesture, and
-   the rail down their left edge says so. Neutral on purpose: the branch
-   colours mean containment, and this is sequence. Shadow and no fill, so it
-   works the same on a row that opens, and so the state rails below overwrite
-   it rather than stacking beside it. */
-.macroclickwerk-event { box-shadow: inset 4px 0 0 alpha(@window_fg_color, 0.35); }
+/* A "When …" and the steps after it are one gesture, drawn as a block the way
+   a body is: the steps indented, one rail down the whole of it. Neutral on
+   purpose — the branch colours mean containment, and this is sequence. The
+   state rails below overwrite the rail, never the indent, so a selected or
+   running step still sits where it belongs. */
+.macroclickwerk-event {
+    box-shadow: inset 4px 0 0 alpha(@window_fg_color, 0.35);
+    background-color: alpha(@window_fg_color, 0.03);
+}
 
 .macroclickwerk-running {
     background-color: alpha(@accent_bg_color, 0.28);
@@ -314,11 +363,33 @@ const EDITOR_CSS = `
 }
 .macroclickwerk-recording-now-block { box-shadow: inset 4px 0 0 @error_color; }
 
-/* The two nudge arrows stack into one button's footprint. */
-.macroclickwerk-nudge button { min-height: 14px; min-width: 24px; padding: 0 4px; }
-
 /* − and + as slim as a spin button's own, which is what they stand in for. */
-.macroclickwerk-spin > button { min-width: 20px; padding-left: 5px; padding-right: 5px; }
+.macroclickwerk-spin > button { min-width: 14px; padding-left: 4px; padding-right: 4px; }
+
+/* The editor is a list of program lines, not of settings: one line each, as
+   tight as a button allows. A row is as tall as the buttons on it plus a hair,
+   and the buttons give up the padding that only made them wide. Entry rows
+   keep their height — their title floats above the text and needs it. */
+.macroclickwerk-editor row:not(.entry) > box.header { min-height: 40px; }
+.macroclickwerk-editor row > box.header > box.title { margin-top: 3px; margin-bottom: 3px; }
+.macroclickwerk-line button.image-button { min-width: 16px; padding-left: 6px; padding-right: 6px; }
+.macroclickwerk-line dropdown > button { padding-left: 7px; padding-right: 4px; }
+.macroclickwerk-line dropdown > button > box { border-spacing: 2px; }
+
+/* "Add step here" is a place, not a step: half the height of one. */
+.macroclickwerk-editor row.macroclickwerk-add > box.header { min-height: 28px; }
+.macroclickwerk-add menubutton > button { min-height: 20px; padding: 1px 8px; }
+.macroclickwerk-add menubutton:not(.destructive-action) > button { opacity: 0.75; }
+
+/* What a step aims at instead of numbers: "pointer", "previous". */
+.macroclickwerk-mode { opacity: 0.6; }
+
+/* Holds a slot open, so the buttons after it keep their column on rows that
+   have nothing to put there. */
+.macroclickwerk-slot { opacity: 0; }
+
+/* The macro's name is the heading of its card. */
+.macroclickwerk-macro-name text { font-weight: bold; }
 
 /* The grip whispers until the pointer is near it. */
 .macroclickwerk-grip { opacity: 0.4; }
@@ -353,7 +424,7 @@ const RUN_ICON_CLASSES = [
 ];
 
 /** How far a step inside a body sits in from the rail of that body. */
-const INDENT_PX = 12;
+const INDENT_PX = 8;
 
 /**
  * How long a rebuilt page is given to settle before the scroll position is left
@@ -467,16 +538,8 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
     /** The same rows, by widget: what `_innermostRow` tests a press against. */
     private _selectableRows = new Set<Gtk.Widget>();
     private _recordControls: Gtk.Widget[] = [];
-    /** Shared dropdown models: the choices never differ between rows. */
-    private _stepKindsModel?: Gtk.StringList;
-    private _recordChoicesModel?: Gtk.StringList;
     /** The row currently painted as the target, so it can be unpainted. */
     private _markedRow?: Gtk.Widget;
-
-    // The Body/Then/Else headers by "stepId:branch". Move up and down ask these
-    // whether a container is open, because folded or not is a fact about the
-    // window, not about the document.
-    private _branchRows = new Map<string, Adw.ExpanderRow>();
 
     // Every page but Macros. Their rows read the settings once, when built, so
     // importing settings has to build them again to show what arrived.
@@ -513,26 +576,15 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
         const current = commitNumbers(row, values.length, values, onChange);
 
         if (pick) {
-            const button = new Gtk.Button({
-                label: _('Pick'),
-                tooltip_text: pick.tooltip,
-                valign: Gtk.Align.CENTER,
-            });
-            button.connect('clicked', pick.run);
-            row.add_suffix(button);
+            row.add_suffix(iconButton('find-location-symbolic', pick.tooltip, pick.run));
         }
 
         if (onShow) {
-            const show = new Gtk.Button({
-                label: _('Show'),
-                tooltip_text: _('Flash this position on the screen for a couple of seconds'),
-                valign: Gtk.Align.CENTER,
-            });
-            show.connect('clicked', () => {
-                const parsed = parseNumbers(row.get_text() ?? '', values.length) ?? current();
-                onShow(parsed);
-            });
-            row.add_suffix(show);
+            row.add_suffix(iconButton('view-reveal-symbolic',
+                _('Flash this position on the screen for a couple of seconds'), () => {
+                    const parsed = parseNumbers(row.get_text() ?? '', values.length) ?? current();
+                    onShow(parsed);
+                }));
         }
 
         return row;
@@ -541,67 +593,61 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
 
     /**
      * A pair of numbers as a field on a row rather than a row of its own, so a
-     * position can share one line with the buttons that act on it.
+     * position can share one line with the buttons that act on it. As wide as
+     * the numbers in it.
      */
     private _numbersEntry(values: number[], onChange: (values: number[]) => void): Gtk.Entry {
         const entry = new Gtk.Entry({
             text: values.join(', '),
             placeholder_text: 'x, y',
-            width_chars: 10,
-            max_width_chars: 12,
             valign: Gtk.Align.CENTER,
             xalign: 1,
         });
+        fitToText(entry, '00, 00');
         commitNumbers(entry, values.length, values, onChange);
         return entry;
     }
 
     /**
-     * Where a click or a move goes, in one row: the numbers, and buttons that
-     * say whether they are used at all. It used to be two rows — a dropdown
-     * naming a mode, and under it the coordinates the mode was about — which is
-     * a line of prose and a line of numbers to say one thing.
+     * Where a click or a move goes, as words on the step's own line: the
+     * numbers, and buttons that say whether they are used at all.
      *
-     * Three states, one row. Coordinates are a place on the screen, with
-     * **Pick** and **Show** beside them. `onModeName` is the step's own
-     * alternative — 'current' for a click, 'rel' for a move — described by
-     * `on`. And either step can aim at 'prev', back to where the pointer was
-     * before the last positioned step; that state reads the same on both, so
-     * everything about it lives here rather than with the callers. A move can
-     * additionally offer 'store' via `store` — remember the spot rather than
-     * go anywhere — which is the other half of 'prev': one marks, one returns.
+     * Three states. Coordinates are a place on the screen, with **Pick** and
+     * **Show** beside them. `onModeName` is the step's own alternative —
+     * 'current' for a click, 'rel' for a move — and `on` says whether it still
+     * has numbers (an offset does, "wherever the pointer is" does not). And
+     * either step can aim at 'prev', back to where the pointer was before the
+     * last positioned step. A move can additionally offer 'store' — remember
+     * the spot rather than go anywhere — which is the other half of 'prev': one
+     * marks, one returns. A state without numbers puts a word where they were,
+     * so the line still reads.
      */
-    private _positionRow(opts: {
+    private _positionControls(opts: {
         step: ClickStep | MoveStep;
-        toggleIcon: string;
-        toggleTip: string;
+        /** The button for the step's own alternative, `onModeName`. */
+        toggle: Gtk.ToggleButton;
         onModeName: 'current' | 'rel';
-        off: { title: string; values: () => number[] };
-        on: { title: string; subtitle?: string; values?: () => number[] };
-        store?: { title: string; subtitle?: string };
+        off: () => number[];
+        on: { word?: string; values?: () => number[] };
+        store?: boolean;
         apply: (values: number[]) => void;
-    }): Adw.ActionRow {
-        type RowState = { title: string; subtitle?: string; values?: () => number[] };
-        const prevState: RowState = {
-            title: _('Position'),
-            subtitle: _('Where the pointer was before the last positioned step'),
-        };
-        const storeState: RowState | null = opts.store ?? null;
-        const row = new Adw.ActionRow();
+    }): Gtk.Widget[] {
         let mode: 'off' | 'on' | 'prev' | 'store' =
             opts.step.mode === 'prev' ? 'prev'
-            : storeState && opts.step.mode === 'store' ? 'store'
+            : opts.store && opts.step.mode === 'store' ? 'store'
             : opts.step.mode === opts.onModeName ? 'on' : 'off';
-        const state = (): RowState =>
-            mode === 'prev' ? prevState
-            : mode === 'store' && storeState ? storeState
-            : mode === 'on' ? opts.on : opts.off;
+        const numbers = (): (() => number[]) | undefined =>
+            mode === 'off' ? opts.off : mode === 'on' ? opts.on.values : undefined;
+        const word = (): string =>
+            mode === 'prev' ? _('previous')
+            : mode === 'store' ? _('remember')
+            : opts.on.word ?? '';
 
-        const entry = this._numbersEntry(opts.off.values(), values => {
+        const entry = this._numbersEntry(opts.off(), values => {
             opts.apply(values);
-            this._refreshStepTitle(opts.step);
             this._save();
         });
+        const label = this._joiner('');
         const point = (): [number, number] => {
             const parsed = parseNumbers(entry.get_text() ?? '', 2);
             return [parsed?.[0] ?? 0, parsed?.[1] ?? 0];
@@ -613,29 +659,29 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
             _('Flash this position on the screen for a couple of seconds'),
             () => this._showMarker(...point()));
 
-        const toggle = toggleButton(opts.toggleIcon, opts.toggleTip, mode === 'on');
-        const storeBtn = storeState ? toggleButton('bookmark-new-symbolic',
+        const toggle = opts.toggle;
+        toggle.set_active(mode === 'on');
+        const storeBtn = opts.store ? toggleButton('bookmark-new-symbolic',
             _('Remember where the pointer is now: from here on, “previous” returns to this spot'),
             mode === 'store') : null;
-        const history = toggleButton('document-open-recent-symbolic',
+        const history = glyphToggle('←',
             _('Go back to where the pointer was before the last positioned step'), mode === 'prev');
 
         const sync = () => {
-            const now = state();
-            const numbers = now.values;
-            row.set_title(now.title);
-            row.set_subtitle(now.subtitle ?? '');
-            entry.set_visible(Boolean(numbers));
+            const values = numbers();
+            entry.set_visible(Boolean(values));
+            label.set_visible(!values);
+            label.set_label(word());
             // 'off' is the state that means a place on the screen, in both
-            // rows: a click's coordinates, a move's destination.
+            // steps: a click's coordinates, a move's destination.
             pick.set_visible(mode === 'off');
             show.set_visible(mode === 'off');
-            if (numbers) {
-                entry.set_text(numbers().join(', '));
+            if (values) {
+                entry.set_text(values().join(', '));
             }
         };
         // The mode variable drives the buttons, not the other way round: a
-        // press proposes a mode, setMode settles both buttons to it, and the
+        // press proposes a mode, setMode settles every button to it, and the
         // guard keeps those programmatic settles from proposing again. Synced
         // in place rather than rebuilt: a rebuild would take the button you
         // just pressed down with it.
@@ -647,14 +693,13 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
             storeBtn?.set_active(mode === 'store');
             history.set_active(mode === 'prev');
             settling = false;
-            // The one place the row's vocabulary meets the step's. Cast because
-            // a union field only accepts writes both members allow.
+            // The one place the controls' vocabulary meets the step's. Cast
+            // because a union field only accepts writes both members allow.
             (opts.step as { mode: string }).mode =
                 mode === 'on' ? opts.onModeName
                 : mode === 'prev' ? 'prev'
                 : mode === 'store' ? 'store' : 'abs';
             sync();
-            this._refreshStepTitle(opts.step);
             this._save();
         };
         toggle.connect('toggled', () => {
@@ -674,15 +719,8 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
         });
         sync();
 
-        row.add_suffix(entry);
-        row.add_suffix(pick);
-        row.add_suffix(show);
-        row.add_suffix(toggle);
-        if (storeBtn) {
-            row.add_suffix(storeBtn);
-        }
-        row.add_suffix(history);
-        return row;
+        // The numbers and what acts on them, then the modes that replace them.
+        return [entry, label, pick, show, toggle, ...(storeBtn ? [storeBtn] : []), history];
     }
 
     /**
@@ -795,6 +833,7 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
         this._macrosPage = new Adw.PreferencesPage({
             title: _('Macros'),
             iconName: 'view-list-symbolic',
+            css_classes: ['macroclickwerk-editor'],
         });
         // Only this page: the settings pages beside it are ordinary rows, and
         // 600 is what those are meant to be. Done once here — a rebuild swaps
@@ -956,13 +995,11 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
         this._markedRow = undefined;
         this._runButtons.clear();
         this._recordControls = [];
-        this._branchRows.clear();
         this._highlighted = [];
 
-        const actions = new Adw.PreferencesGroup({
-            title: _('Macros'),
-            description: _('Steps run top to bottom. Loops and conditions nest.'),
-        });
+        // A heading and nothing under it: backup is two menus beside Add rather
+        // than a card of its own, so the first macro starts one line down.
+        const actions = new Adw.PreferencesGroup({ title: _('Macros') });
 
         const addButton = new Gtk.Button({
             label: _('Add macro'),
@@ -973,9 +1010,12 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
             this._store.addMacro(newMacro(`Macro ${this._store.macros.length + 1}`));
             this._rebuildMacros();
         });
-        actions.set_header_suffix(addButton);
-
-        actions.add(this._transferRow());
+        const headerButtons = new Gtk.Box({ spacing: 6, valign: Gtk.Align.CENTER });
+        for (const button of this._transferButtons()) {
+            headerButtons.append(button);
+        }
+        headerButtons.append(addButton);
+        actions.set_header_suffix(headerButtons);
 
         this._macrosPage.add(actions);
         this._macroGroups.push(actions);
@@ -1102,15 +1142,6 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
         }
     }
 
-    /**
-     * Is this body open on screen? What move up and down mean depends on it.
-     * A block hidden under a collapsed if is as closed as a folded one.
-     */
-    private _isBranchOpen(stepId: string, listKey: string): boolean {
-        const row = this._branchRows.get(`${stepId}:${listKey}`);
-        return !!row && row.get_visible() && row.get_expanded();
-    }
-
     // --- drag and drop ------------------------------------------------------
 
     /**
@@ -1146,6 +1177,13 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
      * the document, resolved at drop time so it is read against the current
      * tree, not the one from when the row was built. A `springRow` folds open
      * after a moment of hovering, so a drop can reach into closed containers.
+     *
+     * On a row that holds others — a repeat, a When, a Yes or No — the
+     * pointer is placed against the row's own line, not the whole block: the
+     * block is as tall as everything open inside it, so halves of it put the
+     * line's own bottom half in "before". The drop mark goes on that line too;
+     * one drawn under the whole block would say "after all of this", which is
+     * not where the step goes.
      */
     private _droppable(
         row: Gtk.Widget,
@@ -1154,27 +1192,29 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
         place: (where: DropZone) => { list: Step[]; at: number } | null,
         springRow?: Adw.ExpanderRow,
     ): void {
+        const line = (row instanceof Adw.ExpanderRow ? this._headerOf(row) : null) ?? row;
+        const fraction = (y: number) => y / Math.max(1, line.get_height());
         const target = Gtk.DropTarget.new(GObject.TYPE_STRING, Gdk.DragAction.MOVE);
         target.connect('motion', (_target, _x, y) => {
-            const where = zone(y / Math.max(1, row.get_height()));
-            this._paintDrop(row, where);
+            const where = zone(fraction(y));
+            this._paintDrop(line, where);
             if (springRow && !springRow.get_expanded()) {
                 this._armSpring(springRow);
             }
             return where ? Gdk.DragAction.MOVE : 0;
         });
         target.connect('leave', () => {
-            this._paintDrop(row, null);
+            this._paintDrop(line, null);
             this._disarmSpring();
         });
         target.connect('drop', (_target, value, _x, y) => {
-            this._paintDrop(row, null);
+            this._paintDrop(line, null);
             this._disarmSpring();
             const [macroId, stepId] = String(value).split(' ');
             if (macroId !== macro.id) {
                 return false;   // each card is one document; no reaching across
             }
-            const where = zone(y / Math.max(1, row.get_height()));
+            const where = zone(fraction(y));
             const dest = where ? place(where) : null;
             if (!dest || !moveStepTo(macro.body, stepId, dest.list, dest.at)) {
                 return false;   // e.g. a loop dropped into its own body
@@ -1371,79 +1411,51 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
     }
 
     /**
-     * A dropdown that is also the button: its first entry is the label, and
-     * picking any of the others acts there and then. Two clicks instead of
-     * three, and no button left sitting next to a dropdown whose value you
-     * already chose. The selection snaps back to the label before the action
-     * runs, so the action is free to rebuild the page from under the widget.
-     * `model` is shared between rows — the choices never differ, so one list
-     * serves every rebuild.
-     */
-    private _actionDropdown(model: Gtk.StringList, onPick: (choice: number) => void): Gtk.DropDown {
-        const dropdown = new Gtk.DropDown({ model, valign: Gtk.Align.CENTER });
-        dropdown.connect('notify::selected', () => {
-            const index = dropdown.get_selected();
-            if (index < 1 || this._rebuilding) {
-                return;   // the label itself, or the page being torn down
-            }
-            dropdown.set_selected(0);
-            onPick(index - 1);
-        });
-        return dropdown;
-    }
-
-    private _addStepDropdown(into: Step[]): Gtk.DropDown {
-        if (!this._stepKindsModel) {
-            this._stepKindsModel = new Gtk.StringList();
-            this._stepKindsModel.append(_('Add step…'));
-            for (const kind of STEP_KINDS) {
-                this._stepKindsModel.append(STEP_KIND_LABELS[kind]);
-            }
-        }
-        return this._actionDropdown(this._stepKindsModel, choice => {
-            into.push(newStep(STEP_KINDS[choice]));
-            this._saveAndRebuild();
-        });
-    }
-
-    /**
-     * The "Add step here" row that ends a macro and every nested block: the
-     * dropdown that appends into `into`, and a Record dropdown that captures
-     * one step there or starts a whole recording landing there. `stepId` and
-     * `listKey` name the nested body the row sits in, null for the macro
-     * itself — the selection target is derived from them here, so the two
-     * ways of recording cannot disagree about the spot.
+     * The row that ends a macro and every nested block: two buttons, one that
+     * appends a step into `into` and one that records there — one step, or a
+     * whole recording landing there. No title: "Add step" on the button is the
+     * whole of what the row says. `stepId` and `listKey` name the nested body
+     * the row sits in, null for the macro itself — the selection target is
+     * derived from them here, so the two ways of recording cannot disagree
+     * about the spot.
      */
     private _addStepRow(into: Step[], macroId: string, stepId: string | null, listKey: string | null): Adw.ActionRow {
         const target = stepId ? `in:${stepId}:${listKey}` : `end:${macroId}`;
-        const row = new Adw.ActionRow({ title: _('Add step here') });
-        row.add_suffix(this._addStepDropdown(into));
+        // A place rather than a step, so it is drawn smaller than one: a short
+        // line, flat buttons as tall as their text.
+        const row = new Adw.ActionRow({ css_classes: ['macroclickwerk-add'] });
 
-        if (!this._recordChoicesModel) {
-            this._recordChoicesModel = new Gtk.StringList();
-            for (const label of [_('Record…'), _('One step'), _('Multiple steps')]) {
-                this._recordChoicesModel.append(label);
-            }
-        }
-        const record = this._actionDropdown(this._recordChoicesModel, choice => {
-            if (choice === 0) {
-                this._captureStepInto(macroId, stepId, listKey);
-            } else {
-                this._recordInto(macroId, target);
-            }
-        });
+        // Named as the rows name them, so what you pick is what you see.
+        const titles = stepTitles();
+        const add = this._menuButton(_('Add step'), STEP_KINDS.map(kind => ({
+            label: titles[kind],
+            run: () => {
+                into.push(newStep(kind));
+                this._saveAndRebuild();
+            },
+        })), 'list-add-symbolic');
+
+        const record = this._menuButton(_('Record'), [
+            { label: _('One step'), run: () => this._captureStepInto(macroId, stepId, listKey) },
+            { label: _('Multiple steps'), run: () => this._recordInto(macroId, target) },
+        ], 'media-record-symbolic');
         record.set_tooltip_text(_('One step: click anywhere on screen, or move the pointer and hold still. ' +
             'Multiple steps: everything until recording is stopped'));
         this._recordControls.push(record);
-        row.add_suffix(record);
+
+        const buttons = new Gtk.Box({ spacing: 6, valign: Gtk.Align.CENTER });
+        buttons.append(add);
+        buttons.append(record);
+        row.add_prefix(buttons);
         return row;
     }
 
     private _buildMacroGroup(macro: Macro): Adw.PreferencesGroup {
-        const group = new Adw.PreferencesGroup({
-            title: macro.name,
-            description: this._macroHint(macro),
-        });
+        // No heading: the name field is the heading, and the controls for the
+        // whole macro sit on its line — a title saying the name, a line under
+        // it saying what the switch means and a field saying the name again
+        // were three lines for one.
+        const group = new Adw.PreferencesGroup();
 
         // Its own ▶, whether it is switched on or not: the switch is about the
         // next press of Run, this is about now. It turns into a Pause while the
@@ -1469,39 +1481,34 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
                 this._selectTop(macro);
             });
 
+        // What the switch means is its tooltip, and changes with it.
         const enabled = new Gtk.Switch({
             active: macroEnabled(macro),
             valign: Gtk.Align.CENTER,
-            tooltip_text: _('Include this macro when you press Run'),
+            tooltip_text: this._macroHint(macro),
         });
         enabled.connect('notify::active', () => {
             macro.enabled = enabled.get_active();
-            group.set_description(this._macroHint(macro));
+            enabled.set_tooltip_text(this._macroHint(macro));
             this._save();
         });
 
-        const remove = new Gtk.Button({
-            icon_name: 'user-trash-symbolic',
-            tooltip_text: _('Delete this macro'),
-            valign: Gtk.Align.CENTER,
-            css_classes: ['flat'],
-        });
-        remove.connect('clicked', () => {
+        const remove = iconButton('user-trash-symbolic', _('Delete this macro'), () => {
             this._store.removeMacro(macro.id);
             this._rebuildMacros();
         });
 
-        const header = new Gtk.Box({ spacing: 6, valign: Gtk.Align.CENTER });
-        header.append(runButton);
-        header.append(stopButton);
-        header.append(enabled);
-        header.append(remove);
-        group.set_header_suffix(header);
-
-        group.add(entryRow(_('Name'), macro.name, text => {
+        const nameRow = entryRow(_('Macro'), macro.name, text => {
             macro.name = text;
             this._save();
-        }));
+        });
+        nameRow.add_css_class('macroclickwerk-macro-name');
+        // The order every line in the editor keeps: what this line is about,
+        // then ▶, then the bin last.
+        for (const widget of [enabled, runButton, stopButton, remove]) {
+            nameRow.add_suffix(widget);
+        }
+        group.add(nameRow);
 
         const addRow = this._addStepRow(macro.body, macro.id, null, null);
         this._selectable(addRow, `end:${macro.id}`, macro.id);
@@ -1512,10 +1519,8 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
         // Which event each step answers to, worked out once for the macro: every
         // row needs it, and asking per row rescanned the whole macro per row.
         const under = eventFollows(macro.body);
-        for (const step of macro.body) {
-            for (const widget of this._buildStepWidgets(macro, step, under)) {
-                group.add(widget);
-            }
+        for (const widget of this._buildStepList(macro, macro.body, under, 0)) {
+            group.add(widget);
         }
         // Under the steps, where what it adds will appear.
         group.add(addRow);
@@ -1543,23 +1548,33 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
     }
 
     /**
-     * A step's title as a row shows it, which is not quite as it reads: a row
-     * title is Pango markup, so any colour the step names is followed by a
-     * block of that colour — and everything else in it is escaped, `_describe`
-     * being free to return an ampersand from a macro's name or a prompt.
+     * A step's title as a row shows it. Every kind but `if` is one word — see
+     * `stepTitles` — and a repeat adds, dimmed, how much its body holds, so a
+     * folded one still says. An `if` says its condition instead, which is the
+     * one thing about it not on its line. Row titles are Pango markup, so any
+     * colour the condition names is followed by a block of that colour, and
+     * everything else is escaped: a prompt is free to hold an ampersand.
      */
     private _rowTitle(step: Step): string {
-        return withColorSwatches(this._describe(step));
+        if (step.kind === 'if') {
+            return withColorSwatches(this._describe(step));
+        }
+        if (step.kind === 'loop') {
+            return this._titleWith(stepTitles().loop, step.body.length === 0
+                ? _('empty — skipped') : this._countLabel(step.body.length));
+        }
+        return this._titleWith(stepTitles()[step.kind]);
     }
 
     /**
-     * The title says what the step does, so a setting that changes that has to
-     * put it right — a click that now goes somewhere else must not still be
-     * headed "Click left @ 100,200". Updated in place: rebuilding would take the
-     * field you are typing in with it.
+     * A row title as markup, with an optional note after it that annotates
+     * rather than names — "Repeat  3 steps", "Area  whole screen" — dimmed.
      */
-    private _refreshStepTitle(step: Step): void {
-        this._stepRows.get(step.id)?.row.set_title(this._rowTitle(step));
+    private _titleWith(title: string, note?: string): string {
+        const escaped = GLib.markup_escape_text(title, -1);
+        return note === undefined
+            ? escaped
+            : `${escaped}  <span alpha="55%">${GLib.markup_escape_text(note, -1)}</span>`;
     }
 
     /** "3 steps", "empty" — the same phrasing wherever a body is counted. */
@@ -1568,32 +1583,6 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
             return _('empty');
         }
         return `${count} ${count === 1 ? _('step') : _('steps')}`;
-    }
-
-    /**
-     * What a step says under its title: only what the title cannot, so a
-     * collapsed loop still tells you it holds four steps. Everything else about
-     * the step is already in the title, and a second line of grey saying it
-     * again is a second line of grey.
-     */
-    private _stepSubtitle(step: Step): string {
-        const parts: string[] = [];
-        if (step.kind === 'loop') {
-            // The body hangs off this row rather than off a header of its own,
-            // so this line is the one that has to say what is in it. An empty
-            // one says what will happen too: the runner skips it, and finding
-            // that out here beats finding it out from a macro that does
-            // nothing.
-            parts.push(step.body.length === 0
-                ? `${_('empty — this repeat is skipped')} — ${_(BRANCH_STYLE.body.hint)}`
-                : `${this._countLabel(step.body.length)} — ${_(BRANCH_STYLE.body.hint)}`);
-        } else if (step.kind === 'if') {
-            // No first, in the order the two blocks are drawn below it — and
-            // in the blocks' own words, which say Yes and No, not then/else.
-            parts.push(`${this._countLabel((step.else ?? []).length)} ${_('if no')}, ` +
-                `${this._countLabel(step.then.length)} ${_('if yes')}`);
-        }
-        return parts.join(' — ');
     }
 
     /**
@@ -1634,37 +1623,132 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
      * the wording differs between the two kinds, so that is all `words`
      * carries.
      */
-    private _pressSuffixes(
-        suffixes: Gtk.Box,
+    private _pressControls(
         step: ClickStep | KeyStep,
         follows: OnEventStep | null,
-        retitle: () => void,
         words: { actions: Record<string, string>; action: string; hold: string },
-    ): void {
+    ): Gtk.Widget[] {
+        const widgets: Gtk.Widget[] = [];
         if (follows) {
-            suffixes.append(this._followToggle(step, follows));
+            widgets.push(this._followToggle(step, follows));
             if (step.action === undefined) {
-                return;
+                return widgets;
             }
         }
-        suffixes.append(chooser(PRESS_ACTIONS, words.actions, step.action ?? 'tap',
+        widgets.push(chooser(PRESS_ACTIONS, words.actions, step.action ?? 'tap',
             words.action, value => {
                 step.action = value;
-                retitle();
                 this._saveAndRebuild();   // the hold field comes and goes with tap
             }));
         if ((step.action ?? 'tap') === 'tap') {
-            suffixes.append(spinSuffix(step.holdMs ?? 20, 0, 10000, words.hold, value => {
+            widgets.push(numberEntry(step.holdMs ?? 20, 0, 10000, words.hold, value => {
                 step.holdMs = value;
                 this._save();
             }, true));
         }
+        return widgets;
+    }
+
+    /** A dimmed word between controls: "±" between a wait and its jitter. */
+    private _joiner(text: string): Gtk.Label {
+        return new Gtk.Label({
+            label: text,
+            valign: Gtk.Align.CENTER,
+            css_classes: ['macroclickwerk-mode'],
+        });
     }
 
     /**
-     * One step, followed by its Body/Then/Else blocks as sibling rows rather
-     * than rows inside it — folding a loop shut to get at its settings must not
-     * take its body off the screen with it.
+     * Hold a slot open with an invisible copy of what would be there, so the
+     * buttons before it stay in their column: the chevron, on a step that does
+     * not fold.
+     */
+    private _slot<T extends Gtk.Widget>(widget: T): T {
+        widget.add_css_class('macroclickwerk-slot');
+        widget.set_can_target(false);
+        widget.set_can_focus(false);
+        widget.set_tooltip_text(null);
+        return widget;
+    }
+
+    /**
+     * An expander that is always open and does not look like one: the Yes and
+     * No under an `if`, and a When holding the steps after it. They are
+     * expanders only because that is the row that can hold rows. The arrow is
+     * made invisible rather than removed, so its room stays and the bin keeps
+     * its column. libadwaita builds the header and its arrow privately, so
+     * they are found by looking — and if it ever builds them differently, the
+     * row simply keeps its chevron.
+     */
+    private _fixOpen(row: Adw.ExpanderRow): void {
+        row.set_expanded(true);
+        this._headerOf(row)?.set_activatable(false);
+        for (const child of descendants(row)) {
+            if (child instanceof Gtk.Image && child.has_css_class('expander-row-arrow')) {
+                child.set_opacity(0);
+                break;
+            }
+        }
+    }
+
+    /**
+     * An expander's own line — libadwaita builds it as a row of its own, and
+     * keeps it to itself. The first one found is the expander's: the rows it
+     * holds come after it.
+     */
+    private _headerOf(row: Adw.ExpanderRow): Adw.ActionRow | null {
+        for (const child of descendants(row)) {
+            if (child instanceof Adw.ActionRow && child.has_css_class('header')) {
+                return child;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * The rows of one list of steps. A "When …" takes the steps after it, up to
+     * the next one, as its block — they are what runs once the event comes, so
+     * they are drawn inside it the way a body is drawn inside its repeat. The
+     * document has no such nesting: they stay where they are in the list, and
+     * only the drawing groups them. Steps above a When in a repeat run under it
+     * too, on the next time round, but they are above it, and drawn as such.
+     */
+    private _buildStepList(
+        macro: Macro,
+        steps: Step[],
+        under: Map<string, OnEventStep>,
+        indent: number,
+    ): Gtk.Widget[] {
+        const widgets: Gtk.Widget[] = [];
+        for (let i = 0; i < steps.length; i++) {
+            const step = steps[i];
+            let block: Step[] = [];
+            if (step.kind === 'onevent') {
+                let end = i + 1;
+                while (end < steps.length && steps[end].kind !== 'onevent') {
+                    end++;
+                }
+                block = steps.slice(i + 1, end);
+                i = end - 1;
+            }
+            widgets.push(...this._buildStepWidgets(macro, step, under, indent, block));
+        }
+        return widgets;
+    }
+
+    /**
+     * One step, followed by its Yes/No blocks as sibling rows rather than rows
+     * inside it — folding an `if` shut to get at its condition must not take
+     * its branches off the screen with it.
+     *
+     * Every step is one line, laid out the same way: grip, icon and title on
+     * the left; on the right what the step does, then the bin, then the
+     * chevron. A step that does not fold still keeps the chevron's slot, so
+     * the bin makes one straight column down the page. There is no ▶ per
+     * step: click a row and the macro's own ▶ starts there, and running one
+     * step alone is in the right-click menu.
+     * Only a repeat and an if fold: a repeat over its body, an if over its
+     * condition and its branches. Nothing else has anything to hide.
      *
      * `indent` is how far in this row sits within whatever contains it. The rail
      * belongs to the enclosing body, not to the step, so a step draws none of
@@ -1675,24 +1759,27 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
         step: Step,
         under: Map<string, OnEventStep>,
         indent = 0,
+        /** For a When, the steps drawn inside it — see `_buildStepList`. */
+        block: Step[] = [],
     ): Gtk.Widget[] {
         const stepKey = `step:${step.id}`;
         const children = childLists(step);
         // A loop has one body and nothing to choose between, so it holds that
-        // body itself instead of putting a "Body" header under it: the header
-        // said what the "Repeat" row above it already said, and cost a row and a
-        // level of indent for it. An `if` keeps its Yes and No headers — there
-        // the header is the only thing saying which of the two you are reading.
-        const inline = children.length === 1 && children[0].key === 'body';
-        // A card that opens onto nothing is a card that should not open. Steps
-        // with settings of their own keep the expander; the rest — a break, a
-        // stop — are one line, and clicking them only selects them.
-        const fields = this._buildStepFields(step);
-        const props = { title: this._rowTitle(step), subtitle: this._stepSubtitle(step) };
-        const row: Adw.ActionRow | Adw.ExpanderRow = fields.length > 0 || inline
-            ? this._expander(stepKey, props,
-                inline ? children[0].steps.length > 0 : children.length > 0)
-            : new Adw.ActionRow(props);
+        // body itself instead of putting a "Body" header under it. An `if`
+        // keeps its Yes and No headers — there the header is the only thing
+        // saying which of the two you are reading.
+        const inline = step.kind === 'loop';
+        const props = { title: this._rowTitle(step), title_lines: 1 };
+        // A When with steps after it holds them, in an expander that is always
+        // open: it is a block, not a fold.
+        const holds = block.length > 0;
+        const row: Adw.ActionRow | Adw.ExpanderRow = step.kind === 'loop' || step.kind === 'if'
+            ? this._expander(stepKey, props, inline ? children[0].steps.length > 0 : true)
+            : holds ? new Adw.ExpanderRow(props) : new Adw.ActionRow(props);
+        if (holds) {
+            this._fixOpen(row as Adw.ExpanderRow);
+            row.add_css_class('macroclickwerk-event');
+        }
         const widgets: Gtk.Widget[] = [row];
         const branchRows: Adw.ExpanderRow[] = [];
 
@@ -1704,9 +1791,13 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
         // Affixes go in boxes of our own rather than one add_prefix/add_suffix
         // call each: AdwActionRow and AdwExpanderRow pack them in opposite
         // directions, so the same code produced mirrored rows depending on
-        // whether the step had settings to fold open.
+        // whether the step folds.
         const prefixes = new Gtk.Box({ spacing: 6, valign: Gtk.Align.CENTER });
-        const suffixes = new Gtk.Box({ spacing: 0, valign: Gtk.Align.CENTER });
+        const suffixes = new Gtk.Box({
+            spacing: 3,
+            valign: Gtk.Align.CENTER,
+            css_classes: ['macroclickwerk-line'],
+        });
         prefixes.append(this._grip(macro, step, row));
         prefixes.append(icon);
         row.add_prefix(prefixes);
@@ -1736,220 +1827,31 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
             row,
             icon,
             kindIcon,
-            container: children.length > 0,
+            container: children.length > 0 || holds,
             branchRows,
         });
 
-        // Settings small enough to read as part of the step's own sentence sit
-        // on its line rather than behind a fold — "Repeat 10×", "Click left @
-        // 840,512", "Press ctrl+c" — and the line says what they are, so they
-        // need no titles of their own. What is left folded is what needs room:
-        // coordinates with a Pick button, text, a list of modifiers.
-        //
-        // The title is the sentence these controls are words of, so it is
-        // rewritten in place rather than by rebuilding the page — a rebuild
-        // would close the dropdown you are still looking at.
-        const retitle = () => row.set_title(this._rowTitle(step));
-
-        // The "When …" this step runs under, if any: what its rail says, and
-        // what a press step can take its edge from — see `_pressSuffixes`.
+        // The "When …" this step runs under, if any: what a press step can
+        // take its edge from — see `_pressControls`.
         const follows = under.get(step.id) ?? null;
 
-        // An event and the steps that run under it are one gesture, and rows
-        // stacked in a list do not say so. They share a rail — a neutral one:
-        // the branch colours mean containment, and this is sequence. The event
-        // itself is the top of its own block.
-        if (step.kind === 'onevent' || follows) {
-            row.add_css_class('macroclickwerk-event');
+        for (const widget of this._stepControls(macro, step, follows)) {
+            suffixes.append(widget);
         }
 
-        switch (step.kind) {
-        // A repeat has exactly one setting, so it lives on the row rather than
-        // behind a fold: the count, and a toggle for having no count at all.
-        case 'loop': {
-            // Not the loop's own kind icon, which already sits on this row:
-            // repeat-song is the "keep going" variant of the same family.
-            const forever = toggleButton('media-playlist-repeat-song-symbolic',
-                _('Repeat without a limit'), step.count === 'forever');
-            const count = new Gtk.SpinButton({
-                adjustment: new Gtk.Adjustment({
-                    lower: 1, upper: 1000000, step_increment: 1, page_increment: 10,
-                    value: typeof step.count === 'number' ? step.count : 10,
-                }),
-                tooltip_text: _('How many times to go round'),
-                valign: Gtk.Align.CENTER,
-                visible: step.count !== 'forever',
-                numeric: true,
-                width_chars: 3,
-            });
-            forever.connect('toggled', () => {
-                step.count = forever.get_active() ? 'forever' : count.get_value_as_int();
-                count.set_visible(!forever.get_active());
-                retitle();
-                this._save();
-            });
-            count.connect('value-changed', () => {
-                if (forever.get_active()) {
-                    return;
-                }
-                step.count = count.get_value_as_int();
-                retitle();
-                this._save();
-            });
-            suffixes.append(forever);
-            suffixes.append(count);
-            break;
-        }
-
-        // Same bargain the loop's count makes: a click is a button, what to do
-        // with it, and — only when it is a whole click — for how long. The
-        // hold field goes with the tap: a bare down or up has no duration,
-        // its other half is another step.
-        case 'click':
-            suffixes.append(chooser(MOUSE_BUTTONS, mouseButtonLabels(), step.button,
-                _('Which mouse button'), value => {
-                    step.button = value;
-                    retitle();
-                    this._save();
-                }));
-            this._pressSuffixes(suffixes, step, follows, retitle, {
-                actions: clickActionLabels(),
-                action: _('A whole click, or one half of one: press it and leave it down, or release what is down'),
-                hold: _('How long the button stays down'),
-            });
-            break;
-
-        // The same words a click has, for the same reason: which, what, and
-        // for how long — "Type ctrl+c", "Press shift".
-        case 'key':
-            this._pressSuffixes(suffixes, step, follows, retitle, {
-                actions: keyActionLabels(),
-                action: _('A whole keystroke, or one half of one: press it and leave it down, or release what is down'),
-                hold: _('How long the key stays down'),
-            });
-            break;
-
-        case 'text':
-            suffixes.append(spinSuffix(step.delayMs ?? 12, 0, 1000,
-                _('Delay between keys, in milliseconds'), value => {
-                    step.delayMs = value;
-                    this._save();
-                }, true));
-            break;
-
-        // Both numbers, and the line already reads "Wait 1s ±200ms", so the
-        // card had nothing left to open onto.
-        case 'wait':
-            suffixes.append(spinSuffix(step.ms, 0, 3600000,
-                _('How long to wait, in milliseconds'), value => {
-                    step.ms = value;
-                    retitle();
-                    this._save();
-                }, true));
-            suffixes.append(spinSuffix(step.jitterMs ?? 0, 0, 600000,
-                _('Vary each wait by up to this much, either way, in milliseconds'), value => {
-                    step.jitterMs = value;
-                    retitle();
-                    this._save();
-                }, true));
-            break;
-        case 'onevent': {
-            const isButton = (TRIGGER_SOURCES as readonly string[]).includes(step.source);
-            suffixes.append(chooser([...TRIGGER_SOURCES, 'custom'], triggerSourceLabels(),
-                isButton ? step.source : 'custom',
-                _('Which button or key this step waits for — the event is swallowed'),
-                value => {
-                    step.source = value === 'custom' ? '' : value;
-                    retitle();
-                    this._saveAndRebuild();
-                }, 12));
-            if (!isButton) {
-                suffixes.append(suffixEntry(step.source, 'KEY_F13',
-                    _('The key waited for, by evdev name'), text => {
-                        step.source = text.trim().toUpperCase();
-                        retitle();
-                        this._save();
-                    }));
-            }
-            // Which edge wakes it. The default takes the next one whichever it
-            // is, so the first such step in the flow catches the press and the
-            // next one the release — a hold is two of them around whatever
-            // should happen in between. Naming one edge instead says it
-            // outright, and sleeps through the other.
-            suffixes.append(chooser(EVENT_EDGES, eventEdgeLabels(), step.edge ?? 'either',
-                _('Which edge wakes the run: the press, the release, or ' +
-                  'whichever comes next'),
-                value => {
-                    step.edge = value === 'either' ? undefined : value;
-                    retitle();
-                    // The steps below read as the edge they follow, so their
-                    // titles change with this: redraw rather than retitle.
-                    this._saveAndRebuild();
-                }, 14));
-            break;
-        }
-
-        case 'start':
-        case 'stop':
-            for (const widget of this._startStopChoosers(macro, step, retitle)) {
-                suffixes.append(widget);
-            }
-            break;
-
-        case 'scroll':
-            suffixes.append(spinSuffix(step.dx, -1000, 1000,
-                _('Horizontal scroll clicks'), value => {
-                    step.dx = value;
-                    retitle();
-                    this._save();
-                }));
-            suffixes.append(spinSuffix(step.dy, -1000, 1000,
-                _('Vertical scroll clicks'), value => {
-                    step.dy = value;
-                    retitle();
-                    this._save();
-                }));
-            break;
-
-        default:
-            break;
-        }
-
-        if (RUNNABLE_ALONE.includes(step.kind)) {
-            suffixes.append(iconButton('media-playback-start-symbolic',
-                _('Do this one step now, on the real screen'),
-                () => this._runStepNow(macro.id, step)));
-        }
-
-        // The arrows are the keyboard's way to move a step, one place at a
-        // time; dragging the row is the mouse's. Stacked into one slim column
-        // so the row spends one button's width on them, not two.
-        // Folded loops and ifs are passed over; open ones are moved into. What
-        // you see is what a press does, which is why the editor decides and the
-        // model only asks.
-        const open = (stepId: string, listKey: string) => this._isBranchOpen(stepId, listKey);
-        const nudge = new Gtk.Box({
-            orientation: Gtk.Orientation.VERTICAL,
-            valign: Gtk.Align.CENTER,
-            css_classes: ['macroclickwerk-nudge'],
-        });
-        nudge.append(iconButton('go-up-symbolic',
-            _('Move up — into an open body above, or past a folded one'), () => {
-                if (moveStepNested(macro.body, step.id, -1, open)) {
-                    this._saveAndRebuild();
-                }
-            }));
-        nudge.append(iconButton('go-down-symbolic',
-            _('Move down — into an open body below, or past a folded one'), () => {
-                if (moveStepNested(macro.body, step.id, 1, open)) {
-                    this._saveAndRebuild();
-                }
-            }));
-        suffixes.append(nudge);
         suffixes.append(iconButton('user-trash-symbolic', _('Delete'), () => {
             removeStep(macro.body, step.id);
             this._saveAndRebuild();
         }));
+        if (!(row instanceof Adw.ExpanderRow)) {
+            // Where a folding row has its chevron: the header's own spacing
+            // and the arrow's margin, less this box's.
+            suffixes.append(this._slot(new Gtk.Image({
+                icon_name: 'pan-down-symbolic',
+                valign: Gtk.Align.CENTER,
+                margin_start: 6,
+            })));
+        }
 
         this._selectable(row, `after:${step.id}`, macro.id);
 
@@ -1962,8 +1864,17 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
         });
         row.add_controller(secondary);
 
-        if (row instanceof Adw.ExpanderRow) {
-            for (const child of fields) {
+        if (holds) {
+            for (const widget of this._buildStepList(macro, block, under, INDENT_PX)) {
+                (row as Adw.ExpanderRow).add_row(widget);
+            }
+        }
+
+        if (step.kind === 'if' && row instanceof Adw.ExpanderRow) {
+            for (const child of this._buildConditionSection(_('Condition'), step.cond, next => {
+                step.cond = next;
+                this._saveAndRebuild();
+            }, 0)) {
                 row.add_row(child);
             }
         }
@@ -1980,10 +1891,11 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
             if (inline) {
                 nested = row as Adw.ExpanderRow;
             } else {
-                nested = this._expander(`${stepKey}:${list.key}`, {
-                    title: _(style.title),
-                    subtitle: `${this._countLabel(list.steps.length)} — ${_(style.hint)}`,
-                }, list.steps.length > 0);
+                nested = new Adw.ExpanderRow({
+                    title: this._titleWith(_(style.title), this._countLabel(list.steps.length)),
+                    tooltip_text: _(style.hint),
+                });
+                this._fixOpen(nested);
                 nested.set_margin_start(indent + INDENT_PX);
                 nested.add_prefix(new Gtk.Image({
                     icon_name: style.icon,
@@ -1995,22 +1907,16 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
                 // block of its own gets a selection of its own.
                 this._selectable(nested, `in:${step.id}:${list.key}`, macro.id);
                 // A branch header is a place: dropping on it puts the step
-                // first in that branch, and hovering springs a folded one open.
+                // first in that branch.
                 this._droppable(nested, macro,
                     () => 'into',
-                    () => ({ list: list.steps, at: 0 }),
-                    nested);
+                    () => ({ list: list.steps, at: 0 }));
             }
             nested.add_css_class('macroclickwerk-branch');
             nested.add_css_class(`macroclickwerk-branch-${kind}`);
-            this._branchRows.set(`${step.id}:${list.key}`, nested);
 
             const addNested = this._addStepRow(list.steps, macro.id, step.id, list.key);
             addNested.set_margin_start(INDENT_PX);   // lines up with the steps below it
-            addNested.add_prefix(new Gtk.Image({
-                icon_name: 'list-add-symbolic',
-                valign: Gtk.Align.CENTER,
-            }));
             // The add row sits at the end of the list, so a drop on it goes
             // there — the counterpart to the branch header meaning "first".
             this._droppable(addNested, macro,
@@ -2020,10 +1926,8 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
                 this._selectable(addNested, `in:${step.id}:${list.key}`, macro.id);
             }
 
-            for (const child of list.steps) {
-                for (const widget of this._buildStepWidgets(macro, child, under, INDENT_PX)) {
-                    nested.add_row(widget);
-                }
+            for (const widget of this._buildStepList(macro, list.steps, under, INDENT_PX)) {
+                nested.add_row(widget);
             }
             // Last, because that is where what it adds ends up.
             nested.add_row(addNested);
@@ -2045,71 +1949,98 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
         return widgets;
     }
 
-    private _buildStepFields(step: Step): Gtk.Widget[] {
-        const condKey = `step:${step.id}:cond`;
-        const rows: Gtk.Widget[] = [];
+    /**
+     * What a step does, as controls for its own line, in the order the line
+     * reads: what is acted on, how, for how long, and where. A control that
+     * comes and goes with a mode sits left of the toggle that sets the mode,
+     * so the toggle stays put under the pointer that pressed it.
+     */
+    private _stepControls(macro: Macro, step: Step, follows: OnEventStep | null): Gtk.Widget[] {
         const save = () => this._save();
-
         switch (step.kind) {
-            case 'click':
-                // Button is not here either: which button and how long it is
-                // held both sit on the step's own line, where the title already
-                // says "Click left @ …" and the controls can finish the sentence.
-                rows.push(this._positionRow({
+        case 'loop': {
+            // The count stays what it was while the toggle hides it, so
+            // turning the limit back on brings back the number it had.
+            let count = typeof step.count === 'number' ? step.count : 10;
+            const spin = numberEntry(count, 1, 1000000, _('How many times to go round'), value => {
+                count = value;
+                if (step.count !== 'forever') {
+                    step.count = value;
+                    save();
+                }
+            });
+            spin.set_visible(step.count !== 'forever');
+            // Not the loop's own kind icon, which already sits on this row:
+            // repeat-song is the "keep going" variant of the same family.
+            const forever = toggleButton('media-playlist-repeat-song-symbolic',
+                _('Repeat without a limit'), step.count === 'forever');
+            forever.connect('toggled', () => {
+                step.count = forever.get_active() ? 'forever' : count;
+                spin.set_visible(!forever.get_active());
+                save();
+            });
+            return [spin, forever];
+        }
+
+        case 'click':
+            return [
+                chooser(MOUSE_BUTTONS, mouseButtonLabels(), step.button,
+                    _('Which mouse button'), value => {
+                        step.button = value;
+                        save();
+                    }, 7),
+                ...this._pressControls(step, follows, {
+                    actions: clickActionLabels(),
+                    action: _('A whole click, or one half of one: press it and leave it down, or release what is down'),
+                    hold: _('How long the button stays down'),
+                }),
+                ...this._positionControls({
                     step,
-                    // The toggles are the whole of the old Position dropdown: one
-                    // down means there are no coordinates to have.
-                    toggleIcon: 'input-mouse-symbolic',
-                    toggleTip: _('Click wherever the pointer already is'),
+                    // The toggles are the whole of the old Position dropdown:
+                    // one down means there are no coordinates to have.
+                    toggle: glyphToggle('@', _('Click wherever the pointer already is'), false),
                     onModeName: 'current',
-                    off: { title: _('Position'), values: () => [step.x ?? 0, step.y ?? 0] },
-                    on: { title: _('Position'), subtitle: _('Wherever the pointer already is') },
+                    off: () => [step.x ?? 0, step.y ?? 0],
+                    on: { word: _('pointer') },
                     apply: ([x, y]) => {
                         step.x = x;
                         step.y = y;
                     },
-                }));
-                // Hold is not here: it sits on the step's own line, beside the
-                // click it belongs to.
-                break;
+                }),
+            ];
 
-            case 'move':
-                rows.push(this._positionRow({
-                    step,
-                    toggleIcon: 'go-jump-symbolic',
-                    toggleTip: _('Move by an offset instead of to a position'),
-                    onModeName: 'rel',
-                    off: { title: _('Position'), values: () => [step.x ?? 0, step.y ?? 0] },
-                    // An offset is numbers too — they just are not a place, so
-                    // there is nothing to point at or flash on the screen.
-                    on: { title: _('Offset'), values: () => [step.dx ?? 0, step.dy ?? 0] },
-                    store: {
-                        title: _('Position'),
-                        subtitle: _('Remember where the pointer is now; “previous” returns here'),
-                    },
-                    apply: ([a, b]) => {
-                        if (step.mode === 'rel') {
-                            step.dx = a;
-                            step.dy = b;
-                        } else {
-                            step.x = a;
-                            step.y = b;
-                        }
-                    },
-                }));
-                break;
+        case 'move':
+            return this._positionControls({
+                step,
+                toggle: toggleButton('go-jump-symbolic',
+                    _('Move by an offset instead of to a position'), false),
+                onModeName: 'rel',
+                off: () => [step.x ?? 0, step.y ?? 0],
+                // An offset is numbers too — they just are not a place, so
+                // there is nothing to point at or flash on the screen.
+                on: { values: () => [step.dx ?? 0, step.dy ?? 0] },
+                store: true,
+                apply: ([a, b]) => {
+                    if (step.mode === 'rel') {
+                        step.dx = a;
+                        step.dy = b;
+                    } else {
+                        step.x = a;
+                        step.y = b;
+                    }
+                },
+            });
 
-            case 'key':
-                // One field for the whole combo, in the order the row's own
-                // title reads it and the order the fingers go down: modifiers
-                // first, the key last. Two fields asked which of them a name
-                // belonged in — a question with one right answer, since the
-                // last name typed is always the key.
-                //
-                // Action and hold are not here: they sit on the step's own
-                // line, the way a click's button and hold do.
-                rows.push(entryRow(_('Keys (evdev names, e.g. KEY_LEFTCTRL KEY_F)'),
-                    [...(step.mods ?? []), step.code].join(' '), text => {
+        case 'key':
+            return [
+                // One field for the whole combo, in the order the fingers go
+                // down: modifiers first, the key last. Shown without the KEY_
+                // every name starts with, which is put back on the way in.
+                suffixEntry(
+                    [...(step.mods ?? []), step.code].map(name => name.replace(/^KEY_/, '')).join(' '),
+                    'LEFTCTRL C',
+                    _('Keys by evdev name, modifiers first: LEFTCTRL C. The KEY_ in front is optional'),
+                    text => {
                         const names = text.split(/[\s,+]+/).filter(Boolean).map(evdevKeyName);
                         // An empty field is a field being retyped, not a step
                         // asking to lose its key: leave the last good combo in
@@ -2119,35 +2050,100 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
                             step.mods = names.slice(0, -1);
                         }
                         save();
-                    }));
-                break;
+                    }, { width: 8, max: 14, settle: true }),
+                ...this._pressControls(step, follows, {
+                    actions: keyActionLabels(),
+                    action: _('A whole keystroke, or one half of one: press it and leave it down, or release what is down'),
+                    hold: _('How long the key stays down'),
+                }),
+            ];
 
-            case 'text':
-                // Delay is not here: it sits on the step's own line.
-                rows.push(entryRow(_('Text'), step.value, text => {
+        case 'text':
+            return [
+                suffixEntry(step.value, _('Text to type'), _('The text to type'), text => {
                     step.value = text;
                     save();
-                }));
-                break;
+                }, { width: 10, max: 24, settle: true }),
+                numberEntry(step.delayMs ?? 12, 0, 1000,
+                    _('Delay between keys, in milliseconds'), value => {
+                        step.delayMs = value;
+                        save();
+                    }, true),
+            ];
 
-            case 'if':
-                rows.push(...this._buildConditionSection(_('Condition'), step.cond, next => {
-                    step.cond = next;
+        case 'wait':
+            return [
+                numberEntry(step.ms, 0, 3600000,
+                    _('How long to wait, in milliseconds'), value => {
+                        step.ms = value;
+                        save();
+                    }, true),
+                this._joiner('±'),
+                numberEntry(step.jitterMs ?? 0, 0, 600000,
+                    _('Vary each wait by up to this much, either way, in milliseconds'), value => {
+                        step.jitterMs = value;
+                        save();
+                    }, true),
+            ];
+
+        case 'scroll':
+            return [
+                this._joiner('↔'),
+                numberEntry(step.dx, -1000, 1000,
+                    _('Horizontal scroll clicks'), value => {
+                        step.dx = value;
+                        save();
+                    }),
+                this._joiner('↕'),
+                numberEntry(step.dy, -1000, 1000,
+                    _('Vertical scroll clicks'), value => {
+                        step.dy = value;
+                        save();
+                    }),
+            ];
+
+        case 'onevent': {
+            const isButton = (TRIGGER_SOURCES as readonly string[]).includes(step.source);
+            const widgets: Gtk.Widget[] = [
+                chooser([...TRIGGER_SOURCES, 'custom'], eventSourceLabels(),
+                    isButton ? step.source : 'custom',
+                    _('Which button or key this step waits for — the event is swallowed'),
+                    value => {
+                        step.source = value === 'custom' ? '' : value;
+                        this._saveAndRebuild();
+                    }, 7),
+            ];
+            if (!isButton) {
+                widgets.push(suffixEntry(step.source, 'KEY_F13',
+                    _('The key waited for, by evdev name'), text => {
+                        step.source = text.trim().toUpperCase();
+                        save();
+                    }, { width: 7, max: 12, settle: true }));
+            }
+            // Which edge wakes it. The default takes the next one whichever it
+            // is, so the first such step in the flow catches the press and the
+            // next one the release — a hold is two of them around whatever
+            // should happen in between. Naming one edge instead says it
+            // outright, and sleeps through the other.
+            widgets.push(chooser(EVENT_EDGES, eventEdgeLabels(), step.edge ?? 'either',
+                _('Which edge wakes the run: the press, the release, or ' +
+                  'whichever comes next'),
+                value => {
+                    step.edge = value === 'either' ? undefined : value;
+                    // The steps below follow this edge, and their tooltips
+                    // say so: redraw rather than save.
                     this._saveAndRebuild();
-                }, condKey));
-                break;
-
-            // Everything else folds open onto nothing, and so does not fold
-            // open at all: a scroll, a wait, a repeat, a start and a stop
-            // each say all they have on their own line — "Scroll
-            // 3 vertically", "Wait 1s ±200ms", Start “Ready” — and a card that
-            // opens onto a single control you can already see is a card that
-            // should stay shut.
-            default:
-                break;
+                }, 7));
+            return widgets;
         }
 
-        return rows;
+        case 'start':
+        case 'stop':
+            return this._startStopChoosers(macro, step);
+
+        default:
+            return [];
+        }
     }
 
     /**
@@ -2160,38 +2156,42 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
     private _startStopChoosers(
         macro: Macro,
         step: Extract<Step, { kind: 'start' | 'stop' }>,
-        retitle: () => void,
     ): Gtk.Widget[] {
         // Every macro but this one, and "this one" as the first choice — a
         // start pointing here is a restart, a stop pointing here ends the run,
         // and both are worth having without picking a name.
         const others = this._store.macros.filter(other => other.id !== macro.id);
-        // A macro that has since been deleted is not a choice any more, so the
-        // step falls back to meaning itself rather than naming a macro that is
-        // not there.
-        if (step.macro && !others.some(other => other.id === step.macro)) {
-            step.macro = '';
-        }
         const options = ['', ...others.map(other => other.id)];
-        const labels: Record<string, string> = { '': _('This macro') };
+        const labels: Record<string, string> = { '': _('This one') };
         for (const other of others) {
             labels[other.id] = other.name;
         }
-        const widgets: Gtk.Widget[] = [
-            chooser(options, labels, step.macro ?? '', _('Which macro'), value => {
+        // A macro that has since been deleted is said to be missing, in red,
+        // until another is picked — not shown as "This one", which a stop
+        // would take as stopping itself, and which the shell would not do
+        // anyway: it still holds the old name, and refuses it when it runs.
+        const missing = Boolean(step.macro) && !others.some(other => other.id === step.macro);
+        if (missing) {
+            options.push(step.macro!);
+            labels[step.macro!] = _('Missing macro');
+        }
+        const which = chooser(options, labels, step.macro ?? '',
+            missing ? _('The macro this named has been deleted — pick another') : _('Which macro'),
+            value => {
                 step.macro = value;
                 // Whatever step was chosen belonged to the previous macro.
                 step.at = '';
                 this._saveAndRebuild();
-            }),
-        ];
+            }, 14);
+        setClass(which, 'error', missing);
+        const widgets: Gtk.Widget[] = [which];
 
         if (step.kind === 'start') {
             // The steps of whichever macro is being started, indented the way
             // the editor nests them, so the list reads as the macro does.
             const target = step.macro ? others.find(other => other.id === step.macro) : macro;
             const stepIds = [''];
-            const stepLabels: Record<string, string> = { '': _('From the top') };
+            const stepLabels: Record<string, string> = { '': _('From top') };
             walk(target?.body ?? [], loc => {
                 // Not this step itself: starting at it would only run it again,
                 // and again.
@@ -2208,49 +2208,64 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
             }
             widgets.push(chooser(stepIds, stepLabels, step.at ?? '', _('Where in it to begin'), value => {
                 step.at = value;
-                retitle();
                 this._save();
-            }));
+            }, 12));
         }
 
         return widgets;
     }
 
+    /**
+     * A condition as rows under its `if`: its own settings, then what it
+     * contains, indented one level per level of nesting rather than folded —
+     * the `if` is what folds, and a fold inside a fold hid the one line you
+     * were looking for. `onRemove` puts a bin on the first line, for a member
+     * of an "all of" or "any of".
+     */
     private _buildConditionSection(
         title: string,
         condition: Condition,
         replace: (next: Condition) => void,
-        key: string,
+        depth: number,
+        onRemove?: () => void,
     ): Gtk.Widget[] {
-        const rows = this._buildConditionRows(condition, replace, key);
-        const pick = chooser(
-            CONDITION_TYPES, CONDITION_TYPE_LABELS, condition.type,
+        const rows = this._buildConditionRows(condition, depth);
+        const trailing: Gtk.Widget[] = [chooser(
+            CONDITION_TYPES, conditionTypeLabels(), condition.type,
             _('What this condition checks'),
             type => replace(newCondition(type)),
-        );
+            8,
+        )];
+        if (onRemove) {
+            trailing.push(iconButton('user-trash-symbolic', _('Remove'), onRemove));
+        }
 
-        // A group's rows are its children, and this line is the one thing that
-        // holds them together — it says how many there are and stays put.
-        const group = condition.type === 'and' || condition.type === 'or'
-            ? condition.of : null;
-
-        // Otherwise the type and the setting that qualifies it are one sentence
-        // — ask the LLM, about this prompt — so the chooser joins that setting
+        // The type and the setting that qualifies it are one sentence — ask
+        // the LLM, about this prompt — so the chooser joins that setting
         // rather than spending a line above it saying only its own name.
-        // Conditions that lead with a fold (not) or show nothing at all
-        // (always) keep the row: there is no line there to share.
+        // Conditions with nothing of their own to show (always, and the ones
+        // that only hold others) keep a line for it.
         const headline = rows[0];
-        if (!group && (headline instanceof Adw.ActionRow || headline instanceof Adw.EntryRow)) {
-            headline.add_suffix(pick);
+        if ((condition.type === 'llm' || condition.type === 'color') &&
+            (headline instanceof Adw.ActionRow || headline instanceof Adw.EntryRow)) {
+            for (const widget of trailing) {
+                headline.add_suffix(widget);
+            }
             return rows;
         }
 
-        const row = new Adw.ActionRow({ title });
-        if (group) {
-            row.set_subtitle(
-                `${group.length} ${group.length === 1 ? _('condition') : _('conditions')}`);
+        // A group's line is the one thing that holds its members together, so
+        // it says how many there are.
+        const group = condition.type === 'and' || condition.type === 'or' ? condition.of : null;
+        const row = new Adw.ActionRow({
+            title: this._titleWith(title, group
+                ? `${group.length} ${group.length === 1 ? _('condition') : _('conditions')}`
+                : undefined),
+        });
+        row.set_margin_start(depth * INDENT_PX);
+        for (const widget of trailing) {
+            row.add_suffix(widget);
         }
-        row.add_suffix(pick);
         return [row, ...rows];
     }
 
@@ -2265,6 +2280,7 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
             active: condition.flash === true,
             tooltip_text: _('Flash a green outline over the checked area for a second whenever this check runs'),
             valign: Gtk.Align.CENTER,
+            css_classes: ['flat'],
         });
         flash.connect('toggled', () => {
             condition.flash = flash.get_active();
@@ -2273,14 +2289,15 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
         return flash;
     }
 
-    private _buildConditionRows(
-        condition: Condition,
-        replace: (next: Condition) => void,
-        key: string,
-    ): Gtk.Widget[] {
+    private _buildConditionRows(condition: Condition, depth: number): Gtk.Widget[] {
         const rows: Gtk.Widget[] = [];
         const save = () => this._save();
         const rebuild = () => this._saveAndRebuild();
+        const indent = (row: Gtk.Widget) => {
+            row.set_margin_start(depth * INDENT_PX);
+            row.add_css_class('macroclickwerk-line');
+            rows.push(row);
+        };
 
         switch (condition.type) {
             case 'always':
@@ -2294,40 +2311,30 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
                 });
                 promptRow.add_suffix(infoButton(
                     _('How to word this, and what is actually sent'), promptHelp(), 64));
-                rows.push(promptRow);
+                indent(promptRow);
 
+                const region = condition.region;
                 const areaRow = new Adw.ActionRow({
-                    title: _('Screen area'),
-                    subtitle: condition.region
-                        ? `${condition.region.w}×${condition.region.h} at ${condition.region.x},${condition.region.y}`
-                        : _('The whole screen'),
+                    title: this._titleWith(_('Area'), region
+                        ? `${region.w}×${region.h} @ ${region.x},${region.y}`
+                        : _('whole screen')),
+                    title_lines: 1,
                 });
-                const pick = new Gtk.Button({
-                    label: _('Pick'),
-                    tooltip_text: _('Drag a rectangle over the screen to select the area'),
-                    valign: Gtk.Align.CENTER,
-                });
-                pick.connect('clicked', () => this._pickRegionFor(condition));
-                areaRow.add_suffix(pick);
-                if (condition.region) {
-                    const region = condition.region;
-                    const show = new Gtk.Button({ label: _('Show'), valign: Gtk.Align.CENTER });
-                    show.connect('clicked', () => this._showMarker(region.x, region.y, region.w, region.h));
-                    areaRow.add_suffix(show);
-                    const clear = new Gtk.Button({
-                        label: _('Screen'),
-                        tooltip_text: _('Check the whole screen instead'),
-                        valign: Gtk.Align.CENTER,
-                    });
-                    clear.connect('clicked', () => {
-                        condition.region = null;
-                        rebuild();
-                    });
-                    areaRow.add_suffix(clear);
+                areaRow.add_suffix(iconButton('find-location-symbolic',
+                    _('Drag a rectangle over the screen to select the area'),
+                    () => this._pickRegionFor(condition)));
+                if (region) {
+                    areaRow.add_suffix(iconButton('view-reveal-symbolic',
+                        _('Flash this area on the screen for a couple of seconds'),
+                        () => this._showMarker(region.x, region.y, region.w, region.h)));
+                    areaRow.add_suffix(iconButton('view-fullscreen-symbolic',
+                        _('Check the whole screen instead'), () => {
+                            condition.region = null;
+                            rebuild();
+                        }));
                 }
                 areaRow.add_suffix(this._flashToggle(condition));
-                rows.push(areaRow);
-
+                indent(areaRow);
                 break;
             }
 
@@ -2336,7 +2343,7 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
                 // and so it is the line the type chooser joins. Tolerance sits
                 // on it for the same reason: on its own line the number said
                 // nothing about what it measured.
-                const colourRow = entryRow(_('Colour (#rrggbb)'), condition.color, text => {
+                const colourRow = entryRow(_('Colour #rrggbb'), condition.color, text => {
                     condition.color = text.trim();
                     save();
                 });
@@ -2347,22 +2354,19 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
                     _('What this colour looks like'));
                 colourRow.connect('changed', () => swatch.queue_draw());
                 colourRow.add_suffix(swatch);
-                colourRow.add_suffix(spinSuffix(condition.tolerance, 0, 442,
+                colourRow.add_suffix(this._joiner('±'));
+                colourRow.add_suffix(numberEntry(condition.tolerance, 0, 442,
                     _('Tolerance: how far off this colour a pixel may be and still count'),
                     value => {
                         condition.tolerance = value;
                         save();
                     }));
-                const read = new Gtk.Button({
-                    label: _('Read'),
-                    tooltip_text: _('Fill this in with the colour that area has on the screen right now — over an area, its average'),
-                    valign: Gtk.Align.CENTER,
-                });
-                read.connect('clicked', () => this._readColorFor(condition));
-                colourRow.add_suffix(read);
-                rows.push(colourRow);
+                colourRow.add_suffix(iconButton('color-select-symbolic',
+                    _('Fill this in with the colour that area has on the screen right now — over an area, its average'),
+                    () => this._readColorFor(condition)));
+                indent(colourRow);
 
-                const areaRow = this._numbersRow(_('Area (x, y, width, height)'),
+                const areaRow = this._numbersRow(_('Area x, y, w, h'),
                     [condition.x, condition.y, condition.w, condition.h],
                     ([x, y, w, h]) => {
                         this._setColorArea(condition, { x, y, w, h });
@@ -2374,99 +2378,81 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
                         run: () => this._pickColorFor(condition),
                     });
                 areaRow.add_suffix(this._flashToggle(condition));
-                rows.push(areaRow);
-
+                indent(areaRow);
                 break;
             }
 
-            case 'not': {
-                const nested = this._expander(`${key}:not`, {
-                    title: _('Inverted condition'),
-                    subtitle: withColorSwatches(describeCondition(condition.of)),
-                });
-                for (const child of this._buildConditionSection(_('Type'), condition.of, next => {
+            case 'not':
+                rows.push(...this._buildConditionSection(_('Not this'), condition.of, next => {
                     condition.of = next;
                     rebuild();
-                }, `${key}:not`)) {
-                    nested.add_row(child);
-                }
-                rows.push(nested);
+                }, depth + 1));
                 break;
-            }
 
             case 'and':
             case 'or': {
-                // No fold of its own: the line above already says "all of" or
-                // "any of" and carries the count, so a second line saying the
-                // same thing only bought a level of indentation. The children
-                // sit directly under it, each still folding on its own.
-                const addRow = new Adw.ActionRow({ title: _('Add a sub-condition') });
-                const model = new Gtk.StringList();
-                const addable = GROUPABLE_TYPES;
-                for (const type of addable) {
-                    model.append(CONDITION_TYPE_LABELS[type]);
-                }
-                const dropdown = new Gtk.DropDown({ model, valign: Gtk.Align.CENTER });
-                const addButton = new Gtk.Button({ label: _('Add'), valign: Gtk.Align.CENTER });
-                addButton.connect('clicked', () => {
-                    condition.of.push(newCondition(addable[dropdown.get_selected()]));
-                    rebuild();
-                });
-                addRow.add_suffix(dropdown);
-                addRow.add_suffix(addButton);
-                rows.push(addRow);
-
+                // Members first, then the line that adds one — the order the
+                // steps of a body keep, for the same reason: it adds below.
                 condition.of.forEach((child, index) => {
-                    const childRow = this._expander(`${key}:${index}`, {
-                        title: withColorSwatches(`${index + 1}. ${describeCondition(child)}`),
-                    });
-                    childRow.add_suffix(iconButton('user-trash-symbolic', _('Remove'), () => {
+                    rows.push(...this._buildConditionSection(`${index + 1}.`, child, next => {
+                        condition.of[index] = next;
+                        rebuild();
+                    }, depth + 1, () => {
                         condition.of.splice(index, 1);
                         rebuild();
                     }));
-                    for (const widget of this._buildConditionSection(_('Type'), child, next => {
-                        condition.of[index] = next;
-                        rebuild();
-                    }, `${key}:${index}`)) {
-                        childRow.add_row(widget);
-                    }
-                    rows.push(childRow);
                 });
 
+                const addRow = new Adw.ActionRow({ css_classes: ['macroclickwerk-add'] });
+                addRow.add_prefix(this._menuButton(_('Add condition'), GROUPABLE_TYPES.map(type => ({
+                    label: conditionTypeLabels()[type],
+                    run: () => {
+                        condition.of.push(newCondition(type));
+                        rebuild();
+                    },
+                })), 'list-add-symbolic'));
+                // Under the members, at their depth: it adds one of them.
+                addRow.set_margin_start((depth + 1) * INDENT_PX);
+                rows.push(addRow);
                 break;
             }
         }
 
-        void replace;
         return rows;
     }
 
     // --- import / export ---------------------------------------------------
 
     /**
-     * Export and Import over both files, on one row. Each is a menu rather than
-     * a button because there are two things to move — the steps, and the machine
-     * they run on — and four buttons in a row is a row nobody reads.
+     * Export and Import over both files. Each is a menu rather than a button
+     * because there are two things to move — the steps, and the machine they
+     * run on — and four buttons in a row is a row nobody reads.
      */
-    private _transferRow(): Adw.ActionRow {
-        const row = new Adw.ActionRow({
-            title: _('Backup'),
-            subtitle: _('Macros are the steps; settings are everything else'),
-        });
-        row.add_suffix(this._transferButton(_('Export'), [
+    private _transferButtons(): Gtk.MenuButton[] {
+        const export_ = this._menuButton(_('Export'), [
             { label: _('Macros'), run: () => this._exportDocument() },
             { label: _('Settings'), run: () => this._exportSettings() },
-        ]));
-        row.add_suffix(this._transferButton(_('Import'), [
+        ]);
+        export_.set_tooltip_text(_('Macros are the steps; settings are everything else'));
+        const import_ = this._menuButton(_('Import'), [
             { label: _('Macros'), run: () => this._importDocument() },
             { label: _('Settings'), run: () => this._importSettings() },
-        ]));
-        return row;
+        ]);
+        import_.set_tooltip_text(_('Macros are the steps; settings are everything else'));
+        return [export_, import_];
     }
 
-    private _transferButton(
+    /**
+     * A button that opens a list of things to do, each done as it is picked.
+     * The popover goes down before the choice runs, so the choice is free to
+     * open a file dialog, or rebuild the page from under the button. `icon`
+     * makes it a flat one with an icon before the label, the way an add row
+     * draws it.
+     */
+    private _menuButton(
         label: string,
         choices: { label: string; run: () => void }[],
+        icon?: string,
     ): Gtk.MenuButton {
         const box = new Gtk.Box({
             orientation: Gtk.Orientation.VERTICAL,
@@ -2480,14 +2466,24 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
         for (const choice of choices) {
             const button = new Gtk.Button({ label: choice.label, css_classes: ['flat'] });
             button.connect('clicked', () => {
-                // Down before the file dialog goes up, or the popover is left
-                // hanging over it.
                 popover.popdown();
                 choice.run();
             });
             box.append(button);
         }
-        return new Gtk.MenuButton({ label, popover, valign: Gtk.Align.CENTER });
+        if (!icon) {
+            return new Gtk.MenuButton({ label, popover, valign: Gtk.Align.CENTER });
+        }
+        const content = new Gtk.Box({ spacing: 6 });
+        content.append(new Gtk.Image({ icon_name: icon }));
+        content.append(new Gtk.Label({ label }));
+        return new Gtk.MenuButton({
+            child: content,
+            popover,
+            always_show_arrow: true,
+            valign: Gtk.Align.CENTER,
+            css_classes: ['flat'],
+        });
     }
 
     /**
@@ -2755,11 +2751,11 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
     /**
      * The menu a step's row opens on a right click.
      *
-     * One entry, because there is one thing the row cannot already say. The ▶
-     * beside a step runs that step alone; Run at the top of the macro starts
-     * from the selected row, which is wherever you last clicked and rarely the
-     * step you are looking at. "Run from here" is the middle of those two:
-     * this step, and everything after it.
+     * The ▶ at the top of the macro starts from the selected row — click a
+     * step, press ▶. The menu says the two things that does not: "Run from
+     * here" is that in one go, from a right click that need not move the
+     * selection first; "Run this step only" does the one step and stops,
+     * for the kinds that are one action each.
      */
     private _stepMenu(macro: Macro, step: Step, row: Gtk.Widget, x: number, y: number): void {
         const box = new Gtk.Box({
@@ -2783,6 +2779,19 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
             this._runFrom(macro, step);
         });
         box.append(run);
+
+        if (RUNNABLE_ALONE.includes(step.kind)) {
+            const once = new Gtk.Button({
+                label: _('Run this step only'),
+                tooltip_text: _('Do this one step now, on the real screen'),
+                css_classes: ['flat'],
+            });
+            once.connect('clicked', () => {
+                popover.popdown();
+                this._runStepNow(macro.id, step);
+            });
+            box.append(once);
+        }
 
         popover.set_parent(row);
         popover.set_pointing_to(new Gdk.Rectangle({

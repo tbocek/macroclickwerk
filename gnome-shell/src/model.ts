@@ -448,8 +448,7 @@ export function pathToStep(list: Step[], id: string): string[] {
  * without an action of its own it takes the edge the event brought, going down
  * when the person pressed and up when they let go. That is what makes "hold
  * the side button, hold E" a pair of steps rather than a guess at a duration.
- * The editor uses the answer twice over: to offer those steps the choice of
- * following, and to draw them as the block they are.
+ * The editor uses the answer to offer those steps the choice of following.
  *
  * Order is the order steps are written, which is the order they run: an event
  * covers everything after it, including the insides of a repeat or an if that

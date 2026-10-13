@@ -153,6 +153,26 @@ function bandedDown(value: number): number {
     return (Math.ceil(value / step - 1e-9) - 1) * step;
 }
 
+/** An entry's own padding either side of its text, and room for the caret. */
+const FIELD_PADDING = 22;
+
+/**
+ * Keep an entry as wide as the text in it, and never narrower than `floor`:
+ * a field sized for the widest value it might hold is mostly empty on every
+ * row that holds a short one. Measured in pixels, not characters — GTK sizes
+ * a character as a digit, and the "m" of "20ms" is half as wide again, so
+ * counted in characters the unit was what got cut off.
+ */
+export function fitToText(entry: Gtk.Entry, floor: string): void {
+    entry.set_width_chars(0);
+    entry.set_max_width_chars(0);
+    const width = (sample: string) => entry.create_pango_layout(sample).get_pixel_size()[0];
+    const fit = () => entry.set_size_request(
+        Math.max(width(entry.get_text() ?? ''), width(floor)) + FIELD_PADDING, -1);
+    fit();
+    entry.connect('changed', fit);
+}
+
 /** 200 → "0.2s", 20 → "20ms", 2500 → "2.5s": how a time field shows itself. */
 function formatMsUnits(ms: number): string {
     if (Math.abs(ms) < 100) {
@@ -183,8 +203,17 @@ function parseMsUnits(text: string): number | null {
  * button's increment is fixed per widget, not per press. With `timeUnits` the
  * field speaks human time — shows 0.2s rather than 200, reads "300ms", "0.5s"
  * and bare milliseconds.
+ *
+ * A time field gets − and + beside it: a duration is the number you nudge —
+ * a hold from 20ms to 30ms — where a count or an offset is a number you type.
+ * Every field also steps on ↑ and ↓, and on the scroll wheel — the wheel only
+ * once the field has the focus, so scrolling the page past a field does not
+ * change what is in it.
+ *
+ * The field is as wide as what it shows, three digits at the least — see
+ * `fitToText`.
  */
-export function spinSuffix(
+export function numberEntry(
     value: number,
     lower: number,
     upper: number,
@@ -205,21 +234,14 @@ export function spinSuffix(
 
     const entry = new Gtk.Entry({
         text: show(current),
-        tooltip_text: tooltip,
+        tooltip_text: `${tooltip}\n↑ ↓ or scroll to step`,
         valign: Gtk.Align.CENTER,
         xalign: 1,
         input_purpose: Gtk.InputPurpose.DIGITS,
-        // Sized to the largest number it can hold, plus a minus sign where
-        // there can be one, but capped: a wait may run to an hour, and a field
-        // sized for 3600000 is a wide field on every row that a wait is not.
-        // Past the cap it scrolls — the value stays whole, only its widest end
-        // is out of view, and that end is the rare one. Time fields get one
-        // more, for the unit: "0.25s" is five.
-        width_chars: Math.min(timeUnits ? 5 : 4, Math.max(3, `${upper}`.length + (lower < 0 ? 1 : 0))),
-        max_width_chars: Math.min(timeUnits ? 5 : 4, Math.max(3, `${upper}`.length + (lower < 0 ? 1 : 0))),
     });
+    fitToText(entry, '000');
 
-    /** What the field says right now, for the nudge to step from — the typed
+    /** What the field says right now, for a step to start from — the typed
      * text when it parses, the last good value when it does not. */
     const read = () => {
         const parsed = parse(entry.get_text() ?? '');
@@ -241,11 +263,46 @@ export function spinSuffix(
     entry.connect('changed', typed);
     entry.connect('activate', () => commit(read()));
 
+    // Captured before the text inside the entry sees them, which would take
+    // ↑ and ↓ as a request to move the focus.
+    const keys = new Gtk.EventControllerKey({ propagation_phase: Gtk.PropagationPhase.CAPTURE });
+    keys.connect('key-pressed', (_controller, keyval: number) => {
+        if (keyval === Gdk.KEY_Up || keyval === Gdk.KEY_KP_Up) {
+            commit(bandedUp(read()));
+            return true;
+        }
+        if (keyval === Gdk.KEY_Down || keyval === Gdk.KEY_KP_Down) {
+            commit(bandedDown(read()));
+            return true;
+        }
+        return false;
+    });
+    entry.add_controller(keys);
+
+    // A touchpad scrolls in fractions of a notch, many times a second, so the
+    // fractions add up to whole steps rather than each being one.
+    let scrolled = 0;
+    const wheel = new Gtk.EventControllerScroll({ flags: Gtk.EventControllerScrollFlags.VERTICAL });
+    wheel.connect('scroll', (_controller, _dx: number, dy: number) => {
+        if (!(entry.get_state_flags() & Gtk.StateFlags.FOCUS_WITHIN)) {
+            return false;   // the page's scroll, not ours
+        }
+        scrolled += dy;
+        while (Math.abs(scrolled) >= 1) {
+            commit(scrolled < 0 ? bandedUp(read()) : bandedDown(read()));
+            scrolled -= Math.sign(scrolled);
+        }
+        return true;
+    });
+    entry.add_controller(wheel);
+    if (!timeUnits) {
+        return entry;
+    }
+
     const minus = new Gtk.Button({ label: '−', tooltip_text: tooltip });
     const plus = new Gtk.Button({ label: '+', tooltip_text: tooltip });
     minus.connect('clicked', () => commit(bandedDown(read())));
     plus.connect('clicked', () => commit(bandedUp(read())));
-
     const box = new Gtk.Box({
         valign: Gtk.Align.CENTER,
         css_classes: ['linked', 'macroclickwerk-spin'],
@@ -261,12 +318,12 @@ export function spinSuffix(
  * things from the same strings — the button must not grow the window, the list
  * must stay readable — so each gets its own.
  */
-function labelFactory(forButton: boolean, maxChars: number): Gtk.SignalListItemFactory {
+function labelFactory(forButton: boolean, maxChars: number, ellipsize = forButton): Gtk.SignalListItemFactory {
     const factory = new Gtk.SignalListItemFactory();
     factory.connect('setup', (_f, item: Gtk.ListItem) => {
         item.set_child(new Gtk.Label({
             xalign: forButton ? 1 : 0,
-            ellipsize: forButton ? Pango.EllipsizeMode.END : Pango.EllipsizeMode.NONE,
+            ellipsize: ellipsize ? Pango.EllipsizeMode.END : Pango.EllipsizeMode.NONE,
             max_width_chars: forButton ? maxChars : -1,
         }));
     });
@@ -294,31 +351,42 @@ export function chooser<T extends string>(
     onChange: (value: T) => void,
     maxChars = 22,
 ): Gtk.DropDown {
+    // Labels that all fit are never cut short: an ellipsis is how a label
+    // makes room, and "L…" is not a button anyone can read. On a full row it is
+    // the title that gives way instead.
+    const fits = options.every(option => (labels[option] ?? option).length <= maxChars);
     const dropdown = new Gtk.DropDown({
         model: optionModel(options, labels),
         selected: Math.max(0, options.indexOf(selected)),
         tooltip_text: tooltip,
         valign: Gtk.Align.CENTER,
-        factory: labelFactory(true, maxChars),
+        factory: labelFactory(true, maxChars, !fits),
         list_factory: labelFactory(false, maxChars),
     });
     onPicked(dropdown, options, selected, onChange);
     return dropdown;
 }
 
-/** A bare entry for a row suffix, where an EntryRow would be a whole row. */
+/**
+ * A bare entry for a row suffix, where an EntryRow would be a whole row.
+ * `settle` commits only once typing pauses, so a half-typed value is never
+ * written — or, for a key, never taken for the key.
+ */
 export function suffixEntry(
     text: string, placeholder: string, tooltip: string,
     onChange: (text: string) => void,
+    opts: { width?: number; max?: number; settle?: boolean } = {},
 ): Gtk.Entry {
     const entry = new Gtk.Entry({
         text,
         placeholder_text: placeholder,
         tooltip_text: tooltip,
         valign: Gtk.Align.CENTER,
-        width_chars: 9,
+        width_chars: opts.width ?? 9,
+        max_width_chars: opts.max ?? -1,
     });
-    entry.connect('changed', () => onChange(entry.get_text() ?? ''));
+    const commit = () => onChange(entry.get_text() ?? '');
+    entry.connect('changed', opts.settle ? debounce(commit) : commit);
     return entry;
 }
 
@@ -386,12 +454,17 @@ export function withColorSwatches(text: string): string {
         hex => `${hex} <span bgcolor="${hex}" fgcolor="${hex}">██</span>`);
 }
 
+/**
+ * `image-button` by hand: GTK used to add it to any button showing an icon,
+ * and the stylesheets that size such buttons — the theme's, and ours — still
+ * key on it.
+ */
 export function iconButton(iconName: string, tooltip: string, onClick: () => void): Gtk.Button {
     const button = new Gtk.Button({
         icon_name: iconName,
         tooltip_text: tooltip,
         valign: Gtk.Align.CENTER,
-        css_classes: ['flat'],
+        css_classes: ['flat', 'image-button'],
     });
     button.connect('clicked', onClick);
     return button;
@@ -404,7 +477,22 @@ export function toggleButton(iconName: string, tooltip: string, active: boolean)
         tooltip_text: tooltip,
         active,
         valign: Gtk.Align.CENTER,
-        css_classes: ['flat'],
+        css_classes: ['flat', 'image-button'],
+    });
+}
+
+/**
+ * A toggle that shows one character rather than an icon — "@" says "at the
+ * pointer" better than any picture of a mouse. Sized as an icon button, which
+ * is what it sits among.
+ */
+export function glyphToggle(glyph: string, tooltip: string, active: boolean): Gtk.ToggleButton {
+    return new Gtk.ToggleButton({
+        label: glyph,
+        tooltip_text: tooltip,
+        active,
+        valign: Gtk.Align.CENTER,
+        css_classes: ['flat', 'image-button'],
     });
 }
 
