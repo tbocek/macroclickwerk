@@ -5,7 +5,7 @@ import GLib from 'gi://GLib';
 
 import type { ColorCondition, Condition, LlmCondition, Region } from './model.js';
 import { describeCondition } from './model.js';
-import { LlmClient, LlmError, type LlmSettings } from './llm.js';
+import { LlmClient, LlmError, type LlmSettings, type Verdict } from './llm.js';
 import { reportProblem } from './problems.js';
 import type { Config } from './store.js';
 import { captureRegion, captureScreen, encodeForLlm } from './screenshot.js';
@@ -149,7 +149,12 @@ export class ConditionEvaluator {
         return outcome;
     }
 
-    private async _evaluateLlm(condition: LlmCondition): Promise<{ result: boolean; detail: string }> {
+    /**
+     * Ask the model one LLM check on the screen as it is now, and hand back
+     * its verdict as it gave it. What a run evaluates, and what the editor's
+     * Check now shows, so the two cannot disagree about what was asked.
+     */
+    async askLlm(condition: LlmCondition): Promise<Verdict> {
         // Endpoint, model and timeout are global settings: a per-condition copy
         // of each was more knobs than anyone wants on every prompt.
         const settings: LlmSettings = {
@@ -157,21 +162,25 @@ export class ConditionEvaluator {
             model: this._config.llmModel,
             apiKey: this._config.llmApiKey,
             timeoutMs: this._config.llmTimeoutMs,
+            kind: this._config.llmKind,
+            threshold: this._config.llmThreshold,
         };
+        const pixbuf = condition.region
+            ? await captureRegion(condition.region.x, condition.region.y, condition.region.w, condition.region.h)
+            : await captureScreen();
+        const image = encodeForLlm(pixbuf, this._config.llmMaxWidth);
+        // After the capture — the flash must not be in the picture the model
+        // is asked about — and after the encode, which blocks the main loop
+        // and would sit between the flash and its first paint.
+        if (condition.flash) {
+            this._onFlash?.(condition.region);
+        }
+        return this._llm.ask(condition.prompt, image, settings);
+    }
 
+    private async _evaluateLlm(condition: LlmCondition): Promise<{ result: boolean; detail: string }> {
         try {
-            const pixbuf = condition.region
-                ? await captureRegion(condition.region.x, condition.region.y, condition.region.w, condition.region.h)
-                : await captureScreen();
-            const image = encodeForLlm(pixbuf, this._config.llmMaxWidth);
-            // After the capture — the flash must not be in the picture the
-            // model is asked about — and after the encode, which blocks the
-            // main loop and would sit between the flash and its first paint.
-            if (condition.flash) {
-                this._onFlash?.(condition.region);
-            }
-            const verdict = await this._llm.ask(condition.prompt, image, settings);
-
+            const verdict = await this.askLlm(condition);
             const detail = `model said ${verdict.match ? 'yes' : 'no'}${verdict.reason ? ` — ${verdict.reason}` : ''} (${verdict.latencyMs}ms)`;
             return { result: verdict.match, detail };
         } catch (error) {
@@ -180,7 +189,7 @@ export class ConditionEvaluator {
             // macro down a branch on no evidence. Say so and stop.
             reportProblem('Model', message, {
                 where: describeCondition(condition),
-                hint: `Macroclickwerk asked ${settings.endpoint || '(no endpoint set)'} — start that server, ` +
+                hint: `Macroclickwerk asked ${this._config.llmEndpoint || '(no endpoint set)'} — start that server, ` +
                     'point Settings → Model somewhere else, or replace the check with a colour test.',
             });
             throw new Error(`the model could not answer: ${message}`);

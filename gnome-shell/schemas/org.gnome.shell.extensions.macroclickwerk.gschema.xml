@@ -121,6 +121,18 @@
             <description>Internal: JSON reporting whether the recording started or stopped</description>
         </key>
 
+        <key name="check-condition-request" type="s">
+            <default>''</default>
+            <summary>Check a condition now</summary>
+            <description>Internal: JSON carrying a condition the editor wants answered on the screen as it is</description>
+        </key>
+
+        <key name="check-condition-result" type="s">
+            <default>''</default>
+            <summary>Check a condition result</summary>
+            <description>Internal: JSON with the answer, or why there was none</description>
+        </key>
+
         <key name="run-step-request" type="s">
             <default>''</default>
             <summary>Run one step</summary>
@@ -181,6 +193,23 @@
             <default>'http://localhost:11434/v1/chat/completions'</default>
             <summary>Chat completions endpoint</summary>
             <description>OpenAI-compatible endpoint used for screenshot questions</description>
+        </key>
+
+        <key name="llm-kind" type="s">
+            <choices>
+                <choice value='chat'/>
+                <choice value='decision'/>
+            </choices>
+            <default>'chat'</default>
+            <summary>Kind of model</summary>
+            <description>'chat': an OpenAI-compatible chat endpoint, asked for a JSON verdict. 'decision': a decision model on a SystemOne-style endpoint (/v1/systemone), asked one yes/no question and answering with a probability</description>
+        </key>
+
+        <key name="llm-decision-threshold" type="i">
+            <default>50</default>
+            <range min="50" max="99"/>
+            <summary>Decision threshold</summary>
+            <description>For a decision model: how likely yes must be, in percent, for a check to count as yes</description>
         </key>
 
         <key name="llm-model" type="s">

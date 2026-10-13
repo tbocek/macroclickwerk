@@ -16,6 +16,14 @@ export interface LlmSettings {
     model: string;
     apiKey: string;
     timeoutMs: number;
+    /**
+     * 'chat' asks an OpenAI-compatible chat endpoint for a JSON verdict.
+     * 'decision' asks a decision model one yes/no question and gets a
+     * probability back, with nothing generated. Chat when absent.
+     */
+    kind?: 'chat' | 'decision';
+    /** For a decision model: how likely yes must be to count as yes. 0.5 when absent. */
+    threshold?: number;
 }
 
 export interface Verdict {
@@ -77,6 +85,93 @@ export function buildInstruction(question: string): string {
         'Use true only when the statement is clearly true in the screenshot.',
         'If you are unsure, or cannot see the thing being asked about, use false.',
     ].join('\n');
+}
+
+/**
+ * The state a decision model is asked about. The picture is the state; this
+ * only says what the picture is, so the question can say "the button" and be
+ * understood as the one in the screenshot.
+ */
+const DECISION_STATE = 'A screenshot of a computer screen, or of the part of it being checked.';
+
+/** The one question's id in a decision request, and so in its answer. */
+const DECISION_QUESTION = 'check';
+
+/**
+ * Read a decision model's answer: the probability of yes for the one question
+ * asked, against `threshold`. The reason says how sure it was of the answer it
+ * gave, which is the part a chat model would have put into words.
+ */
+export function parseDecision(text: string, threshold: number): { match: boolean; reason: string } {
+    let p: unknown;
+    try {
+        const json = JSON.parse(text) as {
+            answers?: Record<string, { noul?: unknown }>;
+            error?: { message?: string } | string;
+        };
+        if (json.error) {
+            throw new LlmError(typeof json.error === 'string' ? json.error : json.error.message ?? 'the decision model reported an error');
+        }
+        p = json.answers?.[DECISION_QUESTION]?.noul;
+    } catch (error) {
+        if (error instanceof LlmError) {
+            throw error;
+        }
+        throw new LlmError(`could not parse the decision: ${text.slice(0, 200)}`);
+    }
+    if (typeof p !== 'number' || !Number.isFinite(p)) {
+        throw new LlmError(`the decision model gave no yes/no probability: ${text.slice(0, 200)}`);
+    }
+    const percent = (value: number) => `${Math.round(value * 100)}%`;
+    const match = p >= threshold;
+    if (match) {
+        return { match, reason: `${percent(p)} sure` };
+    }
+    // A likely yes that the threshold turned into a no says so, or the answer
+    // reads as the model being wrong rather than as the setting doing its job.
+    return { match, reason: p >= 0.5 ? `${percent(p)} yes, short of ${percent(threshold)}` : `${percent(1 - p)} sure` };
+}
+
+/** Questions that ask for an answer in words. */
+const ASKS_FOR_WORDS = /^(what|which|where|when|who|whom|whose|why|how)\b/;
+/** Openings that make it an instruction rather than a question. */
+const GIVES_ORDERS = /^(count|list|describe|find|tell|read|name|identify|give|show|extract|explain|locate|click|press|type|return|say|write|output|summari[sz]e)\b/;
+/** Openings of a yes/no question — the only kind where an "or" picks between two. */
+const ASKS_YES_NO = /^(is|are|am|was|were|does|do|did|has|have|had|can|could|will|would|should|shall|may|might|must)\b/;
+
+/**
+ * Whether a check's wording can be answered with yes or no, and if not, what
+ * to do instead — or null when it can. Both kinds of model answer exactly that
+ * and nothing else, so a question that wants a colour, a count or a choice
+ * between two gets a yes or a no that means nothing, and the macro goes down
+ * a branch on it. Caught as it is typed rather than when the macro misbehaves.
+ *
+ * Only the mistakes that cannot be answered are named. A statement that is
+ * true or false is as good as a question, and "green or yellow" in a
+ * statement is still one fact.
+ */
+export function promptAdvice(text: string): string | null {
+    const wording = text.trim().replace(/^["'“‘(]+/, '').toLowerCase();
+    if (wording === '') {
+        return 'Ask a yes/no question about what is on the screen — “Is the button green?”';
+    }
+    if (ASKS_FOR_WORDS.test(wording)) {
+        return 'This asks for an answer in words, and the model can only say yes or no. Ask about what you ' +
+            'expect instead: “Is the button green?” rather than “What colour is the button?”';
+    }
+    if (GIVES_ORDERS.test(wording)) {
+        return 'This is an instruction, not a question. Make it something yes or no answers: ' +
+            '“There are three enemies” rather than “Count the enemies”.';
+    }
+    if ((wording.match(/\?/g) ?? []).length > 1) {
+        return 'This asks more than one thing, and one yes or no cannot answer both. ' +
+            'Ask one per check — “All of” combines them.';
+    }
+    if (ASKS_YES_NO.test(wording) && /\bor\b/.test(wording)) {
+        return 'A yes would not say which of the two. Ask about one: ' +
+            '“Is the light green?” rather than “Is the light green or red?”';
+    }
+    return null;
 }
 
 let promisified = false;
@@ -271,7 +366,31 @@ export class LlmClient {
         if (!settings.endpoint) {
             throw new LlmError('no LLM endpoint configured');
         }
+        return settings.kind === 'decision'
+            ? this._askDecision(prompt, image, settings)
+            : this._askChat(prompt, image, settings);
+    }
 
+    /**
+     * A decision model is asked the statement as one yes/no question — a
+     * `noul`, in the SystemOne schema — about a state that is the screenshot.
+     * It answers with the probability of yes in a single forward pass, so
+     * there is no text to parse and nothing to think about first.
+     */
+    private async _askDecision(prompt: string, image: EncodedImage, settings: LlmSettings): Promise<Verdict> {
+        const { status, text, latencyMs } = await this._post({
+            model: settings.model,
+            state: DECISION_STATE,
+            images: [image.dataUri],
+            questions: { [DECISION_QUESTION]: { type: 'noul', instructions: prompt } },
+        }, settings);
+        if (status !== Soup.Status.OK) {
+            throw new LlmError(httpErrorText(status, text));
+        }
+        return { ...parseDecision(text, settings.threshold ?? 0.5), latencyMs };
+    }
+
+    private async _askChat(prompt: string, image: EncodedImage, settings: LlmSettings): Promise<Verdict> {
         const body: Record<string, unknown> = {
             model: settings.model,
             temperature: 0,
@@ -302,6 +421,90 @@ export class LlmClient {
             body.chat_template_kwargs = { enable_thinking: false };
         }
 
+        const { status, text, latencyMs } = await this._post(body, settings);
+
+        if (status !== Soup.Status.OK) {
+            // A rejected request may be about either extra field, and there
+            // is no telling which from the status alone. Give up the one we
+            // can most afford to lose first, and try again.
+            if (status === 400 && this._noThinking) {
+                log('macroclickwerk: endpoint rejected chat_template_kwargs, retrying without it');
+                this._noThinking = false;
+                return this._askChat(prompt, image, settings);
+            }
+            if (status === 400 && this._jsonMode) {
+                log('macroclickwerk: endpoint rejected response_format, retrying without JSON mode');
+                this._jsonMode = false;
+                return this._askChat(prompt, image, settings);
+            }
+            throw new LlmError(httpErrorText(status, text));
+        }
+
+        let content = '';
+        let reasoning = '';
+        let finish = '';
+        try {
+            const json = JSON.parse(text) as {
+                choices?: {
+                    finish_reason?: string;
+                    message?: { content?: unknown; reasoning_content?: unknown };
+                }[];
+                error?: { message?: string };
+            };
+            if (json.error?.message) {
+                throw new LlmError(json.error.message);
+            }
+            const choice = json.choices?.[0];
+            finish = choice?.finish_reason ?? '';
+            const raw = choice?.message?.content;
+            if (typeof raw === 'string') {
+                content = raw;
+            } else if (Array.isArray(raw)) {
+                // Some servers answer with the content-part array form.
+                content = raw
+                    .map(part => (typeof part === 'string' ? part : (part as { text?: string })?.text ?? ''))
+                    .join(' ');
+            }
+            if (typeof choice?.message?.reasoning_content === 'string') {
+                reasoning = choice.message.reasoning_content;
+            }
+        } catch (error) {
+            if (error instanceof LlmError) {
+                throw error;
+            }
+            throw new LlmError(`could not parse the response: ${text.slice(0, 200)}`);
+        }
+
+        // A reasoning model that would not be talked out of thinking
+        // sometimes finishes the job inside its thoughts. Only a written-out
+        // JSON object counts there: half a thought is full of the words true
+        // and no, and reading a verdict out of one would be worse than
+        // saying we could not find it.
+        const parsed = parseVerdict(content) ?? verdictFromObjects(reasoning);
+        if (!parsed) {
+            // Naming the empty case separately: an error that ends in a
+            // colon and then nothing reads like the message itself broke.
+            if (content.trim() === '') {
+                throw new LlmError(reasoning.trim() !== '' || finish === 'length'
+                    ? 'the model spent its whole answer thinking and never got to the verdict'
+                    : 'the model returned an empty answer');
+            }
+            throw new LlmError(`could not read a yes/no answer from: ${content.slice(0, 200)}`);
+        }
+
+        return { match: parsed.match, reason: parsed.reason, latencyMs };
+    }
+
+    /**
+     * Send one JSON body to the endpoint and read back whatever came: the
+     * status and the text, for the caller to judge. Owns the timeout, and
+     * turns everything that is not an answer — a refused connection, a
+     * timeout — into an LlmError.
+     */
+    private async _post(
+        body: object,
+        settings: LlmSettings,
+    ): Promise<{ status: number; text: string; latencyMs: number }> {
         const message = Soup.Message.new('POST', settings.endpoint);
         if (!message) {
             throw new LlmError(`invalid endpoint URL: ${settings.endpoint}`);
@@ -328,87 +531,14 @@ export class LlmClient {
         try {
             const session = this._session as Soup.Session & AsyncSoupSession;
             const bytes = await session.send_and_read_async(message, GLib.PRIORITY_DEFAULT, cancellable);
-            const latencyMs = Math.round((GLib.get_monotonic_time() - started) / 1000);
-
-            const status = message.get_status();
-            const text = new TextDecoder().decode(bytes.get_data() ?? new Uint8Array(0));
-
-            if (status !== Soup.Status.OK) {
-                // A rejected request may be about either extra field, and there
-                // is no telling which from the status alone. Give up the one we
-                // can most afford to lose first, and try again.
-                if (status === 400 && this._noThinking) {
-                    log('macroclickwerk: endpoint rejected chat_template_kwargs, retrying without it');
-                    this._noThinking = false;
-                    return this.ask(prompt, image, settings);
-                }
-                if (status === 400 && this._jsonMode) {
-                    log('macroclickwerk: endpoint rejected response_format, retrying without JSON mode');
-                    this._jsonMode = false;
-                    return this.ask(prompt, image, settings);
-                }
-                throw new LlmError(httpErrorText(status, text));
-            }
-
-            let content = '';
-            let reasoning = '';
-            let finish = '';
-            try {
-                const json = JSON.parse(text) as {
-                    choices?: {
-                        finish_reason?: string;
-                        message?: { content?: unknown; reasoning_content?: unknown };
-                    }[];
-                    error?: { message?: string };
-                };
-                if (json.error?.message) {
-                    throw new LlmError(json.error.message);
-                }
-                const choice = json.choices?.[0];
-                finish = choice?.finish_reason ?? '';
-                const raw = choice?.message?.content;
-                if (typeof raw === 'string') {
-                    content = raw;
-                } else if (Array.isArray(raw)) {
-                    // Some servers answer with the content-part array form.
-                    content = raw
-                        .map(part => (typeof part === 'string' ? part : (part as { text?: string })?.text ?? ''))
-                        .join(' ');
-                }
-                if (typeof choice?.message?.reasoning_content === 'string') {
-                    reasoning = choice.message.reasoning_content;
-                }
-            } catch (error) {
-                if (error instanceof LlmError) {
-                    throw error;
-                }
-                throw new LlmError(`could not parse the response: ${text.slice(0, 200)}`);
-            }
-
-            // A reasoning model that would not be talked out of thinking
-            // sometimes finishes the job inside its thoughts. Only a written-out
-            // JSON object counts there: half a thought is full of the words true
-            // and no, and reading a verdict out of one would be worse than
-            // saying we could not find it.
-            const parsed = parseVerdict(content) ?? verdictFromObjects(reasoning);
-            if (!parsed) {
-                // Naming the empty case separately: an error that ends in a
-                // colon and then nothing reads like the message itself broke.
-                if (content.trim() === '') {
-                    throw new LlmError(reasoning.trim() !== '' || finish === 'length'
-                        ? 'the model spent its whole answer thinking and never got to the verdict'
-                        : 'the model returned an empty answer');
-                }
-                throw new LlmError(`could not read a yes/no answer from: ${content.slice(0, 200)}`);
-            }
-
-            return { match: parsed.match, reason: parsed.reason, latencyMs };
+            return {
+                status: message.get_status(),
+                text: new TextDecoder().decode(bytes.get_data() ?? new Uint8Array(0)),
+                latencyMs: Math.round((GLib.get_monotonic_time() - started) / 1000),
+            };
         } catch (error) {
             if (timedOut) {
                 throw new LlmError(`timed out after ${settings.timeoutMs}ms`);
-            }
-            if (error instanceof LlmError) {
-                throw error;
             }
             throw new LlmError((error as Error).message ?? String(error));
         } finally {

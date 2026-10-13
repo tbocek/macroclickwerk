@@ -11,7 +11,7 @@ import {
 } from '../dist/src/model.js';
 import { textToEvents, keyCode, keyName, charToKey, buttonFromCode } from '../dist/src/keymap.js';
 import { starterMacro } from '../dist/src/starter.js';
-import { parseVerdict, verdictFromObjects } from '../dist/src/llm.js';
+import { parseDecision, parseVerdict, promptAdvice, verdictFromObjects } from '../dist/src/llm.js';
 import { isLoopbackEndpoint } from '../dist/src/store.js';
 import {
     reportProblem, listProblems, problemCount, clearProblems, onProblemsChanged,
@@ -533,6 +533,53 @@ clearProblems();
     const again = parseDocument(stringifyDocument(stored));
     check('a remember step survives a round trip', again.macros[0].body[0].kind === 'remember');
     check('remember is offered in the add menu', AUTHORABLE_STEP_KINDS.includes('remember'));
+}
+
+// --- wording a check so yes or no can answer it -----------------------------
+{
+    const fine = [
+        'Is the button on the left green?', 'there is a green button with the label ready',
+        'The player has over $900', 'the light is green or yellow', 'Does the dialog show an error?',
+        'Is there a restart button', '“Is the timer red?”',
+    ];
+    for (const text of fine) {
+        check(`fine as is: ${text}`, promptAdvice(text) === null, promptAdvice(text) ?? '');
+    }
+    const flagged = [
+        ['What colour is the button?', 'words'],
+        ['how many enemies are there', 'words'],
+        ['Which tab is open?', 'words'],
+        ['Count the enemies', 'instruction'],
+        ['Describe the screen', 'instruction'],
+        ['Is the light green or red?', 'which of the two'],
+        ['Is it ready? Is it green?', 'more than one'],
+        ['   ', 'yes/no question'],
+    ];
+    for (const [text, says] of flagged) {
+        const advice = promptAdvice(text) ?? '';
+        check(`flagged: ${text.trim() || '(empty)'}`, advice.includes(says), advice);
+    }
+}
+
+// --- reading a decision model's answer ---------------------------------------
+{
+    const answer = p => JSON.stringify({ model: 'm', answers: { check: { type: 'noul', noul: p } }, usage: {} });
+    const yes = parseDecision(answer(0.97), 0.5);
+    check('a likely yes is yes', yes.match && yes.reason === '97% sure', JSON.stringify(yes));
+    const no = parseDecision(answer(0.03), 0.5);
+    check('an unlikely yes is no, and says how sure', !no.match && no.reason === '97% sure', JSON.stringify(no));
+    const short = parseDecision(answer(0.72), 0.9);
+    check('a yes under the threshold is no, and says why', !short.match && short.reason === '72% yes, short of 90%', JSON.stringify(short));
+    check('the threshold itself counts as yes', parseDecision(answer(0.9), 0.9).match);
+    let thrown = '';
+    try { parseDecision(JSON.stringify({ error: { message: 'model not found' } }), 0.5); } catch (e) { thrown = e.message; }
+    check('a server error is passed on', thrown === 'model not found', thrown);
+    thrown = '';
+    try { parseDecision(JSON.stringify({ answers: {} }), 0.5); } catch (e) { thrown = e.message; }
+    check('an answer without a probability is a failure, not a no', thrown.startsWith('the decision model gave no'), thrown);
+    thrown = '';
+    try { parseDecision('<html>502</html>', 0.5); } catch (e) { thrown = e.message; }
+    check('a non-JSON reply is a failure', thrown.startsWith('could not parse the decision'), thrown);
 }
 
 print(failures === 0 ? '\nALL PASSED' : `\n${failures} FAILURES`);

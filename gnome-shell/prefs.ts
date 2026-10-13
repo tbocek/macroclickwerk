@@ -43,7 +43,7 @@ import {
     walk,
 } from './src/model.js';
 import { MacroStore } from './src/store.js';
-import { buildInstruction, testConnection } from './src/llm.js';
+import { buildInstruction, promptAdvice, testConnection } from './src/llm.js';
 import { comboCodes, isArmed, parseTriggers, type Trigger } from './src/triggers.js';
 import { keyName } from './src/keymap.js';
 import {
@@ -369,6 +369,10 @@ const EDITOR_CSS = `
 .macroclickwerk-add menubutton > button { min-height: 20px; padding: 1px 8px; }
 .macroclickwerk-add menubutton:not(.destructive-action) > button { opacity: 0.75; }
 
+/* The line under a model check: advice, or what the model said. Small, so it
+   reads as a note about the row above rather than a row of its own. */
+.macroclickwerk-hint > box.header > box.title > .title { font-size: smaller; }
+
 /* The macro's name is the heading of its card. */
 .macroclickwerk-macro-name text { font-weight: bold; }
 
@@ -438,33 +442,51 @@ const triggerActionLabels = (): Record<string, string> => ({
 
 
 /**
- * What actually decides whether a check works: advice first, then the wrapper
- * your words go into, word for word. The wrapper is built from the real thing
- * rather than described, so it cannot quietly stop being true — and having it
- * under the advice is what makes the advice obviously follow: the instruction
- * asks for true or false about one statement, so a statement lands and a
- * question invites prose.
+ * What decides whether a check works: advice first, then what your words are
+ * actually sent as. That part is built from the real thing rather than
+ * described, so it cannot quietly stop being true — and it is different for
+ * the two kinds of model: a chat model gets your words inside an instruction
+ * asking for a JSON verdict, a decision model gets them as one yes/no question
+ * and answers with how likely yes is.
  */
-function promptHelp(): string {
-    const instruction = buildInstruction(_('…your words go here…'));
-    return [
-        _('<b>Write a statement, not a question.</b>'),
+function promptHelp(kind: 'chat' | 'decision', thresholdPercent: number): string {
+    const lines = [
+        _('<b>Ask something the answer to is yes or no.</b>'),
+        _('A question or a statement that is true or false — both work.'),
         '',
-        _('<b>Lands:</b>  the button on the left is green'),
-        _('<b>Fragile:</b>  Is the button on the left green?'),
+        _('<b>Works:</b>  Is the button on the left green?'),
+        _('<b>Works:</b>  The player has over $900'),
+        _('<b>Cannot work:</b>  What colour is the button? — it wants words'),
+        _('<b>Cannot work:</b>  Count the enemies — it is an instruction'),
         '',
         _('• One visible fact at a time. “green and enabled” gives the model room to be half right.'),
         _('• Say where it is: “the button at the bottom right”.'),
-        _('• Skip “not”. Set <b>Proceed when the answer is</b> to No instead.'),
-        _('• Reading the reply is lenient: yes, YES, true, 1 and a JSON object are all understood, in any case. Only a reply with no yes or no anywhere in it counts as a failure, and then <b>If the request fails</b> decides what happens.'),
+        _('• No need for “not”: put the steps for a No answer in the If’s No branch.'),
+        _('• A tight <b>Area</b> helps more than any wording.'),
+        _('• ▶ asks the model about the screen as it is now, so you can try the wording before a macro relies on it.'),
+        _('• If the model cannot be reached or gives no answer, the macro stops and the problem log says why.'),
         '',
-        _('A tight <b>Screen area</b> helps more than any wording.'),
-        '',
-        _('<b>Your words are not sent on their own.</b> Every check sends the screenshot together with this, your text on the STATEMENT line:'),
-        '',
-        `<tt>${GLib.markup_escape_text(instruction, -1)}</tt>`,
-    ].join('\n');
+    ];
+    if (kind === 'decision') {
+        lines.push(
+            _('<b>Sent to a decision model</b> as one yes/no question about the screenshot. It answers with how likely yes is, ' +
+              'and the check counts as yes from') + ` ${thresholdPercent}% ` + _('(Settings → Model):'),
+            '',
+            `<tt>${GLib.markup_escape_text(JSON.stringify(
+                { questions: { check: { type: 'noul', instructions: _('…your words go here…') } } }, null, 1), -1)}</tt>`,
+        );
+    } else {
+        lines.push(
+            _('<b>Your words are not sent on their own.</b> Every check sends the screenshot together with this, your text on the STATEMENT line:'),
+            '',
+            `<tt>${GLib.markup_escape_text(buildInstruction(_('…your words go here…')), -1)}</tt>`,
+        );
+    }
+    return lines.join('\n');
 }
+
+/** What a hint under a check is saying, which decides how it looks. */
+type HintTone = 'advice' | 'asking' | 'yes' | 'no' | 'failed';
 
 /** One entry of a menu: what it says, and what it does when picked. */
 interface Choice {
@@ -813,6 +835,10 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
             // Both are painted by the same pass: the target only reads as a
             // target once you can see whether it is live.
             this._settings.connect('changed::record-into', () => this._applyRecordTarget()),
+            // The help under every model check describes what is sent, which
+            // depends on the kind of model and, for a decision model, the bar.
+            this._settings.connect('changed::llm-kind', () => this._saveAndRebuild()),
+            this._settings.connect('changed::llm-decision-threshold', debounce(() => this._saveAndRebuild())),
             this._settings.connect('changed::recording', () => this._applyRecordTarget()),
         );
 
@@ -2174,6 +2200,76 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
         return [row, ...rows];
     }
 
+    /** Which kind of model the checks go to — see the Model page. */
+    private _llmKind(): 'chat' | 'decision' {
+        return this._settings.get_string('llm-kind') === 'decision' ? 'decision' : 'chat';
+    }
+
+    /**
+     * A line under a check that is hidden until it has something to say:
+     * advice about the wording, or what the model answered when asked. One
+     * line for both, since an answer is about the wording that was just tried
+     * and stops being true as soon as it changes.
+     */
+    private _hintRow(): { row: Adw.ActionRow; say: (tone: HintTone | null, text: string) => void } {
+        const row = new Adw.ActionRow({ visible: false, title_lines: 0, css_classes: ['macroclickwerk-hint'] });
+        const icon = new Gtk.Image({ valign: Gtk.Align.CENTER });
+        row.add_prefix(icon);
+        const icons: Record<HintTone, string> = {
+            advice: 'dialog-warning-symbolic',
+            asking: 'content-loading-symbolic',
+            yes: 'object-select-symbolic',
+            no: 'window-close-symbolic',
+            failed: 'dialog-error-symbolic',
+        };
+        const say = (tone: HintTone | null, text: string) => {
+            clearClasses(row, ['warning', 'success', 'error']);
+            row.set_visible(tone !== null);
+            if (!tone) {
+                return;
+            }
+            icon.set_from_icon_name(icons[tone]);
+            row.set_title(text);
+            if (tone === 'advice') {
+                row.add_css_class('warning');
+            } else if (tone === 'yes') {
+                row.add_css_class('success');
+            } else if (tone === 'failed') {
+                row.add_css_class('error');
+            }
+        };
+        return { row, say };
+    }
+
+    /**
+     * Ask the model the check as it stands — the words in the field, even
+     * before they are saved — about the screen right now. The window gets out
+     * of the way first, since the screenshot is of whatever it was covering,
+     * and comes back with the answer.
+     */
+    private _checkNow(
+        condition: LlmCondition,
+        promptRow: Adw.EntryRow,
+        button: Gtk.Button,
+        hint: ReturnType<typeof this._hintRow>,
+    ): void {
+        button.set_sensitive(false);
+        hint.say('asking', _('Asking the model…'));
+        this._askShell('check-condition', { condition: { ...condition, prompt: promptRow.get_text() ?? '' } }, {
+            minimize: true,
+            onResult: answer => {
+                button.set_sensitive(true);
+                if (!answer.ok) {
+                    hint.say('failed', `${_('No answer')} — ${answer.message ?? _('unknown reason')}`);
+                    return;
+                }
+                const seconds = `${(Number(answer.latencyMs ?? 0) / 1000).toFixed(1)} s`;
+                hint.say(answer.match ? 'yes' : 'no',
+                    `${answer.match ? _('Yes') : _('No')} — ${answer.reason || _('no reason given')} · ${seconds}`);
+            },
+        });
+    }
+
     /**
      * The toggle that makes a check outline the area it is reading while it
      * reads it. Both checks that look at a piece of the screen have one, and
@@ -2210,13 +2306,28 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
                 break;
 
             case 'llm': {
-                const promptRow = entryRow(_('Prompt'), condition.prompt, text => {
+                const promptRow = entryRow(_('Yes/no question'), condition.prompt, text => {
                     condition.prompt = text;
                     save();
                 });
-                promptRow.add_suffix(infoButton(
-                    _('How to word this, and what is actually sent'), promptHelp(), 64));
+                const hint = this._hintRow();
+                const check = iconButton('media-playback-start-symbolic',
+                    _('Check now: ask the model about the screen as it is'),
+                    () => this._checkNow(condition, promptRow, check, hint));
+                promptRow.add_suffix(check);
+                promptRow.add_suffix(infoButton(_('How to word this, and what is actually sent'),
+                    promptHelp(this._llmKind(), this._settings.get_int('llm-decision-threshold')), 64));
                 indent(promptRow);
+                // Under the question, as it is typed: whether yes or no can
+                // answer it at all. A Check now answer takes the same line,
+                // until the wording changes again.
+                const advise = () => {
+                    const advice = promptAdvice(promptRow.get_text() ?? '');
+                    hint.say(advice ? 'advice' : null, advice ?? '');
+                };
+                promptRow.connect('changed', advise);
+                advise();
+                indent(hint.row);
 
                 const region = condition.region;
                 const areaRow = new Adw.ActionRow({
@@ -2874,8 +2985,9 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
         });
 
         const group = new Adw.PreferencesGroup({
-            title: _('Local vision model'),
-            description: _('Any OpenAI-compatible endpoint: llama.cpp-server, LM Studio, vLLM, or Ollama on /v1.'),
+            title: _('Vision model'),
+            description: _('A chat model on any OpenAI-compatible endpoint — llama.cpp-server, LM Studio, vLLM, ' +
+                'Ollama on /v1 — or a decision model on its SystemOne endpoint, such as llama.cpp-server’s /v1/systemone.'),
         });
 
         const endpoint = new Adw.EntryRow({ title: _('Endpoint') });
@@ -2884,6 +2996,37 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
             this._settings.set_string('llm-endpoint', endpoint.get_text() ?? '');
         });
         endpoint.connect('changed', commitEndpoint);
+
+        // Which kind of model the endpoint serves. Both answer the same yes or
+        // no; a chat model writes it out, a decision model gives a probability
+        // and nothing else, several times faster. The model's name stays a
+        // field of its own — the server decides what it is called.
+        const threshold = spinRow(_('Yes from (%)'), this._settings.get_int('llm-decision-threshold'),
+            50, 99, 5, value => this._settings.set_int('llm-decision-threshold', Math.round(value)));
+        threshold.set_subtitle(_('How sure the decision model must be before a check counts as yes'));
+        const kindHint = (value: string) => value === 'decision'
+            ? _('Answers with how likely yes is — fast, nothing generated')
+            : _('Answers in words, with a short reason');
+        const kind = comboRow(_('Kind'), ['chat', 'decision'] as const, {
+            chat: _('Chat'),
+            decision: _('Decision'),
+        }, this._llmKind(), value => {
+            this._settings.set_string('llm-kind', value);
+            kind.set_subtitle(kindHint(value));
+            threshold.set_visible(value === 'decision');
+            // The two are usually one server with two paths. Only the path
+            // is changed, and only when it is the other kind's own: anything
+            // else in the field is somebody's deliberate choice.
+            const url = endpoint.get_text() ?? '';
+            const [from, to] = value === 'decision'
+                ? ['/chat/completions', '/systemone'] : ['/systemone', '/chat/completions'];
+            if (url.endsWith(from)) {
+                endpoint.set_text(url.slice(0, -from.length) + to);
+            }
+        });
+        kind.set_subtitle(kindHint(this._llmKind()));
+        threshold.set_visible(this._llmKind() === 'decision');
+        group.add(kind);
         group.add(endpoint);
 
         const model = entryRow(_('Model'), this._settings.get_string('llm-model'), text => {
@@ -2897,6 +3040,7 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
         group.add(spinRow(_('Timeout (ms)'), this._settings.get_int('llm-timeout-ms'), 1000, 300000, 1000, value => {
             this._settings.set_int('llm-timeout-ms', Math.round(value));
         }));
+        group.add(threshold);
 
         const testRow = new Adw.ActionRow({
             title: _('Test the connection'),
@@ -2918,6 +3062,8 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
                 model: model.get_text() ?? '',
                 apiKey: apiKey.get_text() ?? '',
                 timeoutMs: this._settings.get_int('llm-timeout-ms'),
+                kind: this._llmKind(),
+                threshold: this._settings.get_int('llm-decision-threshold') / 100,
             }).then(result => {
                 testButton.sensitive = true;
                 if (!result.ok) {

@@ -17,6 +17,9 @@ import { reportProblem } from './problems.js';
 export interface Config {
     llmEndpoint: string;
     llmModel: string;
+    llmKind: 'chat' | 'decision';
+    /** For a decision model: how likely yes must be, 0.5–0.99, to count as yes. */
+    llmThreshold: number;
     llmApiKey: string;
     llmTimeoutMs: number;
     llmMaxWidth: number;
@@ -173,6 +176,8 @@ export class MacroStore {
         return {
             llmEndpoint: s.get_string('llm-endpoint'),
             llmModel: s.get_string('llm-model'),
+            llmKind: s.get_string('llm-kind') === 'decision' ? 'decision' : 'chat',
+            llmThreshold: s.get_int('llm-decision-threshold') / 100,
             llmApiKey: s.get_string('llm-api-key'),
             llmTimeoutMs: s.get_int('llm-timeout-ms'),
             llmMaxWidth: s.get_int('llm-max-width'),

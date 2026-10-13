@@ -21,7 +21,7 @@ import { MacroStore, type Config } from './src/store.js';
 import { starterMacro } from './src/starter.js';
 import {
     childLists, describeStep, findStep, lastPointerEndpoint, reachesEnd,
-    resolveRecordTarget, resolveRunStart, type Macro, type RecordTarget, type Region, type Step,
+    resolveRecordTarget, resolveRunStart, type LlmCondition, type Macro, type RecordTarget, type Region, type Step,
 } from './src/model.js';
 import { clearProblems, onProblemsChanged, problemCount, reportProblem } from './src/problems.js';
 import { EV_KEY } from './src/keymap.js';
@@ -821,6 +821,28 @@ export default class MacroclickwerkExtension extends Extension {
      * it runs. With a region already given, the pick is skipped and only the
      * colour is read, which is the editor asking what that area looks like now.
      */
+    /**
+     * Answer one LLM check on the screen as it is, for the editor's Check now:
+     * the same question a run would ask, with the model's own answer back, so
+     * a prompt can be tried before a macro depends on it. The editor has just
+     * minimised itself to clear the view, and is still on its way out.
+     */
+    private async _checkCondition(condition: LlmCondition | undefined): Promise<object> {
+        if (!this._evaluator) {
+            return { ok: false, message: 'the extension is not ready yet' };
+        }
+        if (condition?.type !== 'llm' || typeof condition.prompt !== 'string') {
+            return { ok: false, message: 'only a model check can be tried this way' };
+        }
+        await settle(SETTLE_BEFORE_SAMPLE_MS);
+        try {
+            const verdict = await this._evaluator.askLlm(condition);
+            return { ok: true, match: verdict.match, reason: verdict.reason, latencyMs: verdict.latencyMs };
+        } catch (error) {
+            return { ok: false, message: (error as Error).message };
+        }
+    }
+
     private async _pickColor(given: Region | null): Promise<object> {
         const region = given ?? await pickRegion({
             point: true,
@@ -1148,6 +1170,11 @@ export default class MacroclickwerkExtension extends Extension {
                     ? { ok: false, message: outcome.problem }
                     : { ok: true, recording: outcome.recording };
             });
+            return;
+        }
+        if (key === 'check-condition-request') {
+            void this._answerRequest<{ serial?: number; condition?: LlmCondition }>(
+                'check-condition', request => this._checkCondition(request.condition));
             return;
         }
         if (key === 'run-step-request') {
