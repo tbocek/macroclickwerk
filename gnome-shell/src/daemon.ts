@@ -295,7 +295,6 @@ export class EventStream {
     private _path: string;
     private _cancellable: Gio.Cancellable | null = null;
     private _connection: Gio.SocketConnection | null = null;
-    private _reader: (Gio.DataInputStream & AsyncDataInputStream) | null = null;
 
     constructor(path = DEFAULT_EVENT_SOCKET) {
         ensurePromisified();
@@ -323,7 +322,6 @@ export class EventStream {
         const reader = new Gio.DataInputStream({
             base_stream: connection.get_input_stream(),
         }) as Gio.DataInputStream & AsyncDataInputStream;
-        this._reader = reader;
 
         // Deliberately not awaited: the read loop runs until close() is called.
         void this._readLoop(reader, cancellable, onEvent, onClosed);
@@ -367,7 +365,6 @@ export class EventStream {
     close(): void {
         this._cancellable?.cancel();
         this._cancellable = null;
-        this._reader = null;
         try {
             this._connection?.close(null);
         } catch {

@@ -107,12 +107,8 @@ interface StepCommon {
 export type ClickStep = StepCommon & {
     kind: 'click';
     button: MouseButton;
-    /**
-     * 'abs' moves to x/y first, 'current' clicks wherever the pointer is, and
-     * 'prev' moves back to where the pointer was before the last positioned
-     * step — the excursion undone before clicking.
-     */
-    mode: 'abs' | 'current' | 'prev';
+    /** 'abs' moves to x/y first, 'current' clicks wherever the pointer is. */
+    mode: 'abs' | 'current';
     x?: number;
     y?: number;
     /**
@@ -129,12 +125,8 @@ export type ClickStep = StepCommon & {
 
 export type MoveStep = StepCommon & {
     kind: 'move';
-    /**
-     * 'prev' is the same return move a 'prev' click makes, without the click:
-     * back to the spot a `remember` step marked, or with none marked, to
-     * where the pointer was before the last positioned step.
-     */
-    mode: 'abs' | 'rel' | 'prev';
+    /** 'abs' moves to x/y, 'rel' by dx/dy from wherever the pointer is. */
+    mode: 'abs' | 'rel';
     x?: number;
     y?: number;
     dx?: number;
@@ -222,15 +214,6 @@ export type FlowStep = StepCommon & {
 };
 
 /**
- * Mark where the pointer is now, so that a step aimed back ('prev') returns
- * here for the rest of the run. Moves nothing. It used to be a mode of
- * `move` — 'store' — which made it the one move that does not move.
- */
-export type RememberStep = StepCommon & {
-    kind: 'remember';
-};
-
-/**
  * Reaching out of this macro into another one, by id. Empty means this macro,
  * so `stop` on its own is the plain "stop here" it has always been and `start`
  * on its own is "begin again from the top".
@@ -262,7 +245,6 @@ export type Step =
     | LoopStep
     | IfStep
     | FlowStep
-    | RememberStep
     | MacroStep;
 
 export type StepKind = Step['kind'];
@@ -376,7 +358,6 @@ export function newStep(kind: StepKind): Step {
             return { id, kind: 'if', cond: newCondition('color'), then: [], else: [] };
         case 'break':
         case 'continue':
-        case 'remember':
             return { id, kind };
         case 'start':
         case 'stop':
@@ -620,46 +601,6 @@ export function moveStepTo(root: Step[], id: string, into: Step[], at: number): 
 }
 
 /**
- * Insert `step` after the step with id `afterId`. When that step is an empty
- * container the new step goes inside it, which is what you almost always want
- * right after adding a loop.
- */
-export function insertStep(list: Step[], step: Step, afterId?: string | null): void {
-    if (!afterId) {
-        list.push(step);
-        return;
-    }
-    const loc = findStep(list, afterId);
-    if (!loc) {
-        list.push(step);
-        return;
-    }
-    // Named rather than taken from childLists: that order is the editor's, and
-    // an `if` draws No first while the branch you mean by "inside it" is Yes.
-    const inside = loc.step.kind === 'loop' ? loc.step.body
-        : loc.step.kind === 'if' ? loc.step.then
-        : null;
-    if (inside && inside.length === 0) {
-        inside.push(step);
-        return;
-    }
-    loc.list.splice(loc.index + 1, 0, step);
-}
-
-/** Deep copy with fresh ids, for duplicating a step. */
-export function cloneStep(step: Step): Step {
-    const copy = JSON.parse(JSON.stringify(step)) as Step;
-    const reid = (s: Step) => {
-        s.id = newId();
-        for (const child of childLists(s)) {
-            child.steps.forEach(reid);
-        }
-    };
-    reid(copy);
-    return copy;
-}
-
-/**
  * Where the pointer is left after this macro, as far as can be told statically:
  * the last step that names an absolute position. Used when recording, so a fresh
  * session knows where the macro already left off.
@@ -672,11 +613,6 @@ export function lastPointerEndpoint(steps: Step[]): { x: number; y: number } | n
         }
         if (step.mode === 'abs' && typeof step.x === 'number' && typeof step.y === 'number') {
             endpoint = { x: step.x, y: step.y };
-        } else if (step.mode === 'prev') {
-            // "@ previous" moves somewhere no document can name — away from
-            // the last absolute target by definition — so past it there is no
-            // endpoint to claim until another absolute step sets one.
-            endpoint = null;
         }
     });
     return endpoint;
@@ -684,19 +620,38 @@ export function lastPointerEndpoint(steps: Step[]): { x: number; y: number } | n
 
 /**
  * Step kinds that no longer exist. Verbatim recording produced opaque `raw`
- * steps, and `pad` pressed a gamepad button; nothing creates either any more
- * and nothing can edit them, so any left in a saved document are dropped
- * rather than shown as rows that cannot work.
+ * steps, `pad` pressed a gamepad button, and `remember` marked a spot for a
+ * Back that is gone; nothing creates any of them any more and nothing can edit
+ * them, so any left in a saved document are dropped rather than shown as rows
+ * that cannot work.
  */
 const RETIRED_KINDS: Record<string, string> = {
     raw: 'a verbatim step; that recording mode is gone',
     pad: 'a gamepad button step; gamepads are no longer supported',
+    remember: 'a step remembering the pointer position; Back and Remember are gone',
 };
+
+/**
+ * Why a step is no longer kept, or null when it is. Besides the retired kinds,
+ * a move that went back to a remembered spot, or marked one ('prev', and the
+ * older 'store'): with nothing left to remember, it has nowhere to go.
+ */
+function retiredReason(step: Step): string | null {
+    const kind = (step as unknown as { kind: string }).kind;
+    if (RETIRED_KINDS[kind]) {
+        return RETIRED_KINDS[kind];
+    }
+    const mode = (step as { mode?: string }).mode;
+    if (kind === 'move' && (mode === 'prev' || mode === 'store')) {
+        return 'a move back to a remembered pointer position; Back and Remember are gone';
+    }
+    return null;
+}
 
 function dropRetiredSteps(steps: Step[]): Step[] {
     const kept: Step[] = [];
     for (const step of steps) {
-        const retired = RETIRED_KINDS[(step as unknown as { kind: string }).kind];
+        const retired = retiredReason(step);
         if (retired) {
             log(`macroclickwerk: dropping ${retired}`);
             continue;
@@ -1035,16 +990,11 @@ export function parseDocument(json: string): MacroDocument {
                 if (loc.step.kind === 'onevent' && (edge === 'click' || edge === 'split')) {
                     delete (loc.step as { edge?: string }).edge;
                 }
-                // Remembering the pointer was a move that did not move — mode
-                // 'store'. It is a step of its own now; rewritten in place so
-                // it keeps its id, and with it the selection or a start's
-                // `at` that points at it.
-                if (loc.step.kind === 'move' && (loc.step.mode as string) === 'store') {
-                    const id = loc.step.id;
-                    for (const key of Object.keys(loc.step)) {
-                        delete (loc.step as unknown as Record<string, unknown>)[key];
-                    }
-                    Object.assign(loc.step, { id, kind: 'remember' });
+                // A click could go back to where the pointer was before the
+                // last positioned step — "Back", now gone. Clicking where the
+                // pointer is, is the nearest thing left.
+                if (loc.step.kind === 'click' && (loc.step.mode as string) === 'prev') {
+                    loc.step.mode = 'current';
                 }
             });
             fixed.body = dropRetiredSteps(migrateGuards(migrateGates(migrateLoops(fixed.body))));
@@ -1174,12 +1124,10 @@ export function describeStep(
             const verb = step.action === 'down' ? 'Press'
                 : step.action === 'up' ? 'Release' : 'Click';
             return step.mode === 'abs' ? `${verb} ${step.button} @ ${step.x ?? 0},${step.y ?? 0}`
-                : step.mode === 'prev' ? `${verb} ${step.button} @ previous`
                 : `${verb} ${step.button} at pointer`;
         }
         case 'move':
             return step.mode === 'abs' ? `Move to ${step.x ?? 0},${step.y ?? 0}`
-                : step.mode === 'prev' ? 'Move to previous'
                 : `Move by ${step.dx ?? 0},${step.dy ?? 0}`;
         case 'scroll':
             return `Scroll ${step.dx ? `${step.dx} horizontally` : ''}${step.dx && step.dy ? ', ' : ''}${step.dy ? `${step.dy} vertically` : ''}`.trim() || 'Scroll';
@@ -1201,8 +1149,6 @@ export function describeStep(
             return step.count === 'forever' ? 'Repeat forever' : `Repeat ${step.count}×`;
         case 'if':
             return `If ${describeCondition(step.cond)}`;
-        case 'remember':
-            return 'Remember pointer position';
         case 'break':
             return 'Break out of the loop';
         case 'continue':
@@ -1229,7 +1175,7 @@ export function describeStep(
  * recording is gone, is all of them.
  */
 export const AUTHORABLE_STEP_KINDS: StepKind[] = [
-    'click', 'move', 'remember', 'scroll', 'key', 'text', 'wait', 'onevent',
+    'click', 'move', 'scroll', 'key', 'text', 'wait', 'onevent',
     'loop', 'if', 'break', 'continue', 'start', 'stop',
 ];
 

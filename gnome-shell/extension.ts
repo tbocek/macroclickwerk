@@ -450,7 +450,7 @@ export default class MacroclickwerkExtension extends Extension {
             return null;
         }
         const runner = new MacroRunner(
-            this._daemon, this._evaluator, this._settings, this._store.config, {
+            this._daemon, this._evaluator, {
                 onStatus: text => this._onStatus(text),
                 onRunningChanged: () => this._onRunningChanged(),
                 onStepsChanged: path => this._onStepsChanged(macroId, path),
@@ -1213,9 +1213,6 @@ export default class MacroclickwerkExtension extends Extension {
         }
         this._daemon?.setPaths(config.controlSocket, config.eventSocket);
         this._evaluator?.setConfig(config);
-        for (const runner of this._runners.values()) {
-            runner.setConfig(config);
-        }
         this._recorder?.setConfig(config);
     }
 

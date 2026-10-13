@@ -2,7 +2,6 @@
 // evdev event train and hands it to the daemon one step at a time, which is what
 // makes the panic shortcut able to stop playback immediately.
 
-import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import type Clutter from 'gi://Clutter';
 
@@ -12,7 +11,6 @@ import {
     BUTTON_CODES,
     EV_KEY,
     EV_REL,
-    KEY_CODES,
     REL_HWHEEL,
     REL_HWHEEL_HI_RES,
     REL_WHEEL,
@@ -37,7 +35,6 @@ import type {
 } from './model.js';
 import { describeStep, findStep, pathToStep, prettySource } from './model.js';
 import { reportProblem } from './problems.js';
-import type { Config } from './store.js';
 
 export type FinishReason = 'done' | 'stopped' | 'error';
 
@@ -139,8 +136,6 @@ const SCROLL_CLICK_GAP_MS = 5;
 export class MacroRunner {
     private _daemon: DaemonClient;
     private _evaluator: ConditionEvaluator;
-    private _config: Config;
-    private _settings: Gio.Settings;
     private _callbacks: RunnerCallbacks;
 
     private _running = false;
@@ -171,13 +166,6 @@ export class MacroRunner {
      */
     private _resume: string[] = [];
     /**
-     * Where the pointer was before the last positioned step, which is what a
-     * step aimed at 'prev' goes back to. Per run: a fresh run has no history.
-     */
-    private _prevPointer: { x: number; y: number } | null = null;
-    /** Set by a `remember` step: 'prev' then means that spot, not the last excursion. */
-    private _prevPinned = false;
-    /**
      * Empty repeats already complained about, by step id. Per run, and per step
      * rather than one flag for all of them: an empty repeat inside a loop would
      * otherwise say it thousands of times, and two different empty repeats are
@@ -194,14 +182,10 @@ export class MacroRunner {
     constructor(
         daemon: DaemonClient,
         evaluator: ConditionEvaluator,
-        settings: Gio.Settings,
-        config: Config,
         callbacks: RunnerCallbacks = {},
     ) {
         this._daemon = daemon;
         this._evaluator = evaluator;
-        this._settings = settings;
-        this._config = config;
         this._callbacks = callbacks;
     }
 
@@ -259,10 +243,6 @@ export class MacroRunner {
         }
     }
 
-    setConfig(config: Config): void {
-        this._config = config;
-    }
-
     // --- lifecycle ---------------------------------------------------------
 
     /**
@@ -281,8 +261,6 @@ export class MacroRunner {
         this._failedAt = '';
         this._failedStepId = '';
         this._macroId = macro.id;
-        this._prevPointer = null;
-        this._prevPinned = false;
         this._inputEdge = null;
         this._warnedEmptyLoops.clear();
         this._held.clear();
@@ -348,10 +326,6 @@ export class MacroRunner {
         this._cancelled = false;
         this._path = [];
         this._failedAt = '';
-        // The ▶ button is not a run: "@ previous" must not consume history
-        // left over from whichever full run happened to finish last.
-        this._prevPointer = null;
-        this._prevPinned = false;
         this._inputEdge = null;
         this._warnedEmptyLoops.clear();
         this._callbacks.onRunningChanged?.(true);
@@ -612,15 +586,6 @@ export class MacroRunner {
             case 'continue':
                 return 'continue';
 
-            case 'remember': {
-                // Touches nothing — no motion, no daemon — it only decides
-                // what 'prev' means from here on.
-                const [px, py] = global.get_pointer();
-                this._prevPointer = { x: px, y: py };
-                this._prevPinned = true;
-                return 'normal';
-            }
-
             case 'stop':
                 // Stopping ourselves is the ordinary end of a run, not a message
                 // to anyone: unwind from here the way this step always has.
@@ -763,38 +728,16 @@ export class MacroRunner {
     /** Why a move failed, said in terms of where it meant to be and where it is. */
     private _motionFailure(step: ClickStep | MoveStep): string {
         const [px, py] = global.get_pointer();
-        const target = step.mode === 'prev'
-            ? this._prevPointer
-            : { x: step.x ?? 0, y: step.y ?? 0 };
-        return `the pointer would not go to ${target?.x ?? 0},${target?.y ?? 0} — ` +
+        return `the pointer would not go to ${step.x ?? 0},${step.y ?? 0} — ` +
             `it stopped at ${Math.round(px)},${Math.round(py)}`;
     }
 
-    /**
-     * Move to where a positioned step is headed: its own coordinates, or for
-     * 'prev' the position stored before the last positioned step — the pointer
-     * put back where it was before the macro reached over. Every positioned
-     * step remembers the spot it leaves, latest writer wins, so the store sits
-     * here at the one place steps actually move — unless a `remember` step pinned
-     * a spot deliberately; then that spot is what 'prev' means until the run
-     * ends or another store replaces it. A 'prev' before any excursion has
-     * nowhere to go and stays put, which for a click means clicking where the
-     * pointer already is.
-     */
+    /** Move to where a positioned step is headed: its own coordinates. */
     private async _moveToTarget(
         step: ClickStep | MoveStep, lease: Playback,
     ): Promise<{ arrived: boolean; moved: boolean }> {
-        const target = step.mode === 'prev'
-            ? this._prevPointer
-            : { x: step.x ?? 0, y: step.y ?? 0 };
-        if (!target) {
-            // A 'prev' with nowhere to go stays put, as it always has.
-            return { arrived: true, moved: false };
-        }
+        const target = { x: step.x ?? 0, y: step.y ?? 0 };
         const [px, py] = global.get_pointer();
-        if (!this._prevPinned) {
-            this._prevPointer = { x: px, y: py };
-        }
         // Read before the move, and to the same tolerance the move itself
         // settles for: "already there" has to mean what "arrived" means.
         const moved = Math.abs(target.x - px) > 1 || Math.abs(target.y - py) > 1;

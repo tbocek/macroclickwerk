@@ -60,7 +60,7 @@ const NAMES = new Map();
  */
 async function trace(macro, resumeAt = '', onStep = null) {
     const seen = [];
-    const runner = new MacroRunner(daemon, evaluator, {}, {}, {
+    const runner = new MacroRunner(daemon, evaluator, {
         onStepsChanged: path => {
             if (path.length === 0) {
                 return;
@@ -187,7 +187,7 @@ check('pathToStep of a missing step is empty', pathToStep(flat.body, 'gone').len
         for (let i = 0; i < steps; i++) {
             macro.body.push(newStep('scroll'));
         }
-        const runner = new MacroRunner(shared, evaluator, {}, {}, {
+        const runner = new MacroRunner(shared, evaluator, {
             onStepsChanged: path => {
                 if (path.length > 0) {
                     order.push(name);
@@ -246,7 +246,7 @@ check('pathToStep of a missing step is empty', pathToStep(flat.body, 'gone').len
     for (let i = 0; i < 6; i++) {
         noise.body.push(newStep('scroll'));
     }
-    const start = macro => new MacroRunner(daemon, evaluator, {}, {}, {}).run(macro);
+    const start = macro => new MacroRunner(daemon, evaluator, {}).run(macro);
     await Promise.all([start(walk), start(noise)]);
 
     const trace = log.join('');
@@ -254,38 +254,6 @@ check('pathToStep of a missing step is empty', pathToStep(flat.body, 'gone').len
     check('nothing played between its nudges and its click',
           /^s*m+c+s*$/.test(trace), trace);
     check('and it took several passes to get there', trace.indexOf('c') > 2, trace);
-
-    // A click "@ previous" undoes the excursion: back to where the pointer
-    // was before the last positioned step, then the click.
-    pointer = [5, 0];
-    const excursion = newMacro('excursion');
-    const away = newStep('click');
-    away.x = 100;
-    away.y = 0;
-    const back = newStep('click');
-    back.mode = 'prev';
-    excursion.body.push(away, back);
-    await start(excursion);
-    // Within 2: the relative-walk fallback under test stops at a rounded
-    // delta of 1, so its true distance can be up to 1.5.
-    check('a click @ previous returns to where the excursion began',
-          Math.abs(pointer[0] - 5) <= 2, String(pointer));
-
-    // Remember pins the spot Back returns to: two excursions later, Back
-    // still goes to the remembered spot, not to where the last one began.
-    pointer = [20, 0];
-    const pinned = newMacro('pinned');
-    const mark = newStep('remember');
-    const first = newStep('move');
-    first.x = 60;
-    const second = newStep('move');
-    second.x = 100;
-    const home = newStep('move');
-    home.mode = 'prev';
-    pinned.body.push(mark, first, second, home);
-    await start(pinned);
-    check('Remember moves nothing, and Back returns to it past later moves',
-          Math.abs(pointer[0] - 20) <= 2, String(pointer));
 }
 
 // --- starting and stopping other macros ------------------------------------
@@ -303,7 +271,7 @@ check('pathToStep of a missing step is empty', pathToStep(flat.body, 'gone').len
         macro.body.push(...body);
         let problem = null;
         let entered = 0;
-        const runner = new MacroRunner(daemon, evaluator, {}, {}, {
+        const runner = new MacroRunner(daemon, evaluator, {
             onMacroControl: control,
             onStepsChanged: path => { if (path.length > 0) { entered++; } },
             onFinished: (reason, error) => {
@@ -450,7 +418,7 @@ check('pathToStep of a missing step is empty', pathToStep(flat.body, 'gone').len
 
     const seen = [];
     let reason = '';
-    const runnerFor = () => new MacroRunner(daemon, evaluator, {}, {}, {
+    const runnerFor = () => new MacroRunner(daemon, evaluator, {
         onStepsChanged: path => {
             if (path.length > 0) {
                 seen.push(NAMES.get(path[path.length - 1].id) ?? '?');
@@ -486,7 +454,7 @@ check('pathToStep of a missing step is empty', pathToStep(flat.body, 'gone').len
     const bad = named('onevent', 'bad');
     bad.source = 'BTN_NOPE';
     askew.body.push(bad);
-    const failing = new MacroRunner(daemon, evaluator, {}, {}, {
+    const failing = new MacroRunner(daemon, evaluator, {
         onFinished: r => { reason = r; },
         waitForInput: () => null,
     });
@@ -538,7 +506,7 @@ check('pathToStep of a missing step is empty', pathToStep(flat.body, 'gone').len
     check('and that the first event itself follows nothing',
           followsEvent(hold.body, down.id) === null);
 
-    const running = new MacroRunner(watching, evaluator, {}, {}, { waitForInput }).run(hold);
+    const running = new MacroRunner(watching, evaluator, { waitForInput }).run(hold);
     await until(() => waiters.length === 1);
     waiters[0].fire('press');
     await until(() => waiters.length === 2);
@@ -578,7 +546,7 @@ check('pathToStep of a missing step is empty', pathToStep(flat.body, 'gone').len
     const runner = new MacroRunner({
         play: async events => { played.push(...events); return { aborted: false }; },
         stop: async () => {},
-    }, evaluator, {}, {}, {
+    }, evaluator, {
         waitForInput: (source, edge) => {
             let resolver;
             const promise = new Promise(resolve => { resolver = resolve; });
@@ -615,7 +583,7 @@ check('pathToStep of a missing step is empty', pathToStep(flat.body, 'gone').len
     await new MacroRunner({
         play: async events => { played.push(...events); return { aborted: false }; },
         stop: async () => {},
-    }, evaluator, {}, {}, {}).run(alone);
+    }, evaluator, {}).run(alone);
     check('a click with no event above it is a whole click',
           played.length === 2 && played[0].value === 1 && played[1].value === 0,
           JSON.stringify(played));
@@ -666,7 +634,7 @@ check('pathToStep of a missing step is empty', pathToStep(flat.body, 'gone').len
 
     const outcomes = {};
     const seen = [];
-    const runOne = (macro, evalr, name) => new MacroRunner(daemon, evalr, {}, {}, {
+    const runOne = (macro, evalr, name) => new MacroRunner(daemon, evalr, {
         onStepsChanged: path => {
             if (path.length > 0) {
                 seen.push(NAMES.get(path[path.length - 1].id) ?? '?');
@@ -701,7 +669,7 @@ check('pathToStep of a missing step is empty', pathToStep(flat.body, 'gone').len
     const hold = newStep('wait');
     hold.ms = 5000;
     holder.body.push(press, hold);
-    const runner = new MacroRunner(quiet, evaluator, {}, {}, {});
+    const runner = new MacroRunner(quiet, evaluator, {});
     const done = runner.run(holder);
     await new Promise(resolve => GLib.timeout_add(GLib.PRIORITY_DEFAULT, 50, () => { resolve(); return GLib.SOURCE_REMOVE; }));
     runner.stop(false);
@@ -725,7 +693,7 @@ check('pathToStep of a missing step is empty', pathToStep(flat.body, 'gone').len
     const second = newStep('wait');
     const m = newMacro('held');
     m.body.push(first, second);
-    const runner = new MacroRunner(playing, evaluator, {}, {}, { shouldPause: () => played });
+    const runner = new MacroRunner(playing, evaluator, { shouldPause: () => played });
     const sleep = ms => new Promise(resolve => GLib.timeout_add(GLib.PRIORITY_DEFAULT, ms, () => { resolve(); return GLib.SOURCE_REMOVE; }));
     const done = runner.run(m);
     await sleep(150);

@@ -3,6 +3,7 @@
 // preferences window.
 
 import Pango from 'gi://Pango';
+import Clutter from 'gi://Clutter';
 import St from 'gi://St';
 
 import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
@@ -10,6 +11,19 @@ import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 import type { MacroStore } from '../src/store.js';
 import { describeStep, findStep, resolveRunStart, type Macro, type Step } from '../src/model.js';
 import { clearProblems, listProblems, onProblemsChanged, type Problem } from '../src/problems.js';
+
+/**
+ * A box that stacks its children. GNOME Shell 51 knows only `orientation` for
+ * this — `vertical` is gone, and asking for it fails the whole extension at
+ * enable — but the type definitions this is built against predate the change,
+ * hence the cast.
+ */
+function verticalBox(styleClass: string): St.BoxLayout {
+    return new St.BoxLayout({
+        style_class: styleClass,
+        orientation: Clutter.Orientation.VERTICAL,
+    } as Partial<St.BoxLayout.ConstructorProps>);
+}
 
 export interface PopupDeps {
     store: MacroStore;
@@ -80,7 +94,7 @@ export class MacroPopup {
 
         this._problemItem = new PopupMenu.PopupBaseMenuItem({ reactive: false, can_focus: false });
         this._problemHeader = new St.Label({ text: '', style_class: 'macroclickwerk-problems-title' });
-        this._problemList = new St.BoxLayout({ vertical: true, style_class: 'macroclickwerk-problems' });
+        this._problemList = verticalBox('macroclickwerk-problems');
         this._clearItem = new PopupMenu.PopupMenuItem('Clear problems');
         // Clearing is tidying, not navigating, so the menu stays open and the
         // messages just vanish. The method is replaced rather than connected
@@ -102,13 +116,13 @@ export class MacroPopup {
         menu.addMenuItem(this._stopItem);
 
         const statusItem = new PopupMenu.PopupBaseMenuItem({ reactive: false, can_focus: false });
-        const box = new St.BoxLayout({ vertical: true, style_class: 'macroclickwerk-status-box' });
+        const box = verticalBox('macroclickwerk-status-box');
         box.add_child(this._statusLabel);
         box.add_child(this._detailLabel);
         statusItem.add_child(box);
         menu.addMenuItem(statusItem);
 
-        const problemBox = new St.BoxLayout({ vertical: true, style_class: 'macroclickwerk-status-box' });
+        const problemBox = verticalBox('macroclickwerk-status-box');
         const heading = new St.BoxLayout({ style_class: 'macroclickwerk-problems-heading' });
         heading.add_child(new St.Icon({
             icon_name: 'dialog-warning-symbolic',
@@ -246,7 +260,7 @@ export class MacroPopup {
     }
 
     private _problemWidget(problem: Problem): St.BoxLayout {
-        const box = new St.BoxLayout({ vertical: true, style_class: 'macroclickwerk-problem' });
+        const box = verticalBox('macroclickwerk-problem');
 
         const repeat = problem.count > 1 ? ` (×${problem.count})` : '';
         box.add_child(wrappingLabel(

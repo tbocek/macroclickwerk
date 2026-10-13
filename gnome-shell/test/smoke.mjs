@@ -1,6 +1,6 @@
 import {
     parseDocument, stringifyDocument, newStep, describeStep, describeCondition,
-    insertStep, removeStep, cloneStep, walk, findStep, newMacro,
+    removeStep, walk, findStep, newMacro,
     newCondition,
     resolveRecordTarget,
     resolveRunStart,
@@ -12,7 +12,6 @@ import {
 import { textToEvents, keyCode, keyName, charToKey, buttonFromCode } from '../dist/src/keymap.js';
 import { starterMacro } from '../dist/src/starter.js';
 import { parseDecision, parseVerdict, promptAdvice, verdictFromObjects } from '../dist/src/llm.js';
-import { isLoopbackEndpoint } from '../dist/src/store.js';
 import {
     reportProblem, listProblems, problemCount, clearProblems, onProblemsChanged,
 } from '../dist/src/problems.js';
@@ -33,16 +32,10 @@ for (const kind of kinds) {
 
 // tree ops
 const macro = newMacro('t');
-const a = newStep('click'), b = newStep('wait'), loop = newStep('loop');
-macro.body.push(a, b);
-insertStep(macro.body, loop, b.id);
-check('insert after', macro.body.length === 3 && macro.body[2].id === loop.id);
-const inner = newStep('key');
-insertStep(macro.body, inner, loop.id);
-check('insert into empty container', loop.body.length === 1 && loop.body[0].id === inner.id);
+const a = newStep('click'), b = newStep('wait'), loop = newStep('loop'), inner = newStep('key');
+loop.body.push(inner);
+macro.body.push(a, b, loop);
 check('findStep nested', findStep(macro.body, inner.id)?.step.id === inner.id);
-const clone = cloneStep(loop);
-check('clone gets fresh ids', clone.id !== loop.id && clone.body[0].id !== inner.id);
 check('remove', removeStep(macro.body, b.id)?.id === b.id);
 let counted = 0;
 walk(macro.body, () => counted++);
@@ -434,11 +427,6 @@ check('objects-only reads written-out json',
       verdictFromObjects('I decided. {"match": false, "reason":"grey"}').match === false);
 check('objects-only ignores a stray yes', verdictFromObjects('yes, that is true') === null);
 
-// endpoint check
-check('loopback localhost', isLoopbackEndpoint('http://localhost:11434/v1/chat/completions'));
-check('loopback 127', isLoopbackEndpoint('http://127.0.0.1:8080/v1/chat/completions'));
-check('not loopback', !isLoopbackEndpoint('http://192.168.1.5:11434/v1/chat/completions'));
-
 // --- what counts as editing a macro out from under its own run ---------------
 
 // The shell stops a run whose macro changed while it was going. The line
@@ -517,22 +505,20 @@ reportProblem('Macro', 'after unsubscribe');
 check('unsubscribed listener is silent', notified === before);
 clearProblems();
 
-// --- remembering the pointer is a step of its own --------------------------
+// --- Back and Remember are gone ---------------------------------------------
 {
-    const stored = parseDocument(JSON.stringify({ version: 1, macros: [{ id: 'm', name: 'm', body: [
-        { id: 'keep-me', kind: 'move', mode: 'store', x: 3, y: 4 },
-        { id: 'l', kind: 'loop', count: 2, body: [{ id: 'inner', kind: 'move', mode: 'store' }] },
-        { id: 'go', kind: 'move', mode: 'prev' },
+    const old = parseDocument(JSON.stringify({ version: 1, macros: [{ id: 'm', name: 'm', body: [
+        { id: 'mark', kind: 'remember' },
+        { id: 'stored', kind: 'move', mode: 'store' },
+        { id: 'l', kind: 'loop', count: 2, body: [{ id: 'back', kind: 'move', mode: 'prev' }, { id: 'w', kind: 'wait', ms: 5 }] },
+        { id: 'c', kind: 'click', button: 'left', mode: 'prev' },
+        { id: 'to', kind: 'move', mode: 'abs', x: 1, y: 2 },
     ] }] }));
-    const [first, loop, go] = stored.macros[0].body;
-    check('a stored-pointer move becomes a remember step', first.kind === 'remember', JSON.stringify(first));
-    check('…keeping its id, and nothing of the move', first.id === 'keep-me' && Object.keys(JSON.parse(JSON.stringify(first))).length === 2, JSON.stringify(first));
-    check('…at any depth', loop.body[0].kind === 'remember' && loop.body[0].id === 'inner');
-    check('a back move stays a move', go.kind === 'move' && go.mode === 'prev');
-    check('remember reads as such', describeStep(first) === 'Remember pointer position', describeStep(first));
-    const again = parseDocument(stringifyDocument(stored));
-    check('a remember step survives a round trip', again.macros[0].body[0].kind === 'remember');
-    check('remember is offered in the add menu', AUTHORABLE_STEP_KINDS.includes('remember'));
+    const body = old.macros[0].body;
+    check('remember steps and stored-pointer moves are dropped', body.map(s => s.id).join() === 'l,c,to', body.map(s => s.id).join());
+    check('…and a move back, at any depth', body[0].body.map(s => s.id).join() === 'w', body[0].body.map(s => s.id).join());
+    check('a click back becomes a click where the pointer is', body[1].mode === 'current', body[1].mode);
+    check('remember is not offered any more', !AUTHORABLE_STEP_KINDS.includes('remember'));
 }
 
 // --- wording a check so yes or no can answer it -----------------------------

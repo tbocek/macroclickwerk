@@ -134,7 +134,6 @@ function scaleWidthFor(width: number): typeof SCALE_WIDTHS[number] {
 const STEP_ICONS: Record<StepKind, string> = {
     click: 'input-mouse-symbolic',
     move: 'find-location-symbolic',
-    remember: 'mark-location-symbolic',   // a pin in the spot: what Back returns to
     scroll: 'view-sort-descending-symbolic',
     key: 'input-keyboard-symbolic',
     text: 'insert-text-symbolic',
@@ -223,7 +222,6 @@ const eventSourceLabels = (): Record<string, string> => ({
 const stepTitles = (): Record<StepKind, string> => ({
     click: _('Mouse'),
     move: _('Move'),
-    remember: _('Remember'),
     scroll: _('Scroll'),
     key: _('Key'),
     text: _('Text'),
@@ -350,6 +348,10 @@ const EDITOR_CSS = `
     box-shadow: inset 4px 0 0 @error_color;
 }
 .macroclickwerk-recording-now-block { box-shadow: inset 4px 0 0 @error_color; }
+/* The same header fill a selected block gets, in red while it is recording. */
+.macroclickwerk-recording-now-block > box > list > row.header {
+    background-color: alpha(@error_color, 0.28);
+}
 
 /* − and + as slim as a spin button's own, which is what they stand in for. */
 .macroclickwerk-spin > button { min-width: 14px; padding-left: 4px; padding-right: 4px; }
@@ -363,6 +365,30 @@ const EDITOR_CSS = `
 .macroclickwerk-line button.image-button { min-width: 16px; padding-left: 6px; padding-right: 6px; }
 .macroclickwerk-line dropdown > button { padding-left: 6px; padding-right: 3px; }
 .macroclickwerk-line dropdown > button > box { border-spacing: 2px; }
+
+/* Every row a click selects says so under the pointer, the way the theme's
+   own clickable rows do — plain steps and add rows too, which the theme
+   leaves alone because it does not know a click does anything there. Only
+   the line itself: an expander counts as hovered while the pointer is on a row
+   inside it, so it is its header that lights up, never the whole block. */
+row.macroclickwerk-selectable:not(.expander):hover,
+row.macroclickwerk-selectable.expander > box > list > row.header:hover {
+    background-color: color-mix(in srgb, currentColor 4%, transparent);
+}
+/* A row that is already filled — selected, recording into, running — keeps
+   its colour under the pointer and deepens it, rather than going grey or
+   not answering at all. After the rule above, which they must win over. */
+row.macroclickwerk-selectable.macroclickwerk-record-target:hover,
+row.macroclickwerk-selectable.macroclickwerk-record-target-block > box > list > row.header:hover {
+    background-color: alpha(@accent_bg_color, 0.2);
+}
+row.macroclickwerk-selectable.macroclickwerk-recording-now:hover,
+row.macroclickwerk-selectable.macroclickwerk-recording-now-block > box > list > row.header:hover {
+    background-color: alpha(@error_color, 0.36);
+}
+row.macroclickwerk-selectable.macroclickwerk-running:hover {
+    background-color: alpha(@accent_bg_color, 0.36);
+}
 
 /* "Add step here" is a place, not a step: half the height of one. */
 .macroclickwerk-editor row.macroclickwerk-add > box.header { min-height: 28px; }
@@ -563,37 +589,6 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
     private _springRow: Adw.ExpanderRow | null = null;
 
     /**
-     * One text field for a group of related numbers — a point, an offset, a
-     * rectangle — instead of a stack of spin rows. `onShow`, when given, adds a
-     * button that flashes the position on the actual screen, which is the only
-     * thing that makes a raw coordinate meaningful.
-     */
-    private _numbersRow(
-        title: string,
-        values: number[],
-        onChange: (values: number[]) => void,
-        onShow?: (values: number[]) => void,
-        /**
-         * Fills the row in from the screen. What that takes differs per row —
-         * an area picked with the pointer brings a colour back with it — so the
-         * row only offers the button and the caller says what it does. It goes
-         * before **Show**: first put something in the field, then look at it.
-         */
-        pick?: { tooltip: string; run: () => void },
-    ): Adw.EntryRow {
-        const row = new Adw.EntryRow({ title });
-        row.set_text(values.join(', '));
-        const current = commitNumbers(row, values.length, values, onChange);
-
-        for (const button of this._spotButtons(pick ?? null, onShow
-            ? () => onShow(parseNumbers(row.get_text() ?? '', values.length) ?? current())
-            : null)) {
-            row.add_suffix(button);
-        }
-        return row;
-    }
-
-    /**
      * **Pick** and **Show**, the pair every place on the screen gets, in that
      * order — first put something in the field, then look at it. Pick fills
      * the place in from the screen, and what that takes differs per caller;
@@ -617,18 +612,22 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
 
 
     /**
-     * A pair of numbers as a field on a row rather than a row of its own, so a
-     * position can share one line with the buttons that act on it. As wide as
-     * the numbers in it.
+     * A group of numbers — a point, an area — as a field on a line rather than
+     * a row of its own, so it can share the line with the buttons that act on
+     * it. As wide as the numbers in it.
      */
-    private _numbersEntry(values: number[], onChange: (values: number[]) => void): Gtk.Entry {
+    private _numbersEntry(
+        values: number[],
+        onChange: (values: number[]) => void,
+        placeholder = 'x, y',
+    ): Gtk.Entry {
         const entry = new Gtk.Entry({
             text: values.join(', '),
-            placeholder_text: 'x, y',
+            placeholder_text: placeholder,
             valign: Gtk.Align.CENTER,
             xalign: 1,
         });
-        fitToText(entry, '00, 00');
+        fitToText(entry, values.map(() => '00').join(', '));
         commitNumbers(entry, values.length, values, onChange);
         return entry;
     }
@@ -640,10 +639,6 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
      * the screen also gets **Pick** and **Show**; an offset is numbers that
      * are not a place, so it gets neither. Picking another place redraws the
      * line, since what follows the dropdown changes with it.
-     *
-     * "Back" is the same on both: to the spot a Remember step marked, or with
-     * none marked, to where the pointer was before the last step that moved
-     * it. Remembering is a step of its own — it never moves anything.
      */
     private _positionControls<M extends string>(opts: {
         step: { mode: M; x?: number; y?: number; dx?: number; dy?: number };
@@ -655,8 +650,7 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
             labels[place.mode] = place.label;
         }
         const widgets: Gtk.Widget[] = [chooser(opts.places.map(place => place.mode), labels, step.mode,
-            _('Where this acts. Back: to the spot a Remember step marked — or, with none, ' +
-              'to where the pointer was before the last step that moved it'),
+            _('Where this acts'),
             value => {
                 step.mode = value;
                 this._saveAndRebuild();
@@ -1245,6 +1239,7 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
             }
         });
         row.add_controller(click);
+        row.add_css_class('macroclickwerk-selectable');
         this._targetRows.set(target, row);
         this._selectableRows.add(row);
     }
@@ -1521,9 +1516,6 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
     private _rowTitle(step: Step): string {
         if (step.kind === 'if') {
             return withColorSwatches(this._describe(step));
-        }
-        if (step.kind === 'remember') {
-            return this._titleWith(stepTitles().remember, _('pointer position'));
         }
         if (step.kind === 'loop') {
             return this._titleWith(stepTitles().loop, step.body.length === 0
@@ -1947,7 +1939,6 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
                     places: [
                         { mode: 'abs', label: _('At x,y'), numbers: 'spot' },
                         { mode: 'current', label: _('At pointer') },
-                        { mode: 'prev', label: _('Back') },
                     ],
                 }),
             ];
@@ -1958,7 +1949,6 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
                 places: [
                     { mode: 'abs', label: _('To x,y'), numbers: 'spot' },
                     { mode: 'rel', label: _('By offset'), numbers: 'offset' },
-                    { mode: 'prev', label: _('Back') },
                 ],
             });
 
@@ -2355,46 +2345,53 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
             }
 
             case 'color': {
-                // The colour leads, because it is what this condition is about
-                // and so it is the line the type chooser joins. Tolerance sits
-                // on it for the same reason: on its own line the number said
-                // nothing about what it measured.
-                const colourRow = entryRow(_('Colour #rrggbb'), condition.color, text => {
+                // One line, read as a sentence: this colour, give or take
+                // this much, in this area. The colour leads because it is what
+                // the check is about; the type chooser joins the end.
+                const line = new Adw.ActionRow();
+                const colour = suffixEntry(condition.color, '#rrggbb', _('The colour, as #rrggbb'), text => {
                     condition.color = text.trim();
                     save();
-                });
+                }, { settle: true });
+                fitToText(colour, '#000000');
                 // Redrawn as the field changes rather than as it commits: the
                 // commit is on a delay, and a swatch that lags what you typed
                 // by half a second is a swatch you stop trusting.
-                const swatch = colorSwatch(() => colourRow.get_text() ?? '',
-                    _('What this colour looks like'));
-                colourRow.connect('changed', () => swatch.queue_draw());
-                colourRow.add_suffix(swatch);
-                colourRow.add_suffix(this._joiner('±'));
-                colourRow.add_suffix(numberEntry(condition.tolerance, 0, 442,
-                    _('Tolerance: how far off this colour a pixel may be and still count'),
-                    value => {
-                        condition.tolerance = value;
-                        save();
-                    }));
-                colourRow.add_suffix(iconButton('color-select-symbolic',
-                    _('Fill this in with the colour that area has on the screen right now — over an area, its average'),
-                    () => this._readColorFor(condition)));
-                indent(colourRow);
-
-                const areaRow = this._numbersRow(_('Area x, y, w, h'),
-                    [condition.x, condition.y, condition.w, condition.h],
+                const swatch = colorSwatch(() => colour.get_text() ?? '', _('What this colour looks like'));
+                colour.connect('changed', () => swatch.queue_draw());
+                const area = this._numbersEntry([condition.x, condition.y, condition.w, condition.h],
                     ([x, y, w, h]) => {
                         this._setColorArea(condition, { x, y, w, h });
                         rebuild();
-                    },
-                    ([x, y, w, h]) => this._showMarker(x, y, Math.max(1, w), Math.max(1, h)),
-                    {
+                    }, 'x, y, w, h');
+                area.set_tooltip_text(_('The area, as x, y, width, height — a 1×1 area is a single pixel'));
+                for (const widget of [
+                    colour,
+                    swatch,
+                    this._joiner('±'),
+                    numberEntry(condition.tolerance, 0, 442,
+                        _('Tolerance: how far off this colour the area may be and still count'), value => {
+                            condition.tolerance = value;
+                            save();
+                        }),
+                    iconButton('color-select-symbolic',
+                        _('Fill the colour in from the screen as it is now — over an area, its average'),
+                        () => this._readColorFor(condition)),
+                    this._joiner(_('in')),
+                    area,
+                    ...this._spotButtons({
                         tooltip: _('Click a pixel on the screen, or drag over an area: where it is and what colour it is both land here'),
                         run: () => this._pickColorFor(condition),
-                    });
-                areaRow.add_suffix(this._flashToggle(condition));
-                indent(areaRow);
+                    }, () => {
+                        const [x, y, w, h] = parseNumbers(area.get_text() ?? '', 4)
+                            ?? [condition.x, condition.y, condition.w, condition.h];
+                        this._showMarker(x, y, Math.max(1, w), Math.max(1, h));
+                    }),
+                    this._flashToggle(condition),
+                ]) {
+                    line.add_suffix(widget);
+                }
+                indent(line);
                 break;
             }
 

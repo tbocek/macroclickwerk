@@ -187,17 +187,3 @@ export class MacroStore {
         };
     }
 }
-
-/** True when the endpoint talks to this machine, i.e. screenshots stay local. */
-export function isLoopbackEndpoint(url: string): boolean {
-    try {
-        const match = /^https?:\/\/([^/:]+)/i.exec(url.trim());
-        if (!match) {
-            return false;
-        }
-        const host = match[1].toLowerCase();
-        return host === 'localhost' || host === '127.0.0.1' || host === '::1' || host === '[::1]';
-    } catch {
-        return false;
-    }
-}
