@@ -130,11 +130,11 @@ export type ClickStep = StepCommon & {
 export type MoveStep = StepCommon & {
     kind: 'move';
     /**
-     * 'prev' is the same return move a 'prev' click makes, without the click.
-     * 'store' does not move at all: it remembers where the pointer is now, and
-     * that spot is what 'prev' means for the rest of the run.
+     * 'prev' is the same return move a 'prev' click makes, without the click:
+     * back to the spot a `remember` step marked, or with none marked, to
+     * where the pointer was before the last positioned step.
      */
-    mode: 'abs' | 'rel' | 'prev' | 'store';
+    mode: 'abs' | 'rel' | 'prev';
     x?: number;
     y?: number;
     dx?: number;
@@ -222,6 +222,15 @@ export type FlowStep = StepCommon & {
 };
 
 /**
+ * Mark where the pointer is now, so that a step aimed back ('prev') returns
+ * here for the rest of the run. Moves nothing. It used to be a mode of
+ * `move` — 'store' — which made it the one move that does not move.
+ */
+export type RememberStep = StepCommon & {
+    kind: 'remember';
+};
+
+/**
  * Reaching out of this macro into another one, by id. Empty means this macro,
  * so `stop` on its own is the plain "stop here" it has always been and `start`
  * on its own is "begin again from the top".
@@ -253,6 +262,7 @@ export type Step =
     | LoopStep
     | IfStep
     | FlowStep
+    | RememberStep
     | MacroStep;
 
 export type StepKind = Step['kind'];
@@ -366,6 +376,7 @@ export function newStep(kind: StepKind): Step {
             return { id, kind: 'if', cond: newCondition('color'), then: [], else: [] };
         case 'break':
         case 'continue':
+        case 'remember':
             return { id, kind };
         case 'start':
         case 'stop':
@@ -1108,6 +1119,17 @@ export function parseDocument(json: string): MacroDocument {
                 if (loc.step.kind === 'onevent' && (edge === 'click' || edge === 'split')) {
                     delete (loc.step as { edge?: string }).edge;
                 }
+                // Remembering the pointer was a move that did not move — mode
+                // 'store'. It is a step of its own now; rewritten in place so
+                // it keeps its id, and with it the selection or a start's
+                // `at` that points at it.
+                if (loc.step.kind === 'move' && (loc.step.mode as string) === 'store') {
+                    const id = loc.step.id;
+                    for (const key of Object.keys(loc.step)) {
+                        delete (loc.step as unknown as Record<string, unknown>)[key];
+                    }
+                    Object.assign(loc.step, { id, kind: 'remember' });
+                }
             });
             fixed.body = dropRetiredSteps(migrateGuards(migrateGates(migrateLoops(fixed.body))));
             return fixed;
@@ -1242,7 +1264,6 @@ export function describeStep(
         case 'move':
             return step.mode === 'abs' ? `Move to ${step.x ?? 0},${step.y ?? 0}`
                 : step.mode === 'prev' ? 'Move to previous'
-                : step.mode === 'store' ? 'Store pointer position'
                 : `Move by ${step.dx ?? 0},${step.dy ?? 0}`;
         case 'scroll':
             return `Scroll ${step.dx ? `${step.dx} horizontally` : ''}${step.dx && step.dy ? ', ' : ''}${step.dy ? `${step.dy} vertically` : ''}`.trim() || 'Scroll';
@@ -1264,6 +1285,8 @@ export function describeStep(
             return step.count === 'forever' ? 'Repeat forever' : `Repeat ${step.count}×`;
         case 'if':
             return `If ${describeCondition(step.cond)}`;
+        case 'remember':
+            return 'Remember pointer position';
         case 'break':
             return 'Break out of the loop';
         case 'continue':
@@ -1290,13 +1313,14 @@ export function describeStep(
  * recording is gone, is all of them.
  */
 export const AUTHORABLE_STEP_KINDS: StepKind[] = [
-    'click', 'move', 'scroll', 'key', 'text', 'wait', 'onevent',
+    'click', 'move', 'remember', 'scroll', 'key', 'text', 'wait', 'onevent',
     'loop', 'if', 'break', 'continue', 'start', 'stop',
 ];
 
 export const STEP_KIND_LABELS: Record<StepKind, string> = {
     click: 'Click',
     move: 'Move pointer',
+    remember: 'Remember position',
     scroll: 'Scroll',
     key: 'Key press',
     text: 'Type text',

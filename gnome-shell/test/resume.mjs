@@ -270,6 +270,22 @@ check('pathToStep of a missing step is empty', pathToStep(flat.body, 'gone').len
     // delta of 1, so its true distance can be up to 1.5.
     check('a click @ previous returns to where the excursion began',
           Math.abs(pointer[0] - 5) <= 2, String(pointer));
+
+    // Remember pins the spot Back returns to: two excursions later, Back
+    // still goes to the remembered spot, not to where the last one began.
+    pointer = [20, 0];
+    const pinned = newMacro('pinned');
+    const mark = newStep('remember');
+    const first = newStep('move');
+    first.x = 60;
+    const second = newStep('move');
+    second.x = 100;
+    const home = newStep('move');
+    home.mode = 'prev';
+    pinned.body.push(mark, first, second, home);
+    await start(pinned);
+    check('Remember moves nothing, and Back returns to it past later moves',
+          Math.abs(pointer[0] - 20) <= 2, String(pointer));
 }
 
 // --- starting and stopping other macros ------------------------------------

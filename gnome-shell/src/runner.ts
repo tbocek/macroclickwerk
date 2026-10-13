@@ -175,7 +175,7 @@ export class MacroRunner {
      * step aimed at 'prev' goes back to. Per run: a fresh run has no history.
      */
     private _prevPointer: { x: number; y: number } | null = null;
-    /** Set by a 'store' move: 'prev' then means that spot, not the last excursion. */
+    /** Set by a `remember` step: 'prev' then means that spot, not the last excursion. */
     private _prevPinned = false;
     /**
      * Empty repeats already complained about, by step id. Per run, and per step
@@ -592,6 +592,15 @@ export class MacroRunner {
             case 'continue':
                 return 'continue';
 
+            case 'remember': {
+                // Touches nothing — no motion, no daemon — it only decides
+                // what 'prev' means from here on.
+                const [px, py] = global.get_pointer();
+                this._prevPointer = { x: px, y: py };
+                this._prevPinned = true;
+                return 'normal';
+            }
+
             case 'stop':
                 // Stopping ourselves is the ordinary end of a run, not a message
                 // to anyone: unwind from here the way this step always has.
@@ -721,14 +730,6 @@ export class MacroRunner {
             await this._playRelative(step.dx ?? 0, step.dy ?? 0);
             return;
         }
-        // A store touches nothing — no motion, no daemon — it only decides
-        // what 'prev' means from here on.
-        if (step.mode === 'store') {
-            const [px, py] = global.get_pointer();
-            this._prevPointer = { x: px, y: py };
-            this._prevPinned = true;
-            return;
-        }
         // Only the move to hold together here — there is nothing after it.
         const { arrived } = await this._daemon.exclusive(lease => this._moveToTarget(step, lease));
         if (!arrived && !this._cancelled) {
@@ -754,7 +755,7 @@ export class MacroRunner {
      * 'prev' the position stored before the last positioned step — the pointer
      * put back where it was before the macro reached over. Every positioned
      * step remembers the spot it leaves, latest writer wins, so the store sits
-     * here at the one place steps actually move — unless a 'store' step pinned
+     * here at the one place steps actually move — unless a `remember` step pinned
      * a spot deliberately; then that spot is what 'prev' means until the run
      * ends or another store replaces it. A 'prev' before any excursion has
      * nowhere to go and stays put, which for a click means clicking where the

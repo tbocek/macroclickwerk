@@ -581,5 +581,23 @@ reportProblem('Macro', 'after unsubscribe');
 check('unsubscribed listener is silent', notified === before);
 clearProblems();
 
+// --- remembering the pointer is a step of its own --------------------------
+{
+    const stored = parseDocument(JSON.stringify({ version: 1, macros: [{ id: 'm', name: 'm', body: [
+        { id: 'keep-me', kind: 'move', mode: 'store', x: 3, y: 4 },
+        { id: 'l', kind: 'loop', count: 2, body: [{ id: 'inner', kind: 'move', mode: 'store' }] },
+        { id: 'go', kind: 'move', mode: 'prev' },
+    ] }] }));
+    const [first, loop, go] = stored.macros[0].body;
+    check('a stored-pointer move becomes a remember step', first.kind === 'remember', JSON.stringify(first));
+    check('…keeping its id, and nothing of the move', first.id === 'keep-me' && Object.keys(JSON.parse(JSON.stringify(first))).length === 2, JSON.stringify(first));
+    check('…at any depth', loop.body[0].kind === 'remember' && loop.body[0].id === 'inner');
+    check('a back move stays a move', go.kind === 'move' && go.mode === 'prev');
+    check('remember reads as such', describeStep(first) === 'Remember pointer position', describeStep(first));
+    const again = parseDocument(stringifyDocument(stored));
+    check('a remember step survives a round trip', again.macros[0].body[0].kind === 'remember');
+    check('remember is offered in the add menu', AUTHORABLE_STEP_KINDS.includes('remember') && STEP_KIND_LABELS.remember);
+}
+
 print(failures === 0 ? '\nALL PASSED' : `\n${failures} FAILURES`);
 if (failures > 0) imports.system.exit(1);

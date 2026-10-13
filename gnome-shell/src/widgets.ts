@@ -481,21 +481,6 @@ export function toggleButton(iconName: string, tooltip: string, active: boolean)
     });
 }
 
-/**
- * A toggle that shows one character rather than an icon — "@" says "at the
- * pointer" better than any picture of a mouse. Sized as an icon button, which
- * is what it sits among.
- */
-export function glyphToggle(glyph: string, tooltip: string, active: boolean): Gtk.ToggleButton {
-    return new Gtk.ToggleButton({
-        label: glyph,
-        tooltip_text: tooltip,
-        active,
-        valign: Gtk.Align.CENTER,
-        css_classes: ['flat', 'image-button'],
-    });
-}
-
 /** A class held while something is true — the shape every state repaint has. */
 export function setClass(widget: Gtk.Widget, cls: string, on: boolean): void {
     if (on) {

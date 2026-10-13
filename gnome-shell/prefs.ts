@@ -20,7 +20,6 @@ import {
     type LlmCondition,
     type Macro,
     type MouseButton,
-    type MoveStep,
     type OnEventStep,
     type Region,
     type Step,
@@ -49,7 +48,7 @@ import { comboCodes, isArmed, parseTriggers, type Trigger } from './src/triggers
 import { keyName } from './src/keymap.js';
 import {
     chooser, clearClasses, colorSwatch, comboRow, commitNumbers, debounce, descendants,
-    entryRow, fitToText, glyphToggle, iconButton, infoButton, numberEntry, passwordRow, setClass,
+    entryRow, fitToText, iconButton, infoButton, numberEntry, passwordRow, setClass,
     spinRow, suffixEntry, toggleButton, withColorSwatches,
 } from './src/widgets.js';
 
@@ -137,6 +136,7 @@ type BranchKind = 'body' | 'then' | 'else';
 const STEP_ICONS: Record<StepKind, string> = {
     click: 'input-mouse-symbolic',
     move: 'find-location-symbolic',
+    remember: 'mark-location-symbolic',   // a pin in the spot: what Back returns to
     scroll: 'view-sort-descending-symbolic',
     key: 'input-keyboard-symbolic',
     text: 'insert-text-symbolic',
@@ -225,6 +225,7 @@ const eventSourceLabels = (): Record<string, string> => ({
 const stepTitles = (): Record<StepKind, string> => ({
     click: _('Mouse'),
     move: _('Move'),
+    remember: _('Remember'),
     scroll: _('Scroll'),
     key: _('Key'),
     text: _('Text'),
@@ -373,7 +374,7 @@ const EDITOR_CSS = `
 .macroclickwerk-editor row:not(.entry) > box.header { min-height: 40px; }
 .macroclickwerk-editor row > box.header > box.title { margin-top: 3px; margin-bottom: 3px; }
 .macroclickwerk-line button.image-button { min-width: 16px; padding-left: 6px; padding-right: 6px; }
-.macroclickwerk-line dropdown > button { padding-left: 7px; padding-right: 4px; }
+.macroclickwerk-line dropdown > button { padding-left: 6px; padding-right: 3px; }
 .macroclickwerk-line dropdown > button > box { border-spacing: 2px; }
 
 /* "Add step here" is a place, not a step: half the height of one. */
@@ -609,118 +610,60 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
     }
 
     /**
-     * Where a click or a move goes, as words on the step's own line: the
-     * numbers, and buttons that say whether they are used at all.
+     * Where a click or a move acts, as words on the step's own line: a
+     * dropdown naming the place — the way every other choice in the editor
+     * is made — and after it the numbers, when the place has some. A spot on
+     * the screen also gets **Pick** and **Show**; an offset is numbers that
+     * are not a place, so it gets neither. Picking another place redraws the
+     * line, since what follows the dropdown changes with it.
      *
-     * Three states. Coordinates are a place on the screen, with **Pick** and
-     * **Show** beside them. `onModeName` is the step's own alternative —
-     * 'current' for a click, 'rel' for a move — and `on` says whether it still
-     * has numbers (an offset does, "wherever the pointer is" does not). And
-     * either step can aim at 'prev', back to where the pointer was before the
-     * last positioned step. A move can additionally offer 'store' — remember
-     * the spot rather than go anywhere — which is the other half of 'prev': one
-     * marks, one returns. A state without numbers puts a word where they were,
-     * so the line still reads.
+     * "Back" is the same on both: to the spot a Remember step marked, or with
+     * none marked, to where the pointer was before the last step that moved
+     * it. Remembering is a step of its own — it never moves anything.
      */
-    private _positionControls(opts: {
-        step: ClickStep | MoveStep;
-        /** The button for the step's own alternative, `onModeName`. */
-        toggle: Gtk.ToggleButton;
-        onModeName: 'current' | 'rel';
-        off: () => number[];
-        on: { word?: string; values?: () => number[] };
-        store?: boolean;
-        apply: (values: number[]) => void;
+    private _positionControls<M extends string>(opts: {
+        step: { mode: M; x?: number; y?: number; dx?: number; dy?: number };
+        places: { mode: M; label: string; numbers?: 'spot' | 'offset' }[];
     }): Gtk.Widget[] {
-        let mode: 'off' | 'on' | 'prev' | 'store' =
-            opts.step.mode === 'prev' ? 'prev'
-            : opts.store && opts.step.mode === 'store' ? 'store'
-            : opts.step.mode === opts.onModeName ? 'on' : 'off';
-        const numbers = (): (() => number[]) | undefined =>
-            mode === 'off' ? opts.off : mode === 'on' ? opts.on.values : undefined;
-        const word = (): string =>
-            mode === 'prev' ? _('previous')
-            : mode === 'store' ? _('remember')
-            : opts.on.word ?? '';
+        const { step } = opts;
+        const labels: Record<string, string> = {};
+        for (const place of opts.places) {
+            labels[place.mode] = place.label;
+        }
+        const widgets: Gtk.Widget[] = [chooser(opts.places.map(place => place.mode), labels, step.mode,
+            _('Where this acts. Back: to the spot a Remember step marked — or, with none, ' +
+              'to where the pointer was before the last step that moved it'),
+            value => {
+                step.mode = value;
+                this._saveAndRebuild();
+            }, 10)];
 
-        const entry = this._numbersEntry(opts.off(), values => {
-            opts.apply(values);
-            this._save();
-        });
-        const label = this._joiner('');
-        const point = (): [number, number] => {
-            const parsed = parseNumbers(entry.get_text() ?? '', 2);
-            return [parsed?.[0] ?? 0, parsed?.[1] ?? 0];
-        };
-        const pick = iconButton('find-location-symbolic',
-            _('Click the spot on the screen: that position lands here'),
-            () => this._pickPointInto(({ x, y }) => entry.set_text(`${x}, ${y}`)));
-        const show = iconButton('view-reveal-symbolic',
-            _('Flash this position on the screen for a couple of seconds'),
-            () => this._showMarker(...point()));
-
-        const toggle = opts.toggle;
-        toggle.set_active(mode === 'on');
-        const storeBtn = opts.store ? toggleButton('bookmark-new-symbolic',
-            _('Remember where the pointer is now: from here on, “previous” returns to this spot'),
-            mode === 'store') : null;
-        const history = glyphToggle('←',
-            _('Go back to where the pointer was before the last positioned step'), mode === 'prev');
-
-        const sync = () => {
-            const values = numbers();
-            entry.set_visible(Boolean(values));
-            label.set_visible(!values);
-            label.set_label(word());
-            // 'off' is the state that means a place on the screen, in both
-            // steps: a click's coordinates, a move's destination.
-            pick.set_visible(mode === 'off');
-            show.set_visible(mode === 'off');
-            if (values) {
-                entry.set_text(values().join(', '));
-            }
-        };
-        // The mode variable drives the buttons, not the other way round: a
-        // press proposes a mode, setMode settles every button to it, and the
-        // guard keeps those programmatic settles from proposing again. Synced
-        // in place rather than rebuilt: a rebuild would take the button you
-        // just pressed down with it.
-        let settling = false;
-        const setMode = (next: 'off' | 'on' | 'prev' | 'store') => {
-            mode = next;
-            settling = true;
-            toggle.set_active(mode === 'on');
-            storeBtn?.set_active(mode === 'store');
-            history.set_active(mode === 'prev');
-            settling = false;
-            // The one place the controls' vocabulary meets the step's. Cast
-            // because a union field only accepts writes both members allow.
-            (opts.step as { mode: string }).mode =
-                mode === 'on' ? opts.onModeName
-                : mode === 'prev' ? 'prev'
-                : mode === 'store' ? 'store' : 'abs';
-            sync();
-            this._save();
-        };
-        toggle.connect('toggled', () => {
-            if (!settling) {
-                setMode(toggle.get_active() ? 'on' : 'off');
-            }
-        });
-        storeBtn?.connect('toggled', () => {
-            if (!settling) {
-                setMode(storeBtn.get_active() ? 'store' : 'off');
-            }
-        });
-        history.connect('toggled', () => {
-            if (!settling) {
-                setMode(history.get_active() ? 'prev' : 'off');
-            }
-        });
-        sync();
-
-        // The numbers and what acts on them, then the modes that replace them.
-        return [entry, label, pick, show, toggle, ...(storeBtn ? [storeBtn] : []), history];
+        const numbers = opts.places.find(place => place.mode === step.mode)?.numbers;
+        if (numbers === 'offset') {
+            widgets.push(this._numbersEntry([step.dx ?? 0, step.dy ?? 0], ([dx, dy]) => {
+                step.dx = dx;
+                step.dy = dy;
+                this._save();
+            }));
+        } else if (numbers === 'spot') {
+            const entry = this._numbersEntry([step.x ?? 0, step.y ?? 0], ([x, y]) => {
+                step.x = x;
+                step.y = y;
+                this._save();
+            });
+            const point = (): [number, number] => {
+                const parsed = parseNumbers(entry.get_text() ?? '', 2);
+                return [parsed?.[0] ?? 0, parsed?.[1] ?? 0];
+            };
+            widgets.push(entry,
+                iconButton('find-location-symbolic',
+                    _('Click the spot on the screen: that position lands here'),
+                    () => this._pickPointInto(({ x, y }) => entry.set_text(`${x}, ${y}`))),
+                iconButton('view-reveal-symbolic',
+                    _('Flash this position on the screen for a couple of seconds'),
+                    () => this._showMarker(...point())));
+        }
+        return widgets;
     }
 
     /**
@@ -1559,6 +1502,9 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
         if (step.kind === 'if') {
             return withColorSwatches(this._describe(step));
         }
+        if (step.kind === 'remember') {
+            return this._titleWith(stepTitles().remember, _('pointer position'));
+        }
         if (step.kind === 'loop') {
             return this._titleWith(stepTitles().loop, step.body.length === 0
                 ? _('empty — skipped') : this._countLabel(step.body.length));
@@ -1794,7 +1740,7 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
         // whether the step folds.
         const prefixes = new Gtk.Box({ spacing: 6, valign: Gtk.Align.CENTER });
         const suffixes = new Gtk.Box({
-            spacing: 3,
+            spacing: 2,
             valign: Gtk.Align.CENTER,
             css_classes: ['macroclickwerk-line'],
         });
@@ -1849,7 +1795,7 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
             suffixes.append(this._slot(new Gtk.Image({
                 icon_name: 'pan-down-symbolic',
                 valign: Gtk.Align.CENTER,
-                margin_start: 6,
+                margin_start: 7,
             })));
         }
 
@@ -1996,39 +1942,22 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
                 }),
                 ...this._positionControls({
                     step,
-                    // The toggles are the whole of the old Position dropdown:
-                    // one down means there are no coordinates to have.
-                    toggle: glyphToggle('@', _('Click wherever the pointer already is'), false),
-                    onModeName: 'current',
-                    off: () => [step.x ?? 0, step.y ?? 0],
-                    on: { word: _('pointer') },
-                    apply: ([x, y]) => {
-                        step.x = x;
-                        step.y = y;
-                    },
+                    places: [
+                        { mode: 'abs', label: _('At x,y'), numbers: 'spot' },
+                        { mode: 'current', label: _('At pointer') },
+                        { mode: 'prev', label: _('Back') },
+                    ],
                 }),
             ];
 
         case 'move':
             return this._positionControls({
                 step,
-                toggle: toggleButton('go-jump-symbolic',
-                    _('Move by an offset instead of to a position'), false),
-                onModeName: 'rel',
-                off: () => [step.x ?? 0, step.y ?? 0],
-                // An offset is numbers too — they just are not a place, so
-                // there is nothing to point at or flash on the screen.
-                on: { values: () => [step.dx ?? 0, step.dy ?? 0] },
-                store: true,
-                apply: ([a, b]) => {
-                    if (step.mode === 'rel') {
-                        step.dx = a;
-                        step.dy = b;
-                    } else {
-                        step.x = a;
-                        step.y = b;
-                    }
-                },
+                places: [
+                    { mode: 'abs', label: _('To x,y'), numbers: 'spot' },
+                    { mode: 'rel', label: _('By offset'), numbers: 'offset' },
+                    { mode: 'prev', label: _('Back') },
+                ],
             });
 
         case 'key':
