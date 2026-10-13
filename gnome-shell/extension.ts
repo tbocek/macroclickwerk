@@ -24,7 +24,6 @@ import {
     resolveRecordTarget, resolveRunStart, type LlmCondition, type Macro, type RecordTarget, type Region, type Step,
 } from './src/model.js';
 import { clearProblems, onProblemsChanged, problemCount, reportProblem } from './src/problems.js';
-import { EV_KEY } from './src/keymap.js';
 import { TriggerEngine, parseTriggers } from './src/triggers.js';
 import { MacroPopup } from './ui/popup.js';
 import { clearMarker, flashRegion, pickRegion, showMarker } from './ui/overlay.js';
@@ -145,15 +144,6 @@ export default class MacroclickwerkExtension extends Extension {
         });
 
         this._triggers = new TriggerEngine(this._daemon, config.eventSocket, {
-            injectKeys: (codes, down) => {
-                // One train, through the daemon's tracked path: order inside a
-                // combo holds, and keys held by a trigger are released by the
-                // emergency stop like anything else.
-                void this._daemon?.play(codes.map(code =>
-                    ({ dt: 0, type: EV_KEY, code, value: down ? 1 : 0 })))
-                    .catch(error => reportProblem('Daemon',
-                        `a trigger could not press its keys: ${(error as Error).message}`));
-            },
             control: (action, macroId) => {
                 if (macroId !== '') {
                     this._runOneMacro({ macroId, action });

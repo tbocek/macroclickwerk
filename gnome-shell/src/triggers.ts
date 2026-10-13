@@ -1,5 +1,7 @@
-// Input triggers: a button (or key) the daemon consumes, and what the
-// extension does in its place — press another key, or drive a macro.
+// Input triggers: a button (or key) the daemon consumes, and the macro it
+// starts, pauses or stops in its place — a spare button as a switch for the
+// macros, which works whether or not any of them is running. Making a button
+// press something else is a When step in a macro, not a trigger.
 //
 // The split mirrors who can do what. Only the daemon, holding the grab, can
 // withhold the original event from the desktop; only the extension knows what
@@ -24,30 +26,36 @@ export interface Trigger {
      * What a press does. 'none' is a trigger still being set up: nothing is
      * consumed and the source keeps working as itself.
      */
-    action: 'none' | 'key' | 'run' | 'pause' | 'stop';
-    /**
-     * What the source is remapped to, for 'key': one or more evdev names,
-     * space separated. All go down on the press, in order, and come back up
-     * in reverse on the release — so "KEY_LEFTMETA BTN_LEFT" on a mouse
-     * button is a real Super+left-drag while that button is held, which is
-     * how a button becomes "drag windows with me".
-     */
-    key?: string;
+    action: 'none' | 'run' | 'pause' | 'stop';
     /** Macro for run/pause/stop. '' means every enabled macro. */
     macro?: string;
 }
 
-/** The stored JSON, tolerantly: a bad document is no triggers, not a crash. */
+/** What a trigger can do. */
+const TRIGGER_ACTIONS: readonly string[] = ['none', 'run', 'pause', 'stop'];
+
+/**
+ * The stored JSON, tolerantly: a bad document is no triggers, not a crash.
+ * A trigger that pressed a key in place of its button is dropped — that is a
+ * When step in a macro — and says so in the log.
+ */
 export function parseTriggers(json: string): Trigger[] {
     try {
         const parsed: unknown = JSON.parse(json);
         if (!Array.isArray(parsed)) {
             return [];
         }
-        return parsed.filter((t): t is Trigger =>
-            typeof t === 'object' && t !== null &&
-            typeof (t as Trigger).source === 'string' &&
-            typeof (t as Trigger).action === 'string');
+        return parsed.filter((t): t is Trigger => {
+            if (typeof t !== 'object' || t === null || typeof (t as Trigger).source !== 'string') {
+                return false;
+            }
+            const action = (t as { action?: unknown }).action;
+            if (typeof action !== 'string' || !TRIGGER_ACTIONS.includes(action)) {
+                log(`macroclickwerk: dropping a trigger that ${action === 'key' ? 'pressed a key; use a When step in a macro' : 'does nothing known'}`);
+                return false;
+            }
+            return true;
+        });
     } catch {
         return [];
     }
@@ -64,45 +72,16 @@ export function sourceCode(name: string): number | null {
     return keyCode(upper);
 }
 
-/** The remap target as codes, in press order; null if any name is not real. */
-export function comboCodes(key: string | undefined): number[] | null {
-    const names = (key ?? '').trim().split(/\s+/).filter(name => name !== '');
-    if (names.length === 0) {
-        return null;
-    }
-    const codes: number[] = [];
-    for (const name of names) {
-        const code = sourceCode(name);
-        if (code === null) {
-            return null;
-        }
-        codes.push(code);
-    }
-    return codes;
-}
-
 /**
- * A trigger only consumes once it can actually do something: it needs a real
- * source, and its action's own parameters. Half-configured rows stay inert —
- * the user asked for exactly this: an onevent with no body still clicks.
+ * A trigger only consumes once it can actually do something: it needs an
+ * action and a real source. Half-configured rows stay inert — a trigger with
+ * nothing to do leaves its button working as a button.
  */
 export function isArmed(trigger: Trigger): boolean {
-    if (trigger.action === 'none' || sourceCode(trigger.source) === null) {
-        return false;
-    }
-    if (trigger.action === 'key') {
-        return comboCodes(trigger.key) !== null;
-    }
-    return true;
+    return trigger.action !== 'none' && sourceCode(trigger.source) !== null;
 }
 
 export interface TriggerActions {
-    /**
-     * Put keys down or up through the daemon, tracked for emergency release.
-     * One call is one ordered event train: a combo's modifier must be down
-     * before its key, and two separate requests would not promise that.
-     */
-    injectKeys(codes: number[], down: boolean): void;
     /** Drive a macro; macroId '' means every enabled macro. */
     control(action: 'run' | 'pause' | 'stop', macroId: string): void;
 }
@@ -131,18 +110,7 @@ export function dispatch(
     if (!trigger) {
         return;
     }
-    if (trigger.action === 'key') {
-        // Mirror the press: down on 1, up on 0, and a combo goes down in
-        // order and comes up in reverse, like fingers would. Value 2 is the
-        // kernel's autorepeat, which a held injected key produces on its own.
-        const codes = comboCodes(trigger.key);
-        if (codes !== null && (event.value === 0 || event.value === 1)) {
-            actions.injectKeys(event.value === 1 ? codes : [...codes].reverse(),
-                event.value === 1);
-        }
-        return;
-    }
-    // Macro actions fire on the press alone; the release is just the finger
+    // A trigger fires on the press alone; the release is just the finger
     // coming back up. ('none' never reaches here — an unarmed trigger is not
     // in the map — but the type does not know that.)
     if (event.value === 1 && trigger.action !== 'none') {
@@ -176,7 +144,7 @@ export interface Waiter {
  * Remove and return every waiter the event wakes: 'either' waiters on both
  * edges, the other two on the one they name, and autorepeat wakes nobody.
  * Waiters outrank configured triggers for the same code — a run explicitly
- * parked on this click is more specific than a standing remap, and firing both
+ * parked on this click is more specific than a standing trigger, and firing both
  * would act twice on one press.
  */
 export function claimWaiters(waiters: Waiter[], event: StreamedEvent): Waiter[] {

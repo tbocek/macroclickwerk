@@ -44,8 +44,7 @@ import {
 } from './src/model.js';
 import { MacroStore } from './src/store.js';
 import { buildInstruction, promptAdvice, testConnection } from './src/llm.js';
-import { comboCodes, isArmed, parseTriggers, type Trigger } from './src/triggers.js';
-import { keyName } from './src/keymap.js';
+import { isArmed, parseTriggers, type Trigger } from './src/triggers.js';
 import {
     chooser, clearClasses, colorSwatch, comboRow, commitNumbers, debounce, descendants,
     firstDescendant,
@@ -285,6 +284,9 @@ const EDITOR_MAX_WIDTH = 900;
  */
 const EDITOR_WINDOW_WIDTH = 900;
 
+/** How wide the Input page may get — see `_buildInputPage`. */
+const INPUT_MAX_WIDTH = 860;
+
 /**
  * Nesting is the thing you have to be able to read at a glance, and stacked
  * expander rows on their own do not show it. Every body gets a coloured rail
@@ -477,14 +479,13 @@ const triggerSourceLabels = (): Record<string, string> => ({
     custom: _('A key…'),
 });
 
-const TRIGGER_ACTIONS = ['none', 'key', 'run', 'pause', 'stop'] as const;
+const TRIGGER_ACTIONS = ['none', 'run', 'pause', 'stop'] as const;
 
 const triggerActionLabels = (): Record<string, string> => ({
-    none: _('No action yet'),
-    key: _('Press a key'),
-    run: _('Start a macro'),
-    pause: _('Pause a macro'),
-    stop: _('Stop a macro'),
+    none: _('Nothing yet'),
+    run: _('Starts'),
+    pause: _('Pauses'),
+    stop: _('Stops'),
 });
 
 
@@ -542,7 +543,10 @@ function promptHelp(kind: 'chat' | 'decision', thresholdPercent: number): string
 }
 
 /** What a hint under a check is saying, which decides how it looks. */
-type HintTone = 'advice' | 'asking' | 'yes' | 'no' | 'failed';
+type HintTone = 'advice' | 'yes' | 'no' | 'failed';
+
+/** What the model said when a check was tried, for showing where it applies; null clears it. */
+type CheckAnswer = { match: boolean; reason: string; seconds: string } | null;
 
 /** One entry of a menu: what it says, and what it does when picked. */
 interface Choice {
@@ -1863,11 +1867,28 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
             }
         }
 
+        // An answer from Check now goes on the branch it would take: model
+        // says yes, the Yes line; no, the No line. Filled as the headers are
+        // built below, read when an answer comes back.
+        const branchHeaders = new Map<string, { row: Adw.ExpanderRow; title: string }>();
+        const showAnswer = (answer: CheckAnswer) => {
+            for (const { row, title } of branchHeaders.values()) {
+                row.set_title(title);
+                this._headerOf(row)?.remove_css_class('success');
+            }
+            const header = answer && branchHeaders.get(answer.match ? 'then' : 'else');
+            if (answer && header) {
+                const said = `${_('model says')} ${answer.match ? _('yes') : _('no')} · ${answer.reason} · ${answer.seconds}`;
+                header.row.set_title(`${header.title}  — ${GLib.markup_escape_text(said, -1)}`);
+                this._headerOf(header.row)?.add_css_class('success');
+            }
+        };
+
         if (step.kind === 'if') {
             for (const child of this._buildConditionSection(_('Condition'), step.cond, next => {
                 step.cond = next;
                 this._saveAndRebuild();
-            }, 0)) {
+            }, 0, undefined, step.cond.type === 'llm' ? showAnswer : undefined)) {
                 expander?.add_row(child);
             }
         }
@@ -1883,10 +1904,9 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
                 nested = expander;
             } else {
                 const style = branchStyles()[branch ?? 'then'];
-                nested = new Adw.ExpanderRow({
-                    title: this._titleWith(style.title, this._countLabel(list.steps.length)),
-                    tooltip_text: style.hint,
-                });
+                const title = this._titleWith(style.title, this._countLabel(list.steps.length));
+                nested = new Adw.ExpanderRow({ title, tooltip_text: style.hint });
+                branchHeaders.set(list.key, { row: nested, title });
                 nested.set_expanded(true);
                 this._ownFold(nested);
                 nested.set_margin_start(indent + INDENT_PX);
@@ -2205,8 +2225,10 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
         replace: (next: Condition) => void,
         depth: number,
         onRemove?: () => void,
+        /** For the If's own model check: where its answer is shown — see `_buildStepWidgets`. */
+        onAnswer?: (answer: CheckAnswer) => void,
     ): Gtk.Widget[] {
-        const rows = this._buildConditionRows(condition, depth);
+        const rows = this._buildConditionRows(condition, depth, onAnswer);
         const trailing: Gtk.Widget[] = [chooser(
             CONDITION_TYPES, conditionTypeLabels(), condition.type,
             _('What this condition checks'),
@@ -2263,7 +2285,6 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
         row.add_prefix(icon);
         const icons: Record<HintTone, string> = {
             advice: 'dialog-warning-symbolic',
-            asking: 'content-loading-symbolic',
             yes: 'object-select-symbolic',
             no: 'window-close-symbolic',
             failed: 'dialog-error-symbolic',
@@ -2291,27 +2312,45 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
      * Ask the model the check as it stands — the words in the field, even
      * before they are saved — about the screen right now. The window gets out
      * of the way first, since the screenshot is of whatever it was covering,
-     * and comes back with the answer.
+     * and comes back with the answer. While it is asking, the button says so.
+     *
+     * The answer goes where it means something: with `onAnswer`, onto the
+     * branch the If would take; otherwise — a question inside an "all of", say,
+     * which decides no branch on its own — under the question. Not getting an
+     * answer is said under the question either way.
      */
     private _checkNow(
         condition: LlmCondition,
         promptRow: Adw.EntryRow,
         button: Gtk.Button,
         hint: ReturnType<typeof this._hintRow>,
+        onAnswer?: (answer: CheckAnswer) => void,
     ): void {
         button.set_sensitive(false);
-        hint.say('asking', _('Asking the model…'));
+        button.set_icon_name('content-loading-symbolic');
         this._askShell('check-condition', { condition: { ...condition, prompt: promptRow.get_text() ?? '' } }, {
             minimize: true,
             onResult: answer => {
                 button.set_sensitive(true);
+                button.set_icon_name('media-playback-start-symbolic');
                 if (!answer.ok) {
+                    onAnswer?.(null);
                     hint.say('failed', `${_('No answer')} — ${answer.message ?? _('unknown reason')}`);
                     return;
                 }
-                const seconds = `${(Number(answer.latencyMs ?? 0) / 1000).toFixed(1)} s`;
-                hint.say(answer.match ? 'yes' : 'no',
-                    `${answer.match ? _('Yes') : _('No')} — ${answer.reason || _('no reason given')} · ${seconds}`);
+                const said = {
+                    match: Boolean(answer.match),
+                    reason: answer.reason || _('no reason given'),
+                    seconds: `${(Number(answer.latencyMs ?? 0) / 1000).toFixed(1)} s`,
+                };
+                if (onAnswer) {
+                    const advice = promptAdvice(promptRow.get_text() ?? '');
+                    hint.say(advice ? 'advice' : null, advice ?? '');
+                    onAnswer(said);
+                } else {
+                    hint.say(said.match ? 'yes' : 'no',
+                        `${said.match ? _('Yes') : _('No')} — ${said.reason} · ${said.seconds}`);
+                }
             },
         });
     }
@@ -2336,7 +2375,11 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
         return flash;
     }
 
-    private _buildConditionRows(condition: Condition, depth: number): Gtk.Widget[] {
+    private _buildConditionRows(
+        condition: Condition,
+        depth: number,
+        onAnswer?: (answer: CheckAnswer) => void,
+    ): Gtk.Widget[] {
         const rows: Gtk.Widget[] = [];
         const save = () => this._save();
         const rebuild = () => this._saveAndRebuild();
@@ -2359,7 +2402,7 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
                 const hint = this._hintRow();
                 const check = iconButton('media-playback-start-symbolic',
                     _('Check now: ask the model about the screen as it is'),
-                    () => this._checkNow(condition, promptRow, check, hint));
+                    () => this._checkNow(condition, promptRow, check, hint, onAnswer));
                 // The question, and on the same line where on the screen it is
                 // asked about: an area, or nothing for the whole screen.
                 const area = this._regionEntry(condition);
@@ -2380,11 +2423,12 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
                 }
                 indent(promptRow);
                 // Under the question, as it is typed: whether yes or no can
-                // answer it at all. A Check now answer takes the same line,
-                // until the wording changes again.
+                // answer it at all. An answer from Check now was about the
+                // wording that was tried, so a change takes it away again.
                 const advise = () => {
                     const advice = promptAdvice(promptRow.get_text() ?? '');
                     hint.say(advice ? 'advice' : null, advice ?? '');
+                    onAnswer?.(null);
                 };
                 promptRow.connect('changed', advise);
                 advise();
@@ -3196,6 +3240,11 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
             title: _('Input'),
             iconName: 'input-keyboard-symbolic',
         });
+        // A trigger is a line of its own — what is taken over, what happens
+        // instead, and the key or macro that names — and at the settings width
+        // of 600 its dropdowns were cut down to "A…". Wider, like the editor,
+        // though not as wide: the other rows here are ordinary settings.
+        this._widen(page, INPUT_MAX_WIDTH);
 
         const daemon = new Adw.PreferencesGroup({
             title: _('Daemon'),
@@ -3227,10 +3276,9 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
     private _buildTriggersGroup(): Adw.PreferencesGroup {
         this._triggersGroup = new Adw.PreferencesGroup({
             title: _('Triggers'),
-            description: _('A button or key the daemon takes over, and what happens ' +
-                'instead. A trigger with no action set leaves its button alone, and ' +
-                'every trigger falls back to being a plain button whenever the ' +
-                'daemon or the extension is not running.'),
+            description: _('Use a spare mouse button or key to start, pause or stop your macros — ' +
+                'even when none of them is running. The game never sees that press. To make a ' +
+                'button press something else instead, use a When step in a macro.'),
         });
         this._triggersGroup.set_header_suffix(iconButton('list-add-symbolic', _('Add a trigger'), () => {
             const triggers = this._loadTriggers();
@@ -3264,112 +3312,84 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
             this._triggerRows.push(row);
             this._triggersGroup.add(row);
         });
+        // An empty list is a heading over nothing, which says nothing about
+        // where to start. Say it.
+        if (triggers.length === 0) {
+            const empty = new Adw.ActionRow({
+                title: _('No triggers yet'),
+                subtitle: _('Press + to have a spare button start a macro, say'),
+            });
+            this._triggerRows.push(empty);
+            this._triggersGroup.add(empty);
+        }
     }
 
+    /**
+     * One trigger as one sentence, the way a step reads in the editor: When
+     * [this button] → [starts] [that macro]. The controls are the sentence;
+     * there is no summary beside them saying the same thing again. A line
+     * under it speaks up only when there is something to know — a trigger
+     * that does nothing yet, or one that takes over a click everywhere.
+     */
     private _triggerRow(triggers: Trigger[], index: number): Adw.ActionRow {
         const trigger = triggers[index];
-        const row = new Adw.ActionRow({ title: this._describeTrigger(trigger) });
-
-        const retitle = () => {
-            row.set_title(this._describeTrigger(trigger));
-            row.set_subtitle(this._triggerCaveat(trigger));
-        };
-        retitle();
+        const isButton = (TRIGGER_SOURCES as readonly string[]).includes(trigger.source);
+        const row = new Adw.ActionRow({ title: _('When'), subtitle: this._triggerCaveat(trigger) });
+        row.add_prefix(new Gtk.Image({
+            icon_name: isButton ? 'input-mouse-symbolic' : 'input-keyboard-symbolic',
+            valign: Gtk.Align.CENTER,
+        }));
+        const line = new Gtk.Box({ spacing: 4, valign: Gtk.Align.CENTER, css_classes: ['macroclickwerk-line'] });
+        row.add_suffix(line);
 
         // What is taken over: one of the mouse buttons, or any key by name.
-        const sources = [...TRIGGER_SOURCES, 'custom'];
-        const isButton = (TRIGGER_SOURCES as readonly string[]).includes(trigger.source);
-        row.add_suffix(chooser(sources, triggerSourceLabels(), isButton ? trigger.source : 'custom',
+        line.append(chooser([...TRIGGER_SOURCES, 'custom'], triggerSourceLabels(), isButton ? trigger.source : 'custom',
             _('Which button or key this trigger takes over'), value => {
                 trigger.source = value === 'custom' ? '' : value;
                 this._saveTriggers(triggers, true);
-            }, 12));
+            }, 14));
         if (!isButton) {
-            row.add_suffix(suffixEntry(trigger.source, 'KEY_F13',
-                _('The key taken over, by evdev name'), text => {
-                    trigger.source = text.trim().toUpperCase();
-                    this._saveTriggers(triggers);
-                    retitle();
-                }));
+            line.append(suffixEntry(trigger.source, 'KEY_F13', _('The key taken over, by evdev name'), text => {
+                trigger.source = text.trim().toUpperCase();
+                this._saveTriggers(triggers);
+                row.set_subtitle(this._triggerCaveat(trigger));
+            }));
         }
 
-        row.add_suffix(chooser(TRIGGER_ACTIONS, triggerActionLabels(), trigger.action,
+        line.append(this._joiner('→'));
+        line.append(chooser(TRIGGER_ACTIONS, triggerActionLabels(), trigger.action,
             _('What a press does instead'), value => {
                 trigger.action = value;
                 this._saveTriggers(triggers, true);
             }, 14));
 
-        if (trigger.action === 'key') {
-            const keyEntry = suffixEntry(trigger.key ?? '', 'KEY_E',
-                _('What is pressed in its place, by evdev name: KEY_E, BTN_LEFT — or ' +
-                    'several, space separated, like KEY_LEFTMETA BTN_LEFT for a ' +
-                    'Super+left drag. Careful: "LEFT" alone is the arrow key.'), text => {
-                    trigger.key = text.trim().toUpperCase();
-                    this._saveTriggers(triggers);
-                    retitle();
-                    // Red until every name resolves — the title above shows
-                    // what the names resolve *to*, which is the safety net
-                    // against LEFT quietly being an arrow key.
-                    setClass(keyEntry, 'error',
-                        comboCodes(trigger.key) === null && trigger.key !== '');
-                });
-            row.add_suffix(keyEntry);
-        } else if (trigger.action !== 'none') {
+        if (trigger.action !== 'none') {
             const macros = this._store.macros;
             const options = ['', ...macros.map(macro => macro.id)];
             const labels: Record<string, string> = { '': _('Everything switched on') };
             for (const macro of macros) {
                 labels[macro.id] = macro.name;
             }
-            row.add_suffix(chooser(options, labels, trigger.macro ?? '',
-                _('Which macro this drives'), value => {
-                    trigger.macro = value;
-                    this._saveTriggers(triggers);
-                    retitle();
-                }, 16));
+            line.append(chooser(options, labels, trigger.macro ?? '', _('Which macro this drives'), value => {
+                trigger.macro = value;
+                this._saveTriggers(triggers);
+            }, 22));
         }
 
-        row.add_suffix(iconButton('user-trash-symbolic', _('Remove this trigger'), () => {
+        line.append(iconButton('user-trash-symbolic', _('Remove this trigger'), () => {
             triggers.splice(index, 1);
             this._saveTriggers(triggers, true);
         }));
         return row;
     }
 
-    private _describeTrigger(trigger: Trigger): string {
-        const labels = triggerSourceLabels();
-        const source = labels[trigger.source] ?? (trigger.source || _('Pick a key'));
-        switch (trigger.action) {
-            case 'key': {
-                // The canonical names, so what you typed shows as what it
-                // *means*: "left" comes back as KEY_LEFT, the arrow key —
-                // visibly not the mouse button someone probably wanted.
-                const codes = comboCodes(trigger.key);
-                const resolved = codes ? codes.map(code => keyName(code)).join(' + ') : trigger.key;
-                return `${source} → ${resolved || '…'}`;
-            }
-            case 'run': return `${source} ${_('starts')} ${this._triggerMacroName(trigger)}`;
-            case 'pause': return `${source} ${_('pauses')} ${this._triggerMacroName(trigger)}`;
-            case 'stop': return `${source} ${_('stops')} ${this._triggerMacroName(trigger)}`;
-            default: return source;
-        }
-    }
-
-    private _triggerMacroName(trigger: Trigger): string {
-        if (!trigger.macro) {
-            return _('everything switched on');
-        }
-        const macro = this._store.getMacro(trigger.macro);
-        return macro ? `“${macro.name}”` : _('a deleted macro');
-    }
-
     private _triggerCaveat(trigger: Trigger): string {
         if (!isArmed(trigger)) {
             // The user's rule: an onevent with nothing attached is still a click.
-            return _('no action yet — the click passes through');
+            return _('Does nothing yet — the button works as usual until you pick what it does');
         }
         if (trigger.source === 'BTN_LEFT' || trigger.source === 'BTN_RIGHT') {
-            return _('taken over everywhere, in every app, while the daemon runs');
+            return _('Taken over everywhere, in every app, while Macroclickwerk runs');
         }
         return '';
     }

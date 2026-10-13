@@ -22,7 +22,6 @@ function recordingActions() {
     const done = [];
     return {
         done,
-        injectKeys: (codes, down) => done.push(`key ${codes.join('+')} ${down ? 'down' : 'up'}`),
         control: (action, macroId) => done.push(`${action} ${macroId || '(all)'}`),
     };
 }
@@ -36,18 +35,17 @@ check('nonsense resolves to nothing', sourceCode('BTN_NOPE') === null);
 
 // --- what arms -------------------------------------------------------------
 
-const remap = { id: '1', source: 'BTN_SIDE', action: 'key', key: 'KEY_E' };
+const pauser = { id: '1', source: 'BTN_SIDE', action: 'pause', macro: '' };
 const bare = { id: '2', source: 'BTN_EXTRA', action: 'none' };
 const runner = { id: '3', source: 'KEY_F13', action: 'run', macro: 'm1' };
-const halfway = { id: '4', source: 'BTN_MIDDLE', action: 'key', key: '' };
+const nowhere = { id: '4', source: 'BTN_NOPE', action: 'run', macro: 'm1' };
 
-check('a remap with a key arms', isArmed(remap));
-// The point of 'none': an onevent with no body is still a click.
+// The point of 'none': a trigger with nothing to do leaves its button alone.
 check('a trigger with no action stays inert', !isArmed(bare));
-check('a remap without its key stays inert', !isArmed(halfway));
-check('a macro trigger arms', isArmed(runner));
+check('a trigger on a name that is no button stays inert', !isArmed(nowhere));
+check('a macro trigger arms', isArmed(runner) && isArmed(pauser));
 
-const byCode = armedByCode([remap, bare, runner, halfway]);
+const byCode = armedByCode([pauser, bare, runner, nowhere]);
 check('only the armed ones are consumed', byCode.size === 2,
       `${byCode.size}: ${[...byCode.keys()].join(',')}`);
 check('the inert ones claim no code',
@@ -58,16 +56,10 @@ check('the inert ones claim no code',
 {
     const actions = recordingActions();
     dispatch(byCode, trig(BUTTON_CODES.side, 1), actions);
-    dispatch(byCode, trig(BUTTON_CODES.side, 0), actions);
-    check('a remapped click mirrors down and up',
-          actions.done.join(' | ') === `key ${KEY_CODES.KEY_E} down | key ${KEY_CODES.KEY_E} up`,
-          actions.done.join(' | '));
-}
-
-{
-    const actions = recordingActions();
     dispatch(byCode, trig(BUTTON_CODES.side, 2), actions);
-    check('autorepeat is not re-injected', actions.done.length === 0, actions.done.join());
+    dispatch(byCode, trig(BUTTON_CODES.side, 0), actions);
+    check('a button pauses once, on the press — not on autorepeat or release',
+          actions.done.join(' | ') === 'pause (all)', actions.done.join(' | '));
 }
 
 {
@@ -158,13 +150,13 @@ check('the inert ones claim no code',
 // falls through to dispatch when no waiter claimed the event.
 {
     const actions = recordingActions();
-    const map = armedByCode([{ id: 'r', source: 'BTN_SIDE', action: 'key', key: 'KEY_E' }]);
+    const map = armedByCode([{ id: 'r', source: 'BTN_SIDE', action: 'run', macro: 'm1' }]);
     const waiters = [{ code: BUTTON_CODES.side, edge: 'either', resolve: () => {} }];
     const event = trig(BUTTON_CODES.side, 1);
     if (claimWaiters(waiters, event).length === 0) {
         dispatch(map, event, actions);
     }
-    check('a parked run outranks a standing remap of the same button',
+    check('a parked run outranks a standing trigger on the same button',
           actions.done.length === 0, actions.done.join());
 }
 
@@ -261,31 +253,14 @@ check('the inert ones claim no code',
           ended === 'press', ended);
 }
 
-// --- remaps mirror press and release, whatever the source --------------------
-
-// A remap is a hold-follow on any EV_KEY source: mouse button to key, key to
-// key, key to mouse button. Down mirrors down, up mirrors up, and the held
-// source's autorepeat is left to the kernel.
+// --- pressing a key in place of a button is a When step, not a trigger -------
 {
-    const map = armedByCode([
-        { id: 'k', source: 'KEY_F13', action: 'key', key: 'KEY_E' },
-        { id: 'b', source: 'BTN_LEFT', action: 'key', key: 'BTN_RIGHT' },
-    ]);
-
-    let actions = recordingActions();
-    dispatch(map, trig(KEY_CODES.KEY_F13, 1), actions);
-    dispatch(map, trig(KEY_CODES.KEY_F13, 2), actions);
-    dispatch(map, trig(KEY_CODES.KEY_F13, 0), actions);
-    check('a key source mirrors press and release onto its key',
-          actions.done.join(' | ') === `key ${KEY_CODES.KEY_E} down | key ${KEY_CODES.KEY_E} up`,
-          actions.done.join(' | '));
-
-    actions = recordingActions();
-    dispatch(map, trig(BUTTON_CODES.left, 1), actions);
-    dispatch(map, trig(BUTTON_CODES.left, 0), actions);
-    check('a mouse button remaps to another button, both edges',
-          actions.done.join(' | ') === `key ${BUTTON_CODES.right} down | key ${BUTTON_CODES.right} up`,
-          actions.done.join(' | '));
+    const kept = parseTriggers(JSON.stringify([
+        { id: 'k', source: 'BTN_SIDE', action: 'key', key: 'KEY_E' },
+        { id: 'r', source: 'KEY_F13', action: 'run', macro: 'm1' },
+    ]));
+    check('a trigger that pressed a key is dropped, the rest kept',
+          kept.map(t => t.id).join() === 'r', kept.map(t => t.id).join());
 }
 
 // Gamepads are not supported, so their button names name nothing — a trigger

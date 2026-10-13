@@ -3,78 +3,141 @@
 Record, edit and replay input macros on GNOME/Wayland — with loops, and with
 conditions that can look at the screen.
 
-![Macroclickwerk Extension Screenshot](docs/screenshot.png)
+![The macro editor: a macro that waits for the Ready button to turn green, then clicks it](docs/screenshot.png)
 
-A macro is a tree of steps: clicks, key presses, typed text, scrolls, waits,
-recorded event trains — and `on event`, which parks the run until a button or
-key of your choosing is pressed (or, if you say so, released) and swallows
-that event, so a side button can mean "do the next steps" instead of what it
-normally does. Two of them on the two edges of one button make a hold: on
-left press → press E, on left release → release E. Around them you can put `loop` and `if` blocks. A loop
-only counts — forever, or a fixed number of times; you leave it with `break`
-inside an `if`, which keeps every condition in one place:
+A macro is a tree of steps: clicks, pointer moves, key presses, typed text,
+scrolls and waits — and **When**, which parks the run until a button or key of
+your choosing is pressed (or released) and swallows that press, so a side
+button can mean "do the next steps" instead of what it normally does. Around
+them go **Repeat** — forever, or a number of times — and **If**, which asks the
+screen a question and runs its **Yes** or its **No** block. You leave a Repeat
+with **Break** inside an If, which keeps every decision in one place. An If can
+ask:
 
-- **screen colour** — "the pixel at 840,512 is green ±24", or "this 40×40 area
-  averages to green ±30". Sub-5 ms, deterministic, no network. Both the spot
-  and the colour come off the screen itself: **Pick** takes a click as one
-  pixel and a drag as an area, and stores what that area averages to.
-- **ask a local vision model** — a screenshot plus your own prompt ("Is the button
-  on the left green?"), answered yes/no by an OpenAI-compatible endpoint running
-  on your machine.
-- **and / or / not** over the above, and **always** / **never** for a branch
-  that is not deciding anything today.
+- **a screen colour** — "the pixel at 840,512 is green ±24", or "this 70×30
+  area averages to green ±20". A few milliseconds, deterministic, no network.
+- **a vision model** — a screenshot plus a yes/no question of your own ("Is the
+  Ready button green?"). Either a chat model on any OpenAI-compatible endpoint,
+  or a *decision* model that answers with how likely yes is, in a third of a
+  second.
+- **all of / any of / not** over the above, and **always** / **never** for a
+  branch that is not deciding anything today.
 
-The macro that ships on first run is the one this was built for:
+Every step is one line in the editor, and everything about it is on that line.
 
-```
-repeat forever:
-    if the model says the left button is green:
-        click at x,y
-        if a colour check passes:
-            type E
-    wait 10s
-```
+## What you can do with it
+
+### Wait for a button, then click it
+
+The screenshot above is the macro this was built for. A Repeat asks the model,
+once a second, whether the Ready button is green; when it is, the Mouse step
+clicks it and waits three seconds, give or take half a second. The question
+names an area — `938, 414, 194, 82` — so the model looks at the button and not
+at the whole screen, and **Flash** draws a green outline over that area every
+time the check runs, so you can watch it look where you meant. The `then 50ms`
+on the click is the game's turn: the next step waits until the game has had a
+frame to register the click.
+
+### Skip waves on a colour, with no model at all
+
+![A colour check: when the Skip Wave button turns green, click it](docs/skip-waves.png)
+
+When the answer is a colour, a colour check is faster and never wrong about
+it. **Pick** (⌖) takes a click as one pixel or a drag as an area, and brings
+back the colour that area averages to; 💧 reads it again in place when the
+button has changed shade. The swatch beside `#2beb00` follows what you type, so
+you always see which green you mean.
+
+### Macros that drive each other
+
+![Restart match: when the round is over, click Restart and start Auto-ready again](docs/restart-match.png)
+
+A **Start** step starts another macro — or restarts it, if it is already going
+— from the top or from any step you pick. Here a watcher notices the round is
+over, clicks **Restart Match**, and hands over to Auto-ready from the top. A
+**Stop** step ends one. Switch several macros on and **Run** starts them side
+by side, interleaving a step at a time over the one pointer and keyboard.
+
+### Side-button tricks: hold to sprint, three-shot burst
+
+![When the side button goes down, Shift goes down; when the extra button is pressed, click three times](docs/side-button-tricks.png)
+
+A **When** holds the steps after it, drawn as a block. A key or click under a
+When can *follow* it — the toggle next to the key — so it goes down when you
+press the side button and comes up when you let go: hold to sprint, without the
+game ever seeing the side button. The second When waits for the extra button
+and fires three clicks, 40 ms apart.
+
+### Ask the model the right question
+
+![Check now: the model's answer shows on the Yes line; a question with "not" in it gets a hint](docs/asking-the-model.png)
+
+A model can only say yes or no, so the question has to be one that yes or no
+answers — and it works best when **Yes means what you are waiting for is on
+the screen**: the click goes in Yes, waiting or trying again in No. The editor
+checks the wording as you type. "What colour is the button?", "Count the
+enemies" and "Is the button not green?" each get a hint underneath saying what
+to ask instead. **▶ Check now** asks the model about the real screen right
+away and marks the branch the If would take — "Yes — model says yes · 97% sure ·
+0.3 s" — so you can try a question before a macro relies on it.
+
+### A decision model, in a third of a second
+
+![Settings → Model with a decision model selected: Kind, endpoint, model, Yes from 80%](docs/decision-model.png)
+
+Under **Settings → Model**, **Kind** is either **Chat** — any OpenAI-compatible
+chat endpoint, asked for a one-line JSON verdict — or **Decision**: a decision
+model such as Cloudflare's Clef on llama.cpp-server's `/v1/systemone`, asked one
+yes/no question and answering with a probability, with nothing generated. On
+the same machine and the same 27B size, a decision took about 0.3 s where a
+chat model took 1–2 s. **Yes from (%)** sets how sure it must be: below
+that the answer is No, so raising it makes a macro act only when the model is
+very sure. **Test** sends one small picture and says what came back.
+
+### Triggers: a spare button as a switch for your macros
+
+![Settings → Input → Triggers: F13 starts Auto-ready, the side button pauses everything, the extra button stops everything](docs/triggers.png)
+
+A trigger turns a spare mouse button or key into a switch for your macros: it
+starts, pauses or stops one of them — or everything switched on — even when
+none is running. The press is consumed, so the game never sees it. Until you
+pick what a trigger does, its button works as usual, and so does every button
+whenever Macroclickwerk is not running. To make a button press something else
+inside a game, use a When step in a macro, as in the side-button tricks above.
+While a macro is waiting on a button in a When, that press goes to the When,
+not to a trigger on the same button.
 
 ## Features
 
 - **Recording** of real mouse and keyboard input, coalesced into readable steps:
-  clicks carry their absolute screen position, pointer movement becomes a move
-  step wherever it comes to rest, and idle gaps become waits.
-- **A full tree editor in preferences** — every step and condition, nested
-  loops and `and`/`or`/`not`, plain-language summaries, and JSON import/export
-  to a file you choose.
+  clicks carry their absolute screen position, pointer movement becomes a Move
+  wherever it comes to rest, and idle gaps become waits. Record into any row —
+  into the middle of a loop, say — and watch that row go red while it runs.
+- **A one-line-per-step editor** — every setting of a step on its own line;
+  Repeat and If fold from the arrow on their left; steps move by dragging the
+  grip. Times step with − and +; every number field with ↑/↓, or the scroll
+  wheel once focused.
+- **A wait after any action** — `then 30ms` on a click, move, key, text or
+  scroll gives the game a frame to register it before the next step.
+- **Two kinds of vision model** — a chat model on any OpenAI-compatible
+  endpoint, or a decision model that answers with a probability in a third of a
+  second; a **Yes from (%)** bar for how sure it must be.
+- **Questions you can trust** — the wording is checked as you type, and
+  **▶ Check now** asks the model about the real screen and marks the branch the
+  If would take.
+- **Triggers** — a spare mouse button or key that starts, pauses or stops your
+  macros, even when none is running.
+- **Pause and continue** — halting a run remembers the step it was on, and
+  clicking a row is what says where the next run starts.
+- **See what a check is looking at** — **Flash** outlines the checked area for
+  a second every time it runs, drawn just after the screen is read, so it is
+  never part of what was measured.
 - **A panel popup that stays out of the way** — a switch, a stop, what is
   running, and a way into the settings.
-- **Several macros at once** — a switch per macro says which ones **Run**
-  starts, and they run side by side, interleaving a step at a time over the one
-  pointer and keyboard.
-- **Pause and continue** — halting a run remembers the step it was on, and
-  selecting a step is what says where the next run starts.
-- **Record straight into a loop body** — click the row a recording should land
-  on, and watch it go red while the recording runs. The same selection is where
-  a run continues from: one mark for “here”.
-- **Macros that drive each other** — a `start` step restarts a macro from the
-  top *or from any step you pick*, so a watcher can send another macro straight
-  to the part that matters; `stop` ends one.
-- **See what a check is looking at** — a **Flash** toggle on either screen
-  check draws a green outline over the checked area for a second every time it
-  runs, drawn just after the screen is read so it is never part of what was
-  measured or of the picture the model sees. Picking an area flashes it back at
-  you too, so the numbers that land in the field are never taken on trust.
-- **Emergency stop** that aborts mid-macro and releases every held key.
-- **Triggers** — a mouse button or key the daemon takes over, and what happens
-  in its place: press another key (side button becomes E), or start, pause or
-  stop a macro — one of them, or everything switched on, which turns a spare
-  button into a physical run/stop switch. The original click is consumed, so
-  the game only ever sees the replacement. Set up under *Preferences → Input →
-  Triggers*. A trigger with no action set leaves its button alone, and every
-  trigger falls back to being a plain button when the daemon or the extension
-  is not there to act — never a dead button. Recordings skip trigger presses:
-  they capture what the screen saw, not what the mouse did. The same machinery
-  drives the **on event step**: put it in a macro and the run parks there until
-  the button is pressed, consuming the press — `repeat forever: [on event
-  side button, click …, type E]` is a side button that plays a sequence. A
-  run parked on a button outranks a standing trigger on the same button.
+- **Emergency stop** that aborts mid-macro and releases every held key; a
+  stopped or paused macro also lets go of whatever it was holding down.
+- **Backup** — **Export** and **Import** next to **Add macro**, for the macros
+  and for the settings, to a file you choose.
 
 ## How it fits together
 
@@ -106,6 +169,11 @@ coordinate involved is correct. A person moving a mouse and clicking never gets
 close to being that quick. The wait is skipped when the pointer was already
 there, so a macro clicking the same button in a loop pays it once.
 
+What comes *after* a step is yours to set: `then 30ms` on a click, move, key,
+text or scroll holds the next step back until the game has had a frame or two
+to register this one. A game reads input once a frame; two actions in the same
+millisecond can both land before it looks, and it sees only the last.
+
 If a target swallows the warp (a pointer-confining grab), the extension falls
 back to walking there over uinput: nudge, re-read the pointer, nudge again
 until it is within a pixel. The move and the click that follows it hold the
@@ -121,8 +189,9 @@ a relative offset for those.
 ## Requirements
 
 - Linux with `uinput`, GCC, `libjson-c`, `libmicrohttpd`
-- GNOME Shell 50 on Wayland
-- optional: any OpenAI-compatible vision endpoint, for the `llm` condition
+- GNOME Shell 51 on Wayland
+- optional: a vision model for model checks — a chat model on any
+  OpenAI-compatible endpoint, or a decision model on a SystemOne endpoint
 
 ## Installation
 
@@ -148,7 +217,7 @@ rm -rf ~/.local/share/gnome-shell/extensions/clickmate@tbocek.github.com
 ```
 
 Macros live under the settings schema, so they do not carry over on their own:
-**before** removing the old extension, export them (Settings → Backup →
+**before** removing the old extension, export them (Settings → Macros →
 Export → Macros) and import the file into Macroclickwerk — the same round trip
 works for settings.
 
@@ -191,9 +260,8 @@ Devices do not have to exist when the daemon starts. `/dev/input` is watched, so
 anything matching is captured when it appears and reattached when it comes back
 after being unplugged. That matters more than it sounds: a wireless mouse often
 pairs a second or two into boot, and a remapper upstream of macroclickwerk rebuilds
-its virtual keyboard every time it is restarted. Both used to leave the daemon
-running against devices that no longer existed, with nothing but a line in the
-journal to say so. `journalctl -u macroclickwerk -f` shows `captured`, `reattached`
+its virtual keyboard every time it is restarted, and both are picked up again
+on their own. `journalctl -u macroclickwerk -f` shows `captured`, `reattached`
 and `detached` as they happen.
 
 The daemon takes an exclusive grab on those devices — but only while something
@@ -234,36 +302,51 @@ pnpm run install     # symlinks dist/ into ~/.local/share/gnome-shell/extensions
 
 Log out and back in (Wayland has no `Alt+F2 r`), then enable *Macroclickwerk*.
 
-### A local vision model
+### A vision model
 
-Only needed for `llm` conditions. For example:
+Only needed for model checks. Two kinds work, chosen under *Settings → Model →
+Kind*; the endpoint and the model's name are yours to fill in, whatever your
+server calls it.
+
+**Chat** — any OpenAI-compatible chat endpoint with a vision model. For
+example:
 
 ```bash
 ollama serve
 ollama pull qwen2.5vl:7b
 ```
 
-then point *Preferences → Model → Endpoint* at
-`http://localhost:11434/v1/chat/completions`. Preferences warns when the endpoint
-is not on this machine, because every check uploads a picture of your screen to it.
+then set the endpoint to `http://localhost:11434/v1/chat/completions`. Each
+check sends the screenshot and asks for a single JSON object,
+`{"match": true|false, "reason": "…"}`, with `response_format: json_object` so
+servers that support constrained decoding enforce it (the field is dropped
+automatically if the server rejects it). Small models still wander, so the
+reply parser also accepts fenced JSON, `"true"` as a string, `1`/`0`, alternate
+keys like `answer` or `result`, trailing chatter, and a bare YES/NO. Reasoning
+models get `chat_template_kwargs: {enable_thinking: false}`, because a model
+that deliberates over every screenshot answers seconds late — or, once its
+token budget runs out mid-thought, not at all; thinking that arrives anyway is
+dropped rather than read for a verdict.
 
-Endpoint, model and timeout are global — conditions carry only the prompt, the
-screen area, and what to do on a failure. Each condition is asked for a single
-JSON object, `{"match": true|false, "reason": "…"}`, and `response_format:
-json_object` is sent so servers that support constrained decoding enforce it
-(the field is dropped automatically if the server rejects it). Small models
-still wander, so the reply parser also accepts fenced JSON, `"true"` as a
-string, `1`/`0`, alternate keys like `answer` or `result`, trailing chatter, and
-a bare YES/NO. If a prompt misbehaves, the popup's status line shows what the
-model actually said.
+**Decision** — a decision model on a SystemOne-style endpoint, such as Clef on
+llama.cpp-server's `/v1/systemone`. Switching the kind changes the end of the
+endpoint between `/chat/completions` and `/systemone` for you. The check is
+sent as one yes/no question about the screenshot, and the model answers with
+the probability of yes in a single pass — nothing is generated, which is what
+makes it fast. **Yes from (%)** is the bar: below it, the answer is No. When the
+model is unsure the macro waits, and raising the bar makes it act only when the
+model is very sure.
 
-Reasoning models get `chat_template_kwargs: {enable_thinking: false}`, because a
-model that deliberates over every screenshot answers seconds late — or, once its
-token budget runs out mid-thought, not at all. Templates that do not know the
-field ignore it, and a server that rejects it is retried without it. Thinking
-that arrives anyway is dropped: it is prose full of braces and the words *true*
-and *no*, and reading a verdict out of half a thought would be worse than
-reporting that none was found.
+Endpoint, model, timeout and kind are global; a check carries only its
+question, its area and whether to flash it. **Test the connection** sends one
+small red picture and says what came back — red means no answer and why,
+yellow means it answered but did not see the picture, which is usually a model
+that cannot see images. Every check uploads a picture of your screen to the
+endpoint, so point it at a machine you trust.
+
+If the model cannot be reached or gives no answer, the macro stops — guessing
+either branch would send it somewhere on no evidence — and the problem log in
+the panel popup says why.
 
 ## Usage
 
@@ -279,7 +362,7 @@ The panel popup holds only a run switch, a **Stop**, what is running, and a
 last condition verdict, "Recorded 3 steps". That text is kept after the fact,
 because most of it happens while the menu is closed — click the panel icon to
 read it. Everything else — macros, steps, conditions, which macros run — lives
-in the preferences window.
+in the Settings window.
 
 ### Switched on, and running several at once
 
@@ -295,31 +378,31 @@ and will end up somewhere neither meant; two watching different corners of the
 screen and clicking different buttons will not.
 
 Beside the switch is a **▶** that runs that one macro, on or off, right now —
-and turns into a **■** while it runs, which is also how the editor shows you
-which macros are going without your having to look at the panel.
+and turns into **⏸** while it runs, which is also how the editor shows you which
+macros are going without your having to look at the panel. The **■** next to it
+stops the macro and puts the selection back on its first step.
 
 A macro that is switched off is still yours to edit, record into and step
 through; it just does not join in when you press Run.
 
 The macro is the only thing there is a switch for. Steps have none: a step that
 is in a macro runs when that macro runs. Something you want out of the way for
-now is either deleted or put behind an `if` that says when it applies. (Steps
-used to carry a switch each; documents saved with one lose it on first load, and
-those steps run.)
+now is either deleted or put behind an `if` that says when it applies.
 
 Macros can also drive each other. A `start` step names a macro and starts it; if
 that macro is already going it is stopped first and begins again, which is the
 whole point — a watcher that notices the screen has gone back to its starting
-state can put the macro that works it back at the beginning. An **At step**
-dropdown on the same step picks where that new run begins: **From the top**, or
-any step of the target macro, shown indented the way the editor nests them. A
+state can put the macro that works it back at the beginning. A second dropdown
+on the same step picks where that new run begins: **From top**, or any step of
+the target macro, shown indented the way the editor nests them. A
 `start` pointing into its own macro is therefore a jump — stop whatever this
 run is doing, continue from the chosen step. A `stop` step names a macro and
-ends it. Both offer **This macro** as the first choice, so a `start` with
+ends it. Both offer **This one** as the first choice, so a `start` with
 nothing named is "go round again" and a `stop` with nothing named ends the run
-it is in, the way a `break` ends a loop. Delete a macro or a step something
-points at and the reference falls back — the macro to meaning this one, the
-step to the top — rather than pinning the run to something that is gone.
+it is in, the way a `break` ends a loop. Delete the step a `start` begins at and
+it falls back to the top. Delete the macro it names and the step says **Missing
+macro** in red until you pick another — running it fails with that message
+rather than quietly meaning something else.
 
 ### Pause, continue, stop
 
@@ -360,15 +443,13 @@ off the menu or close it.
 Build a macro by recording it (`Ctrl+Shift+R`), then open Settings to adjust it.
 Recorded steps go on the row you selected. Click any row in any macro and it is
 tinted blue to show it: a step, and the recording is dropped in right after it;
-an **Add step here** row inside a loop, or a **Yes** or **No** header, and the
-recording goes at the end of that
-body. Having selected nothing, the first step of the macro is selected for you,
-which is where a run would start anyway; a macro with no steps yet leaves **The
-end of the macro**. Choose the body of a loop and a recording lands inside
-the loop instead of after it — which is what you want in a macro that is one
-endless loop, and until now meant recording at the end and moving every step in
-by hand. Appending to the end of a macro that never gets there still tells you
-so; a body has no such trap.
+the **+ Add step** row inside a Repeat, or a **Yes** or **No** header, and the
+recording goes at the end of that body. Having selected nothing, the first step
+of the macro is selected for you, which is where a run would start anyway; a
+macro with no steps yet has only its add row to select. Choose the body of a
+loop and a recording lands inside the loop instead of after it — which is what
+you want in a macro that is one endless loop. Appending to the end of a macro
+that never gets there still tells you so; a body has no such trap.
 
 While a recording is running, the selected row turns a stronger red, so you can
 see where the next click will land without looking at the panel.
@@ -384,55 +465,42 @@ what you hoped — and putting it first means it is not buried under a `then` th
 has grown. It changes nothing about the run: the condition is still asked once
 and the matching branch still runs.
 
-Steps are added from the **Add step…** dropdown, which is also the button:
-picking a kind adds it there, at the end of whichever list the dropdown sits in.
-The row it sits on is the last row of that list, under the steps, because that is
-where what it adds appears.
-Next to it, **Record…** offers two ways in. **One step** captures a single
-action, which is the quickest way to fill in coordinates: the window gets out
-of the way, and the next click you make becomes a `click` step at that
-position; move the pointer and hold still for about a second instead and you
-get a `move` step. **Multiple steps** starts a whole recording landing at that
-same row — the window stays out of the way until you stop (`Ctrl+Shift+R`, the
-panel menu, or picking **Multiple steps** again). `Ctrl+Shift+M` captures one
-step without opening Settings, into whichever row is selected.
+Every list of steps ends in a short row with two buttons. **+ Add step**
+offers every kind of step and adds it there, at the end of that list — the row
+is the last one because that is where what it adds appears. A new Repeat or If
+starts open, so the row for adding into it is right there. **● Record** offers
+two ways in. **One step** captures a single action, which is the quickest way to
+fill in coordinates: the window gets out of the way, and the next click you make
+becomes a Mouse step at that position; move the pointer and hold still for
+about a second instead and you get a Move step. **Multiple steps** starts a
+whole recording landing at that same row — the window stays out of the way
+until you stop (`Ctrl+Shift+R`, the panel menu, or picking **Multiple steps**
+again). `Ctrl+Shift+M` captures one step without opening Settings, into
+whichever row is selected.
 
 **Right-click any step** for **Run from here**: the macro starts at that step
 and carries on from it, which is how you try the second half of something
-without sitting through the first. It sits between the two buttons that were
-already there — the **▶** on a step runs that step *alone*, and **Run** at the
-top starts from the selected row, which is wherever you last clicked and rarely
-the step you are looking at. Running from here moves the selection here too, so
-the mark, the highlight and where a pause would continue from all agree.
+without sitting through the first. Running from here moves the selection here
+too, so the mark, the highlight and where a pause would continue from all
+agree. A step that is one action — Mouse, Move, Key, Text, Scroll, Wait — also
+offers **Run this step only**: the window drops out of the way, the step runs on
+the real screen, and the window comes back. It is the quickest way to check that
+a click really lands where you meant it to.
 
-The **▶** on a step does that one step immediately, on the real screen: the
-window drops out of the way, the step runs, and the window comes back. It is the
-quickest way to check that a click really lands where you meant it to, without
-running the macro around it. Steps that only mean something inside a run do not
-get one — a loop or an `if` would take its whole body along, and an endless loop
-would take the session with it from a window that has no Stop. A step that ran
-becomes the selected row, so the insertion point walks down the macro with you:
-whatever you record next carries on from where you got to, rather than from
-wherever the selection started out.
-
-**Move up** and **Move down** treat the editor as what you see. A folded loop is
-one card, so a step passes it in a single press; an open one is a place with an
-inside, so the same press moves the step into it — in at the top coming down, in
-at the bottom coming up. An `if` is entered by the side you arrive from, in the
-order the two blocks are drawn: **No** from above, **Yes** from below, skipping
-either if it is folded shut. Pressing on
-past the end of a body climbs back out around the loop, so nothing that moved in
-is stuck there.
+Steps move by dragging the grip on their left. Drop on the top half of a row to
+put the step before it, the bottom half to put it after; drop on a Repeat or
+When header to put it first inside, and hover over a folded Repeat to spring it
+open. A step moves with everything inside it. Repeat and If fold from the arrow
+on their left; the rest of the header is for selecting, like any other row.
 
 Coordinates are single fields — `100, 200` for a point, `10, 20, 40, 40` for an
-area — each with a **Show** button that flashes a red X (or an outline) at that
-spot on the real screen for a couple of seconds, so you can check a number
-without running anything. Next to it, **Pick** fills the field by pointing: the
-window gets out of the way, the screen dims, and where you click lands in the
-field — which is how you correct a coordinate that has moved without recording
-the step again. Escape leaves the field as it was, and what was picked is
-flashed back at you. A step's title follows its coordinates, so a click that now
-goes somewhere else says where. An area is picked by dragging one out on the
+area — sized to what is in them. Beside each, **⌖ Pick** fills the field by
+pointing: the window gets out of the way, the screen dims, and where you click
+lands in the field — which is how you correct a coordinate that has moved
+without recording the step again. Escape leaves the field as it was, and what
+was picked is flashed back at you. **👁 Show** flashes a red X (or an outline)
+at that spot on the real screen for a couple of seconds, so you can check a
+number without running anything. An area is picked by dragging one out on the
 same overlay, described with the condition it belongs to below.
 
 Every one of these — the picker, the red X, the green flash — is drawn above
@@ -454,28 +522,28 @@ a fixed position fails outright against a game that has the pointer locked
 rather than clicking wherever it got stuck. Relative motion still works there,
 because relative motion is exactly what a locked pointer accepts.
 
-Where a click or a move goes is one row: the numbers, **Pick**, **Show**, and
-buttons for not using coordinates at all. On a click the mouse button means
-"wherever the pointer already is", and the numbers go away with it; on a move
-it means "by this much" rather than "to here", and the numbers stay but stop
-being a place — so **Pick** and **Show**, which are about a spot on the screen,
-go instead. It used to be a dropdown naming the mode with the coordinates on a
-second row underneath: a line of prose and a line of numbers to say one thing.
+Where a click or a move goes is a dropdown on its line. A Mouse step acts **At
+x,y** or **At pointer** — wherever the pointer already is, and the numbers go
+away with it. A Move goes **To x,y** or **By offset** — the numbers stay but
+stop being a place, so **Pick** and **Show**, which are about a spot on the
+screen, go instead.
 
-The history button on the same row is "@ previous": the step goes back to
-wherever the pointer was before the last positioned step in the run. Every
-positioned click and move remembers the spot it left, so *click at 3438,549*
-followed by *click left @ previous* is an excursion and its undo — the macro
-reaches over, clicks, and puts the pointer back where you were working, in a
-blink, since positioned moves are instant warps. A "@ previous" before any
-positioned step has nowhere to go and stays put; each run starts with no
-history.
-
-Screen areas for `llm` conditions can also be chosen with **Pick**, which drops
-the window out of the way and lets you drag a rectangle over the screen;
-**Screen** goes back to checking the whole screen. Whatever you drag out is
+A model check is one line: the yes/no question, then its area — `x, y, width,
+height`, or empty for the whole screen. **Pick** drops the window out of the way
+and lets you drag a rectangle over the screen, and whatever you drag out is
 flashed back at you once the window returns, so the numbers in the field never
 have to be taken on trust.
+
+Ask so that Yes means what you are waiting for is on the screen, and put what
+should happen then in the If's **Yes** block. A question that yes or no cannot
+answer — "What colour…", "Count…", "…green or red?" — or one that asks about
+something missing gets a hint under it, with what to ask instead; **ⓘ** beside
+the question has the rules, examples, and exactly what is sent to the model.
+**▶ Check now** asks the model about the screen as it is, before a macro relies
+on the question: the answer goes on the branch the If would take — "Yes — model
+says yes · 97% sure · 0.3 s" — and changing the question clears it. A question
+inside **all of** or **any of** decides no branch on its own, so its answer shows
+under it instead, and so does a check that got no answer, with why.
 
 A colour condition's **Pick** is the same overlay, and it brings the colour
 back with it: click a pixel and the check is that pixel and the colour it has;
@@ -483,22 +551,20 @@ drag a rectangle and the check is that area and what it averages to.
 
 The check is then one colour against one colour — what that area averages to
 now, against what it averaged to when you picked it, within the tolerance
-beside the field. There is no third number, and there used to be: a share of
-the pixels that had to match. It is gone because it asked individual pixels to
-match an *average*, and an average is a colour that need not be anywhere in the
-area — a green button with a dark glyph on it and a white badge under it
-averages to a green that is neither the button nor the glyph nor the badge, so
-the share was routinely zero and the check could not come true however the
-screen looked. Averaging both sides asks a question the numbers can answer, and
-one number is left to tune.
+beside the field. Both sides are averages on purpose: an average is a colour
+that need not be anywhere in the area — a green button with a dark glyph on it
+and a white badge under it averages to a green that is neither the button nor
+the glyph nor the badge — so comparing single pixels against it would rarely
+match. Comparing an average with an average asks a question the numbers can
+answer, and leaves one number to tune.
 
 Tolerance is a distance in RGB, not a slack per channel: 30 is roughly 17 per
 channel if all three move together. Generous enough for antialiasing, a shadow,
 a frame caught mid-animation; nowhere near enough to survive the thing you are
 watching disappearing.
 
-**Read** beside the colour takes that average again without moving the area,
-for when the button you are watching has changed shade since you picked it.
+💧 beside the colour takes that average again without moving the area, for
+when the button you are watching has changed shade since you picked it.
 
 `#22aa33` is a number, and a number is not a colour anyone recognises, so a
 block of it sits beside the field — following the text as you type it, and
@@ -506,19 +572,19 @@ drawn as an empty outline while what you have typed is not a colour yet. The
 same block follows every colour a summary line names, so a folded `If avg of
 40×40 @ 1,2 ≈ #123456 ±30` says which blue it means without being opened.
 
-The **Flash** toggle on the area row draws a green outline over the checked
+The **Flash** toggle on a check's line draws a green outline over the checked
 area for a second every time the check runs, so you can watch a running macro
 look where you meant it to. Both checks have one. The flash fires just after
 the screen is read, never before: the outline's own green would otherwise be
 part of the colour the check measured, and part of the picture the model is
 asked about.
 
-At the top of the Macros page, **Backup** has an **Export** and an **Import**,
-each offering **Macros** or **Settings** — two files, because they move for
-different reasons: the steps are the work, the settings are the machine they run
-on. Both open a file chooser, so where a backup goes and which one comes back is
-yours to say; the names `macroclickwerk-macros.json` and `macroclickwerk-settings.json` are
-only what the save dialog starts with. Importing macros replaces every macro you
+At the top of the Macros page, next to **Add macro**, are **Export** and
+**Import**, each offering **Macros** or **Settings** — two files, because they
+move for different reasons: the steps are the work, the settings are the
+machine they run on. Both open a file chooser, so where a backup goes and which
+one comes back is yours to say; the names `macroclickwerk-macros.json` and
+`macroclickwerk-settings.json` are only what the save dialog starts with. Importing macros replaces every macro you
 have. Importing settings skips anything the schema does not know or will not
 take, and says which keys it ignored.
 
@@ -528,7 +594,7 @@ Over the unix socket at `/var/run/macroclickwerk-socket`. One thing to know befo
 driving it directly: the daemon speaks raw evdev, and its virtual mouse is a
 **relative** device — pointer motion through `/play` is `REL_X`/`REL_Y`, with
 the compositor's acceleration curve applied to whatever you send. Absolute
-positioning ("click at x,y", "@ previous") is the extension's work: it warps
+positioning ("click at x,y") is the extension's work: it warps
 the compositor's pointer, verifies where it landed, and only then clicks
 through the daemon. The raw API has no such convergence — a delta in means an
 accelerated delta out.
@@ -609,7 +675,7 @@ systemctl mask systemd-udev-settle.service
 ## Troubleshooting
 
 - **Popup says it cannot reach the daemon** — `systemctl status macroclickwerk`, and
-  check the socket path in *Preferences → Input*.
+  check the socket path in *Settings → Input*.
 - **"The macroclickwerk daemon is out of date"** — the extension needs API v2; rerun
   `sudo make install`.
 - **Clicks land in the wrong place** — check whether the target grabs the
@@ -617,6 +683,16 @@ systemctl mask systemd-udev-settle.service
   could not land.
 - **Daemon will not start** — check permissions on `/dev/uinput` and that
   `libjson-c` and `libmicrohttpd` are installed.
+- **The extension shows ERROR** — `gnome-extensions info
+  macroclickwerk@tbocek.github.com` says so, and `journalctl --user -b | grep -A6
+  macroclickwerk` says why. Changes to the extension load only at the next
+  login.
+- **Every model check fails with "model … not found"** — the model's name has
+  to match what the server calls it, exactly; servers rename models when their
+  settings change. **Test the connection** under *Settings → Model* shows the
+  server's answer.
+- **The game misses an action** — give the step a `then` wait (30–50 ms is a
+  frame or two), so the next step does not arrive before the game has looked.
 
 ## Contributing
 
