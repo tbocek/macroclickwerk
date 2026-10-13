@@ -277,6 +277,15 @@ const branchStyles = (): Record<'then' | 'else', { icon: string; title: string; 
 const EDITOR_MAX_WIDTH = 900;
 
 /**
+ * How wide the window opens. A Mouse step carries the most on its line —
+ * button, action, hold, where, the spot with Pick and Show, and the wait after
+ * it — and nested a few levels deep it needs about 760 px. Opening at the
+ * editor's own maximum leaves that room, and the title beside it. It can
+ * still be made narrower; past that the page simply stops shrinking.
+ */
+const EDITOR_WINDOW_WIDTH = 900;
+
+/**
  * Nesting is the thing you have to be able to read at a glance, and stacked
  * expander rows on their own do not show it. Every body gets a coloured rail
  * down its left edge — one colour per branch — that spans everything inside it,
@@ -402,6 +411,9 @@ row.macroclickwerk-selectable.macroclickwerk-running:hover {
 /* The macro's name is the heading of its card. */
 .macroclickwerk-macro-name text { font-weight: bold; }
 
+/* The fold arrow is an icon, not a button: as narrow as its arrow. */
+.macroclickwerk-fold { min-width: 18px; min-height: 18px; padding: 0; }
+
 /* The grip whispers until the pointer is near it. */
 .macroclickwerk-grip { opacity: 0.4; }
 row:hover .macroclickwerk-grip { opacity: 1; }
@@ -411,6 +423,15 @@ row:hover .macroclickwerk-grip { opacity: 1; }
 .macroclickwerk-drop-below { box-shadow: inset 0 -3px 0 @accent_bg_color; }
 .macroclickwerk-drop-into  { background-color: alpha(@accent_bg_color, 0.25); }
 `;
+
+/** The width of the fold arrow on the left of a step, and of the blank kept in its place. */
+const FOLD_ARROW_PX = 18;
+
+/**
+ * The steps that act on the game, and so can wait after themselves for it to
+ * register what they did — see `ThenWait` in the model.
+ */
+const THEN_WAIT_KINDS: StepKind[] = ['click', 'move', 'key', 'text', 'scroll'];
 
 /** Hovering a drag over a folded container this long springs it open. */
 const SPRING_OPEN_MS = 600;
@@ -782,6 +803,10 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
 
     async fillPreferencesWindow(window: Adw.PreferencesWindow): Promise<void> {
         this._window = window;
+        const [width, height] = window.get_default_size();
+        if (width < EDITOR_WINDOW_WIDTH) {
+            window.set_default_size(EDITOR_WINDOW_WIDTH, height);
+        }
         this._settings = this.getSettings();
         this._store = new MacroStore(this._settings);
         this._loadExpansion();
@@ -1616,18 +1641,32 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
     }
 
     /**
-     * An expander that is always open and does not look like one: the Yes and
-     * No under an `if`, and a When holding the steps after it. They are
-     * expanders only because that is the row that can hold rows. The arrow is
-     * made invisible rather than removed, so its room stays and the bin keeps
-     * its column. libadwaita builds the header and its arrow privately, so
-     * they are found by looking — and if it ever builds them differently, the
-     * row simply keeps its chevron.
+     * Take folding away from libadwaita's own arrow: the arrow on the right of
+     * an expander goes, and so does folding by clicking the header, which on
+     * these rows is how they are selected. A Repeat or an If folds from the
+     * arrow on its left instead — see `_foldArrow` — and the rest are blocks
+     * that stay open: a When with the steps after it, the Yes and No of an If.
+     * libadwaita builds the header and its arrow privately, so they are found
+     * by looking; if it ever builds them differently, the row simply keeps
+     * its own arrow as well.
      */
-    private _fixOpen(row: Adw.ExpanderRow): void {
-        row.set_expanded(true);
+    private _ownFold(row: Adw.ExpanderRow): void {
         this._headerOf(row)?.set_activatable(false);
-        firstDescendant(row, child => child.has_css_class('expander-row-arrow'))?.set_opacity(0);
+        firstDescendant(row, child => child.has_css_class('expander-row-arrow'))?.set_visible(false);
+    }
+
+    /** The arrow that folds a Repeat or an If, pointing the way the row is. */
+    private _foldArrow(row: Adw.ExpanderRow): Gtk.Button {
+        const button = new Gtk.Button({
+            valign: Gtk.Align.CENTER,
+            css_classes: ['flat', 'macroclickwerk-fold'],
+            tooltip_text: _('Fold or unfold'),
+        });
+        const sync = () => button.set_icon_name(row.get_expanded() ? 'pan-down-symbolic' : 'pan-end-symbolic');
+        button.connect('clicked', () => row.set_expanded(!row.get_expanded()));
+        row.connect('notify::expanded', sync);
+        sync();
+        return button;
     }
 
     /**
@@ -1709,11 +1748,11 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
         // open: it is a block, not a fold. Everything else is a plain row.
         const holds = block.length > 0;
         const expander = step.kind === 'loop' || step.kind === 'if'
-            ? this._expander(stepKey, props, inline ? children[0].steps.length > 0 : true)
+            ? this._expander(stepKey, props, true)
             : holds ? new Adw.ExpanderRow(props) : null;
         const row: Adw.ActionRow | Adw.ExpanderRow = expander ?? new Adw.ActionRow(props);
         if (holds && expander) {
-            this._fixOpen(expander);
+            expander.set_expanded(true);
             expander.add_css_class('macroclickwerk-event');
         }
         const widgets: Gtk.Widget[] = [row];
@@ -1728,16 +1767,24 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
         // call each: AdwActionRow and AdwExpanderRow pack them in opposite
         // directions, so the same code produced mirrored rows depending on
         // whether the step folds.
-        const prefixes = new Gtk.Box({ spacing: 6, valign: Gtk.Align.CENTER });
+        const prefixes = new Gtk.Box({ spacing: 4, valign: Gtk.Align.CENTER });
         const suffixes = new Gtk.Box({
             spacing: 2,
             valign: Gtk.Align.CENTER,
             css_classes: ['macroclickwerk-line'],
         });
         prefixes.append(this._grip(macro, step, row));
+        // The fold arrow on the left, before the icon, the way a tree shows
+        // one. A row that does not fold keeps the room empty, or its icon and
+        // title would sit further left than a Repeat's beside it and read as
+        // a level of nesting that is not there.
+        prefixes.append(expander && !holds ? this._foldArrow(expander) : new Gtk.Box({ width_request: FOLD_ARROW_PX }));
         prefixes.append(icon);
         row.add_prefix(prefixes);
         row.add_suffix(suffixes);
+        if (expander) {
+            this._ownFold(expander);
+        }
 
         // Dropping on a step: the top half means before it, the bottom half
         // after it — or, for a loop holding its own body, into that body,
@@ -1775,21 +1822,20 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
             suffixes.append(widget);
         }
 
+        if (THEN_WAIT_KINDS.includes(step.kind)) {
+            const acting = step as Step & { afterMs?: number };
+            suffixes.append(this._joiner(_('then')));
+            suffixes.append(numberEntry(acting.afterMs ?? 0, 0, 600000,
+                _('Then wait this long before the next step, so the game has registered it. 0: go straight on'),
+                value => {
+                    acting.afterMs = value > 0 ? value : undefined;
+                    this._save();
+                }, true));
+        }
         suffixes.append(iconButton('user-trash-symbolic', _('Delete'), () => {
             removeStep(macro.body, step.id);
             this._saveAndRebuild();
         }));
-        if (!expander) {
-            // Where a folding row has its chevron: the header's own spacing
-            // and the arrow's margin, less this box's.
-            suffixes.append(new Gtk.Image({
-                icon_name: 'pan-down-symbolic',
-                valign: Gtk.Align.CENTER,
-                margin_start: 7,
-                opacity: 0,
-                can_target: false,
-            }));
-        }
 
         this._selectable(row, `after:${step.id}`, macro.id);
 
@@ -1832,7 +1878,8 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
                     title: this._titleWith(style.title, this._countLabel(list.steps.length)),
                     tooltip_text: style.hint,
                 });
-                this._fixOpen(nested);
+                nested.set_expanded(true);
+                this._ownFold(nested);
                 nested.set_margin_start(indent + INDENT_PX);
                 nested.add_prefix(new Gtk.Image({
                     icon_name: style.icon,

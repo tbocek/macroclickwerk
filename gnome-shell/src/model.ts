@@ -104,7 +104,18 @@ interface StepCommon {
     id: string;
 }
 
-export type ClickStep = StepCommon & {
+/**
+ * How long a step that acts on the game waits after itself, before the next
+ * step starts. A game reads input once a frame, on its own schedule; two
+ * actions in the same millisecond can both land before it looks, and it sees
+ * only the last. Absent or 0 is no wait — a step goes straight on, as it
+ * always did.
+ */
+interface ThenWait {
+    afterMs?: number;
+}
+
+export type ClickStep = StepCommon & ThenWait & {
     kind: 'click';
     button: MouseButton;
     /** 'abs' moves to x/y first, 'current' clicks wherever the pointer is. */
@@ -123,7 +134,7 @@ export type ClickStep = StepCommon & {
     holdMs?: number;
 };
 
-export type MoveStep = StepCommon & {
+export type MoveStep = StepCommon & ThenWait & {
     kind: 'move';
     /** 'abs' moves to x/y, 'rel' by dx/dy from wherever the pointer is. */
     mode: 'abs' | 'rel';
@@ -133,13 +144,13 @@ export type MoveStep = StepCommon & {
     dy?: number;
 };
 
-export type ScrollStep = StepCommon & {
+export type ScrollStep = StepCommon & ThenWait & {
     kind: 'scroll';
     dx: number;
     dy: number;
 };
 
-export type KeyStep = StepCommon & {
+export type KeyStep = StepCommon & ThenWait & {
     kind: 'key';
     /** evdev key name, e.g. KEY_E. */
     code: string;
@@ -150,7 +161,7 @@ export type KeyStep = StepCommon & {
     holdMs?: number;
 };
 
-export type TextStep = StepCommon & {
+export type TextStep = StepCommon & ThenWait & {
     kind: 'text';
     value: string;
     /** Delay between characters. */
@@ -1107,6 +1118,16 @@ function formatMs(ms: number): string {
  * says "a chosen step" rather than which one.
  */
 export function describeStep(
+    step: Step,
+    macroName?: (id: string) => string | undefined,
+    stepLabel?: (stepId: string) => string | undefined,
+): string {
+    const after = (step as ThenWait).afterMs;
+    const action = describeAction(step, macroName, stepLabel);
+    return after && after > 0 ? `${action}, then wait ${formatMs(after)}` : action;
+}
+
+function describeAction(
     step: Step,
     macroName?: (id: string) => string | undefined,
     stepLabel?: (stepId: string) => string | undefined,

@@ -505,6 +505,18 @@ reportProblem('Macro', 'after unsubscribe');
 check('unsubscribed listener is silent', notified === before);
 clearProblems();
 
+// --- the wait after an action ----------------------------------------------
+{
+    const c = newStep('click');
+    c.afterMs = 30;
+    check('a wait after a step is part of how it reads', describeStep(c).endsWith(', then wait 30ms'), describeStep(c));
+    c.afterMs = 0;
+    check('no wait, no mention', !describeStep(c).includes('then'), describeStep(c));
+    const kept = parseDocument(JSON.stringify({ version: 1, macros: [{ id: 'm', name: 'm', body: [
+        { id: 'k', kind: 'key', code: 'KEY_E', action: 'tap', mods: [], afterMs: 40 }] }] }));
+    check('the wait survives a save', kept.macros[0].body[0].afterMs === 40);
+}
+
 // --- Back and Remember are gone ---------------------------------------------
 {
     const old = parseDocument(JSON.stringify({ version: 1, macros: [{ id: 'm', name: 'm', body: [

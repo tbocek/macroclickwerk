@@ -496,18 +496,23 @@ export class MacroRunner {
         switch (step.kind) {
             case 'click':
                 await this._doClick(step);
+                await this._thenWait(step);
                 return 'normal';
             case 'move':
                 await this._doMove(step);
+                await this._thenWait(step);
                 return 'normal';
             case 'scroll':
                 await this._doScroll(step);
+                await this._thenWait(step);
                 return 'normal';
             case 'key':
                 await this._doKey(step);
+                await this._thenWait(step);
                 return 'normal';
             case 'text':
                 await this._doText(step);
+                await this._thenWait(step);
                 return 'normal';
             case 'wait':
                 await this._doWait(step);
@@ -1027,6 +1032,16 @@ export class MacroRunner {
         const cancelWait = this._waitCancel;
         this._waitCancel = null;
         cancelWait?.();
+    }
+
+    /**
+     * The pause a step asks for after itself, so the game has seen it before
+     * the next one arrives. Cut short by a stop, like any other wait.
+     */
+    private async _thenWait(step: { afterMs?: number }): Promise<void> {
+        if (step.afterMs && step.afterMs > 0 && !this._cancelled) {
+            await this._sleep(step.afterMs);
+        }
     }
 
     private _sleep(ms: number): Promise<void> {

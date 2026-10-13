@@ -704,6 +704,32 @@ check('pathToStep of a missing step is empty', pathToStep(flat.body, 'gone').len
     check('and a stopped run names nothing', runner.currentStepId === '', runner.currentStepId);
 }
 
+// --- a step waits after itself, so the game registers it ----------------------
+{
+    const at = [];
+    const timing = { play: async () => { at.push(GLib.get_monotonic_time()); return { aborted: false }; }, stop: async () => {} };
+    const first = newStep('key');
+    first.holdMs = 0;
+    first.afterMs = 120;
+    const second = newStep('key');
+    second.holdMs = 0;
+    const m = newMacro('paced');
+    m.body.push(first, second);
+    await new MacroRunner(timing, evaluator, {}).run(m);
+    const gap = (at[at.length - 1] - at[0]) / 1000;
+    check('a step with a wait after it holds the next one back', gap >= 110, `${gap.toFixed(0)} ms`);
+
+    first.afterMs = 5000;
+    at.length = 0;
+    const runner = new MacroRunner(timing, evaluator, {});
+    const done = runner.run(m);
+    await new Promise(resolve => GLib.timeout_add(GLib.PRIORITY_DEFAULT, 50, () => { resolve(); return GLib.SOURCE_REMOVE; }));
+    const t0 = GLib.get_monotonic_time();
+    runner.stop(false);
+    await done;
+    check('a stop cuts the wait short', (GLib.get_monotonic_time() - t0) / 1000 < 500 && at.length === 1, `${at.length} plays`);
+}
+
 print(failures === 0 ? '\nALL PASSED' : `\n${failures} FAILURES`);
 if (failures > 0) {
     imports.system.exit(1);
