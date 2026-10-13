@@ -498,22 +498,31 @@ const triggerActionLabels = (): Record<string, string> => ({
  */
 function promptHelp(kind: 'chat' | 'decision', thresholdPercent: number): string {
     const lines = [
-        _('<b>Ask something the answer to is yes or no.</b>'),
-        _('A question or a statement that is true or false — both work.'),
+        _('<b>Ask so that Yes means: what you are waiting for is on the screen.</b>'),
+        _('Put what the macro should then do in the If’s <b>Yes</b> branch, and waiting or trying again in <b>No</b>.'),
         '',
-        _('<b>Works:</b>  Is the button on the left green?'),
-        _('<b>Works:</b>  The player has over $900'),
-        _('<b>Cannot work:</b>  What colour is the button? — it wants words'),
-        _('<b>Cannot work:</b>  Count the enemies — it is an instruction'),
+        _('<b>Good:</b>  Is the Ready button green?  → Yes: click it.  No: wait, try again.'),
+        _('<b>Good:</b>  The player has over $900  → Yes: buy.  No: keep playing.'),
+        _('<b>Avoid:</b>  Is the button not green? — say what you expect to see instead.'),
+        _('<b>Avoid:</b>  The restart button is gone — ask whether it is there, and use No.'),
+        _('<b>Cannot work:</b>  What colour is the button? — the answer is a word, not yes or no.'),
+        _('<b>Cannot work:</b>  Count the enemies — that is an order, not a question.'),
         '',
-        _('• One visible fact at a time. “green and enabled” gives the model room to be half right.'),
+        _('• One thing at a time. “green and enabled” lets the model be half right.'),
         _('• Say where it is: “the button at the bottom right”.'),
-        _('• No need for “not”: put the steps for a No answer in the If’s No branch.'),
         _('• A tight <b>Area</b> helps more than any wording.'),
-        _('• ▶ asks the model about the screen as it is now, so you can try the wording before a macro relies on it.'),
+        _('• ▶ asks the model about the screen right now, so you can try the question before a macro relies on it.'),
         _('• If the model cannot be reached or gives no answer, the macro stops and the problem log says why.'),
         '',
     ];
+    if (kind === 'decision') {
+        lines.push(
+            _('<b>When the model is not sure, the answer is No.</b> It only says Yes from') +
+                ` ${thresholdPercent}% ` + _('sure. Raise that under Settings → Model → <b>Yes from (%)</b> and the macro ' +
+                'acts only when the model is very sure; when it is unsure, it waits.'),
+            '',
+        );
+    }
     if (kind === 'decision') {
         lines.push(
             _('<b>Sent to a decision model</b> as one yes/no question about the screenshot. It answers with how likely yes is, ' +
@@ -2351,9 +2360,24 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
                 const check = iconButton('media-playback-start-symbolic',
                     _('Check now: ask the model about the screen as it is'),
                     () => this._checkNow(condition, promptRow, check, hint));
-                promptRow.add_suffix(check);
-                promptRow.add_suffix(infoButton(_('How to word this, and what is actually sent'),
-                    promptHelp(this._llmKind(), this._settings.get_int('llm-decision-threshold')), 64));
+                // The question, and on the same line where on the screen it is
+                // asked about: an area, or nothing for the whole screen.
+                const area = this._regionEntry(condition);
+                for (const widget of [
+                    check,
+                    infoButton(_('How to word this, and what is actually sent'),
+                        promptHelp(this._llmKind(), this._settings.get_int('llm-decision-threshold')), 64),
+                    this._joiner(_('in')),
+                    area.entry,
+                    ...this._spotButtons({
+                        tooltip: _('Drag a rectangle over the screen to select the area'),
+                        run: () => this._pickRegionFor(condition),
+                    }, null),
+                    area.show,
+                    this._flashToggle(condition),
+                ]) {
+                    promptRow.add_suffix(widget);
+                }
                 indent(promptRow);
                 // Under the question, as it is typed: whether yes or no can
                 // answer it at all. A Check now answer takes the same line,
@@ -2366,28 +2390,6 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
                 advise();
                 indent(hint.row);
 
-                const region = condition.region;
-                const areaRow = new Adw.ActionRow({
-                    title: this._titleWith(_('Area'), region
-                        ? `${region.w}×${region.h} @ ${region.x},${region.y}`
-                        : _('whole screen')),
-                    title_lines: 1,
-                });
-                for (const button of this._spotButtons({
-                    tooltip: _('Drag a rectangle over the screen to select the area'),
-                    run: () => this._pickRegionFor(condition),
-                }, region ? () => this._showMarker(region.x, region.y, region.w, region.h) : null)) {
-                    areaRow.add_suffix(button);
-                }
-                if (region) {
-                    areaRow.add_suffix(iconButton('view-fullscreen-symbolic',
-                        _('Check the whole screen instead'), () => {
-                            condition.region = null;
-                            rebuild();
-                        }));
-                }
-                areaRow.add_suffix(this._flashToggle(condition));
-                indent(areaRow);
                 break;
             }
 
@@ -2956,6 +2958,51 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
         });
     }
 
+    /**
+     * Where a model check looks, as a field: x, y, width, height — or empty,
+     * for the whole screen, which is what clearing it means. With **Show**
+     * beside it, which has an area to flash only while there is one.
+     */
+    private _regionEntry(condition: LlmCondition): { entry: Gtk.Entry; show: Gtk.Widget } {
+        const region = condition.region;
+        const entry = new Gtk.Entry({
+            text: region ? `${region.x}, ${region.y}, ${region.w}, ${region.h}` : '',
+            placeholder_text: _('whole screen'),
+            tooltip_text: _('The area, as x, y, width, height. Empty: the whole screen'),
+            valign: Gtk.Align.CENTER,
+            xalign: 1,
+        });
+        fitToText(entry, _('whole screen'));
+        const read = (): Region | null | undefined => {
+            const text = (entry.get_text() ?? '').trim();
+            if (text === '') {
+                return null;
+            }
+            const numbers = parseNumbers(text, 4);
+            return numbers ? { x: numbers[0], y: numbers[1], w: numbers[2], h: numbers[3] } : undefined;
+        };
+        const [show] = this._spotButtons(null, () => {
+            const now = read();
+            if (now) {
+                this._showMarker(now.x, now.y, now.w, now.h);
+            }
+        });
+        const sync = () => show.set_visible(Boolean(read()));
+        entry.connect('changed', sync);
+        // Committed once typing pauses, and only what reads: half a rectangle
+        // is a field being typed, not the whole screen.
+        entry.connect('changed', debounce(() => {
+            const next = read();
+            setClass(entry, 'error', next === undefined);
+            if (next !== undefined) {
+                condition.region = next;
+                this._save();
+            }
+        }));
+        sync();
+        return { entry, show };
+    }
+
     /** Move a colour check onto an area, from the field or from the screen. */
     private _setColorArea(condition: ColorCondition, region: Region): void {
         condition.x = region.x;
@@ -3047,7 +3094,7 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
         // field of its own — the server decides what it is called.
         const threshold = spinRow(_('Yes from (%)'), this._settings.get_int('llm-decision-threshold'),
             50, 99, 5, value => this._settings.set_int('llm-decision-threshold', Math.round(value)));
-        threshold.set_subtitle(_('How sure the decision model must be before a check counts as yes'));
+        threshold.set_subtitle(_('Below this, a check counts as No. Higher: the macro acts only when the model is very sure'));
         const kindHint = (value: string) => value === 'decision'
             ? _('Answers with how likely yes is — fast, nothing generated')
             : _('Answers in words, with a short reason');

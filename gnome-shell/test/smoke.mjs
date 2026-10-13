@@ -539,6 +539,7 @@ clearProblems();
         'Is the button on the left green?', 'there is a green button with the label ready',
         'The player has over $900', 'the light is green or yellow', 'Does the dialog show an error?',
         'Is there a restart button', '“Is the timer red?”',
+        'There is a “Not ready” label', 'Is there a note on the board', 'Is the knot tied',
     ];
     for (const text of fine) {
         check(`fine as is: ${text}`, promptAdvice(text) === null, promptAdvice(text) ?? '');
@@ -552,6 +553,10 @@ clearProblems();
         ['Is the light green or red?', 'which of the two'],
         ['Is it ready? Is it green?', 'more than one'],
         ['   ', 'yes/no question'],
+        ['Is the button not green?', 'expect to see'],
+        ['The restart button is gone', 'expect to see'],
+        ["The dialog isn't open", 'expect to see'],
+        ['There is no longer a timer', 'expect to see'],
     ];
     for (const [text, says] of flagged) {
         const advice = promptAdvice(text) ?? '';

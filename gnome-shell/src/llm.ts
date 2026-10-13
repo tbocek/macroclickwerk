@@ -136,6 +136,9 @@ export function parseDecision(text: string, threshold: number): { match: boolean
 const ASKS_FOR_WORDS = /^(what|which|where|when|who|whom|whose|why|how)\b/;
 /** Openings that make it an instruction rather than a question. */
 const GIVES_ORDERS = /^(count|list|describe|find|tell|read|name|identify|give|show|extract|explain|locate|click|press|type|return|say|write|output|summari[sz]e)\b/;
+/** Wording that makes Yes mean something is missing rather than there. */
+const ASKS_ABOUT_ABSENCE = /\b(not|no longer|never|without|isn't|aren't|doesn't|don't|isn’t|aren’t|doesn’t|don’t|gone|missing|disappeared|absent)\b|n['’]t\b/;
+
 /** Openings of a yes/no question — the only kind where an "or" picks between two. */
 const ASKS_YES_NO = /^(is|are|am|was|were|does|do|did|has|have|had|can|could|will|would|should|shall|may|might|must)\b/;
 
@@ -146,9 +149,10 @@ const ASKS_YES_NO = /^(is|are|am|was|were|does|do|did|has|have|had|can|could|wil
  * between two gets a yes or a no that means nothing, and the macro goes down
  * a branch on it. Caught as it is typed rather than when the macro misbehaves.
  *
- * Only the mistakes that cannot be answered are named. A statement that is
- * true or false is as good as a question, and "green or yellow" in a
- * statement is still one fact.
+ * Named are the mistakes that cannot be answered, and one that can but reads
+ * backwards: a question about something being absent, which makes Yes mean
+ * "it is not there". A statement that is true or false is as good as a
+ * question, and "green or yellow" in a statement is still one fact.
  */
 export function promptAdvice(text: string): string | null {
     const wording = text.trim().replace(/^["'“‘(]+/, '').toLowerCase();
@@ -170,6 +174,15 @@ export function promptAdvice(text: string): string | null {
     if (ASKS_YES_NO.test(wording) && /\bor\b/.test(wording)) {
         return 'A yes would not say which of the two. Ask about one: ' +
             '“Is the light green?” rather than “Is the light green or red?”';
+    }
+    // Answerable, but backwards: Yes should mean the thing you wait for is
+    // there. A "not", or something gone, makes Yes mean an absence — easy to
+    // misread, for the model and for whoever reads the macro later.
+    // Quoted words are text on the screen, not the question's own: a label
+    // that says “Not ready” is something to look for.
+    if (ASKS_ABOUT_ABSENCE.test(wording.replace(/"[^"]*"|“[^”]*”/g, ''))) {
+        return 'Ask what you expect to see, so that Yes means it is there: “Is the button green?” rather than ' +
+            '“Is the button not green?”. Put what should happen otherwise in the If’s No branch.';
     }
     return null;
 }
