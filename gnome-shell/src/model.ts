@@ -397,8 +397,7 @@ export function childLists(step: Step): { key: string; steps: Step[] }[] {
             step.else ??= [];
             // No before Yes, which is the order the editor draws them in and so
             // the order everything that talks about "the first branch" means:
-            // where a step lands when it moves down into an `if`, and which
-            // branch an empty one takes a new step into.
+            // which branch an empty `if` takes a new step into.
             return [
                 { key: 'else', steps: step.else },
                 { key: 'then', steps: step.then },
@@ -617,89 +616,6 @@ export function moveStepTo(root: Step[], id: string, into: Step[], at: number): 
     }
     loc.list.splice(loc.index, 1);
     into.splice(Math.max(0, Math.min(at, into.length)), 0, loc.step);
-    return true;
-}
-
-/** Move a step within its own list only, so reordering never changes nesting. */
-export function moveStep(list: Step[], id: string, delta: number): boolean {
-    const loc = findStep(list, id);
-    if (!loc) {
-        return false;
-    }
-    const target = loc.index + delta;
-    if (target < 0 || target >= loc.list.length) {
-        return false;
-    }
-    const [step] = loc.list.splice(loc.index, 1);
-    loc.list.splice(target, 0, step);
-    return true;
-}
-
-/** The container a step sits inside, and where that container itself sits. */
-export function parentOf(root: Step[], id: string, depth = 0): StepLocation | null {
-    for (const [index, step] of root.entries()) {
-        const lists = childLists(step);
-        if (lists.some(child => child.steps.some(s => s.id === id))) {
-            return { list: root, index, step, depth };
-        }
-        for (const child of lists) {
-            const inner = parentOf(child.steps, id, depth + 1);
-            if (inner) {
-                return inner;
-            }
-        }
-    }
-    return null;
-}
-
-/**
- * Move a step one place up or down, treating an open container as somewhere you
- * can move into. Which is the whole point: a folded loop is one card on screen,
- * so a step should pass it in a single press, while an open one is a place with
- * an inside, and the press that walks up to its edge should walk in.
- *
- * `isOpen` answers that for one branch of one container, and comes from the
- * editor, because the answer is which cards are folded on screen right now.
- * Reaching the end of a body and pressing again climbs back out, past the
- * container — otherwise a step that moved in could never leave.
- */
-export function moveStepNested(
-    root: Step[],
-    id: string,
-    delta: 1 | -1,
-    isOpen: (stepId: string, listKey: string) => boolean,
-): boolean {
-    const loc = findStep(root, id);
-    if (!loc) {
-        return false;
-    }
-
-    const neighbour = loc.index + delta;
-    if (neighbour >= 0 && neighbour < loc.list.length) {
-        const sibling = loc.list[neighbour];
-        const open = childLists(sibling).filter(list => isOpen(sibling.id, list.key));
-        const [step] = loc.list.splice(loc.index, 1);
-        if (open.length > 0) {
-            // Enter by the near side: coming down, land on top of the first open
-            // branch; coming up, land at the bottom of the last one.
-            const target = delta === 1 ? open[0] : open[open.length - 1];
-            if (delta === 1) {
-                target.steps.unshift(step);
-            } else {
-                target.steps.push(step);
-            }
-        } else {
-            loc.list.splice(neighbour, 0, step);
-        }
-        return true;
-    }
-
-    const parent = parentOf(root, id);
-    if (!parent) {
-        return false;   // already at the top or bottom of the macro
-    }
-    const [step] = loc.list.splice(loc.index, 1);
-    parent.list.splice(parent.index + (delta === 1 ? 1 : 0), 0, step);
     return true;
 }
 
@@ -1317,29 +1233,3 @@ export const AUTHORABLE_STEP_KINDS: StepKind[] = [
     'loop', 'if', 'break', 'continue', 'start', 'stop',
 ];
 
-export const STEP_KIND_LABELS: Record<StepKind, string> = {
-    click: 'Click',
-    move: 'Move pointer',
-    remember: 'Remember position',
-    scroll: 'Scroll',
-    key: 'Key press',
-    text: 'Type text',
-    wait: 'Wait',
-    onevent: 'On event',
-    loop: 'Loop',
-    if: 'If / else',
-    break: 'Break',
-    continue: 'Continue',
-    start: 'Start a macro',
-    stop: 'Stop a macro',
-};
-
-export const CONDITION_TYPE_LABELS: Record<ConditionType, string> = {
-    always: 'Always true',
-    never: 'Never true',
-    llm: 'Ask the LLM about a screenshot',
-    color: 'Screen colour',
-    and: 'All of…',
-    or: 'Any of…',
-    not: 'Not…',
-};

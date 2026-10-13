@@ -687,6 +687,55 @@ check('pathToStep of a missing step is empty', pathToStep(flat.body, 'gone').len
           JSON.stringify(listProblems().slice(0, 3).map(p => p.message)));
 }
 
+// --- a stopped run lets go of what it holds ----------------------------------
+
+// Stopping one macro while another runs cannot use the daemon's own stop —
+// that lets go of every key on the machine — so the run must release its own.
+{
+    const played = [];
+    const quiet = { play: async events => { played.push(...events); return { aborted: false }; }, stop: async () => {} };
+    const holder = newMacro('holder');
+    const press = newStep('key');
+    press.code = 'KEY_LEFTSHIFT';
+    press.action = 'down';
+    const hold = newStep('wait');
+    hold.ms = 5000;
+    holder.body.push(press, hold);
+    const runner = new MacroRunner(quiet, evaluator, {}, {}, {});
+    const done = runner.run(holder);
+    await new Promise(resolve => GLib.timeout_add(GLib.PRIORITY_DEFAULT, 50, () => { resolve(); return GLib.SOURCE_REMOVE; }));
+    runner.stop(false);
+    await done;
+    const shift = 42;
+    const down = played.filter(e => e.code === shift && e.value === 1).length;
+    const up = played.filter(e => e.code === shift && e.value === 0).length;
+    check('a run stopped mid-hold lets go of the key it pressed', down === 1 && up === 1, JSON.stringify(played));
+}
+
+// --- holding over the menu still knows where it is ---------------------------
+
+// With the pointer over the panel menu a run holds in front of its next step,
+// and pausing from the panel always happens there. The place to continue from
+// is that next step, not nothing. The hold begins once the first step has
+// played, which puts it exactly between the two.
+{
+    let played = false;
+    const playing = { play: async () => { played = true; return { aborted: false }; }, stop: async () => {} };
+    const first = newStep('key');
+    const second = newStep('wait');
+    const m = newMacro('held');
+    m.body.push(first, second);
+    const runner = new MacroRunner(playing, evaluator, {}, {}, { shouldPause: () => played });
+    const sleep = ms => new Promise(resolve => GLib.timeout_add(GLib.PRIORITY_DEFAULT, ms, () => { resolve(); return GLib.SOURCE_REMOVE; }));
+    const done = runner.run(m);
+    await sleep(150);
+    check('holding between steps names the next one', runner.currentStepId === second.id,
+          runner.currentStepId === first.id ? 'the first' : runner.currentStepId);
+    runner.stop();
+    await done;
+    check('and a stopped run names nothing', runner.currentStepId === '', runner.currentStepId);
+}
+
 print(failures === 0 ? '\nALL PASSED' : `\n${failures} FAILURES`);
 if (failures > 0) {
     imports.system.exit(1);

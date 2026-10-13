@@ -318,7 +318,7 @@ export function numberEntry(
  * things from the same strings — the button must not grow the window, the list
  * must stay readable — so each gets its own.
  */
-function labelFactory(forButton: boolean, maxChars: number, ellipsize = forButton): Gtk.SignalListItemFactory {
+function labelFactory(forButton: boolean, maxChars: number, ellipsize: boolean): Gtk.SignalListItemFactory {
     const factory = new Gtk.SignalListItemFactory();
     factory.connect('setup', (_f, item: Gtk.ListItem) => {
         item.set_child(new Gtk.Label({
@@ -361,7 +361,7 @@ export function chooser<T extends string>(
         tooltip_text: tooltip,
         valign: Gtk.Align.CENTER,
         factory: labelFactory(true, maxChars, !fits),
-        list_factory: labelFactory(false, maxChars),
+        list_factory: labelFactory(false, maxChars, false),
     });
     onPicked(dropdown, options, selected, onChange);
     return dropdown;
@@ -507,6 +507,19 @@ export function* descendants(widget: Gtk.Widget | null): Generator<Gtk.Widget> {
         yield child;
         yield* descendants(child);
     }
+}
+
+/** The first widget under this one that `test` accepts, depth first. */
+export function firstDescendant<T extends Gtk.Widget = Gtk.Widget>(
+    widget: Gtk.Widget | null,
+    test: ((child: Gtk.Widget) => child is T) | ((child: Gtk.Widget) => boolean),
+): T | null {
+    for (const child of descendants(widget)) {
+        if (test(child)) {
+            return child as T;
+        }
+    }
+    return null;
 }
 
 /**

@@ -48,6 +48,7 @@ import { comboCodes, isArmed, parseTriggers, type Trigger } from './src/triggers
 import { keyName } from './src/keymap.js';
 import {
     chooser, clearClasses, colorSwatch, comboRow, commitNumbers, debounce, descendants,
+    firstDescendant,
     entryRow, fitToText, iconButton, infoButton, numberEntry, passwordRow, setClass,
     spinRow, suffixEntry, toggleButton, withColorSwatches,
 } from './src/widgets.js';
@@ -125,9 +126,6 @@ function scaleLabels(): Record<string, string> {
 function scaleWidthFor(width: number): typeof SCALE_WIDTHS[number] {
     return SCALE_WIDTHS.find(option => Number(option) >= width) ?? SCALE_WIDTHS[SCALE_WIDTHS.length - 1];
 }
-
-/** The nested step lists a container step owns, as the editor draws them. */
-type BranchKind = 'body' | 'then' | 'else';
 
 /**
  * A step reads as a line of a program, so it gets the same icon everywhere and
@@ -259,26 +257,26 @@ function evdevKeyName(name: string): string {
 }
 
 /**
- * Only `then` and `else` get a header row of their own — a loop has one body
- * and shows it in the loop's own row.
+ * The header an `if` gives each of its branches. A loop has one body and shows
+ * it on its own row, so only these two have one. Built on demand, for the
+ * gettext reason `scaleLabels` gives — and with the strings written out, so
+ * they can be found for translating.
  */
-const BRANCH_STYLE: Record<BranchKind, { icon: string; title: string; hint: string }> = {
-    body: {
-        icon: 'media-playlist-repeat-symbolic',
-        title: 'Body',
-        hint: 'Runs on every iteration',
-    },
-    then: {
-        icon: 'object-select-symbolic',
-        title: 'Yes',
-        hint: 'Runs when the check holds',
-    },
-    else: {
-        icon: 'window-close-symbolic',
-        title: 'No',
-        hint: 'Runs when it does not',
-    },
-};
+const branchStyles = (): Record<'then' | 'else', { icon: string; title: string; hint: string }> => ({
+    then: { icon: 'object-select-symbolic', title: _('Yes'), hint: _('Runs when the check holds') },
+    else: { icon: 'window-close-symbolic', title: _('No'), hint: _('Runs when it does not') },
+});
+
+/**
+ * How wide the macro editor may get. `AdwPreferencesPage` wraps its groups in a
+ * clamp of 600, which is the right measure for a settings row — a label on the
+ * left, a value on the right, and nothing that suffers from a short line. A
+ * step row is not that: it carries a title, dropdowns, fields and buttons on
+ * one line, and at 600 a deeply nested one has no room left for its title.
+ * The clamp is not a property of the page, so the only way to say otherwise
+ * is to reach in for it — see `_widen`.
+ */
+const EDITOR_MAX_WIDTH = 900;
 
 /**
  * Nesting is the thing you have to be able to read at a glance, and stacked
@@ -295,17 +293,6 @@ const BRANCH_STYLE: Record<BranchKind, { icon: string; title: string; hint: stri
  * painted inside the box it already had, so nothing moves. It also means the
  * state rails simply overwrite the branch rail instead of stacking beside it.
  */
-/**
- * How wide the macro editor may get. `AdwPreferencesPage` wraps its groups in a
- * clamp of 600, which is the right measure for a settings row — a label on the
- * left, a value on the right, and nothing that suffers from a short line. A
- * step row is not that: it carries a title, a chooser, a spin and five buttons
- * on one line, and at 600 the title wraps to two lines while the chooser
- * truncates to “Right cl…”. The clamp is not a property of the page, so the
- * only way to say otherwise is to reach in for it — see `_widen`.
- */
-const EDITOR_MAX_WIDTH = 900;
-
 const EDITOR_CSS = `
 .macroclickwerk-branch {
     box-shadow: inset 4px 0 0 alpha(@accent_bg_color, 0.85);
@@ -381,13 +368,6 @@ const EDITOR_CSS = `
 .macroclickwerk-editor row.macroclickwerk-add > box.header { min-height: 28px; }
 .macroclickwerk-add menubutton > button { min-height: 20px; padding: 1px 8px; }
 .macroclickwerk-add menubutton:not(.destructive-action) > button { opacity: 0.75; }
-
-/* What a step aims at instead of numbers: "pointer", "previous". */
-.macroclickwerk-mode { opacity: 0.6; }
-
-/* Holds a slot open, so the buttons after it keep their column on rows that
-   have nothing to put there. */
-.macroclickwerk-slot { opacity: 0; }
 
 /* The macro's name is the heading of its card. */
 .macroclickwerk-macro-name text { font-weight: bold; }
@@ -486,15 +466,22 @@ function promptHelp(): string {
     ].join('\n');
 }
 
+/** One entry of a menu: what it says, and what it does when picked. */
+interface Choice {
+    label: string;
+    tooltip?: string;
+    run: () => void;
+}
+
 /** What highlighting a running step needs to get at, per step id. */
 interface StepRow {
-    /** An expander when the step has settings of its own, a plain row when not. */
+    /** An expander when the step folds or holds a block, a plain row when not. */
     row: Adw.ActionRow | Adw.ExpanderRow;
     icon: Gtk.Image;
     kindIcon: string;
-    /** Loops and ifs get a rail rather than a fill: a fill would flood the body. */
+    /** Rows that hold others get a rail rather than a fill: a fill would flood them. */
     container: boolean;
-    /** The Body/Then/Else headers that follow this row, lit up along with it. */
+    /** An if's Yes and No headers, which follow its row and light up with it. */
     branchRows: Adw.ExpanderRow[];
 }
 
@@ -576,19 +563,34 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
         row.set_text(values.join(', '));
         const current = commitNumbers(row, values.length, values, onChange);
 
-        if (pick) {
-            row.add_suffix(iconButton('find-location-symbolic', pick.tooltip, pick.run));
+        for (const button of this._spotButtons(pick ?? null, onShow
+            ? () => onShow(parseNumbers(row.get_text() ?? '', values.length) ?? current())
+            : null)) {
+            row.add_suffix(button);
         }
-
-        if (onShow) {
-            row.add_suffix(iconButton('view-reveal-symbolic',
-                _('Flash this position on the screen for a couple of seconds'), () => {
-                    const parsed = parseNumbers(row.get_text() ?? '', values.length) ?? current();
-                    onShow(parsed);
-                }));
-        }
-
         return row;
+    }
+
+    /**
+     * **Pick** and **Show**, the pair every place on the screen gets, in that
+     * order — first put something in the field, then look at it. Pick fills
+     * the place in from the screen, and what that takes differs per caller;
+     * Show flashes it, which is the only thing that makes raw numbers
+     * meaningful. Either may be left out.
+     */
+    private _spotButtons(
+        pick: { tooltip: string; run: () => void } | null,
+        show: (() => void) | null,
+    ): Gtk.Widget[] {
+        const buttons: Gtk.Widget[] = [];
+        if (pick) {
+            buttons.push(iconButton('find-location-symbolic', pick.tooltip, pick.run));
+        }
+        if (show) {
+            buttons.push(iconButton('view-reveal-symbolic',
+                _('Flash this on the screen for a couple of seconds'), show));
+        }
+        return buttons;
     }
 
 
@@ -651,26 +653,22 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
                 step.y = y;
                 this._save();
             });
-            const point = (): [number, number] => {
-                const parsed = parseNumbers(entry.get_text() ?? '', 2);
-                return [parsed?.[0] ?? 0, parsed?.[1] ?? 0];
-            };
-            widgets.push(entry,
-                iconButton('find-location-symbolic',
-                    _('Click the spot on the screen: that position lands here'),
-                    () => this._pickPointInto(({ x, y }) => entry.set_text(`${x}, ${y}`))),
-                iconButton('view-reveal-symbolic',
-                    _('Flash this position on the screen for a couple of seconds'),
-                    () => this._showMarker(...point())));
+            widgets.push(entry, ...this._spotButtons({
+                tooltip: _('Click the spot on the screen: that position lands here'),
+                run: () => this._pickPointInto(({ x, y }) => entry.set_text(`${x}, ${y}`)),
+            }, () => {
+                const [x, y] = parseNumbers(entry.get_text() ?? '', 2) ?? [0, 0];
+                this._showMarker(x, y);
+            }));
         }
         return widgets;
     }
 
     /**
-     * `defaultExpanded` opens a row the first time it is seen — bodies use it, so
-     * opening a loop shows what is inside it rather than another closed row.
-     * Collapsing is remembered separately, or the default would undo it on the
-     * next rebuild.
+     * `defaultExpanded` opens a row the first time it is seen — a repeat with
+     * steps in it, and every if — so the page opens onto steps rather than
+     * closed rows. Collapsing is remembered separately, or the default would
+     * undo it on the next rebuild.
      */
     private _expander(
         key: string,
@@ -718,7 +716,7 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
         if (this._closed) {
             return;
         }
-        // Keys all embed a step id (`step:<id>`, `step:<id>:body`, …). Keys of
+        // Keys are `step:<id>`, for the repeats and ifs that fold. Keys of
         // deleted steps are dropped here, or every step ever removed would
         // leave its state behind forever.
         const ids = new Set<string>();
@@ -856,13 +854,9 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
     // --- macros page -------------------------------------------------------
 
     /** The scrolled window the macros page puts its own content in. */
-    private _scroller(widget: Gtk.Widget | null = this._macrosPage): Gtk.ScrolledWindow | null {
-        for (const child of descendants(widget)) {
-            if (child instanceof Gtk.ScrolledWindow) {
-                return child;
-            }
-        }
-        return null;
+    private _scroller(): Gtk.ScrolledWindow | null {
+        return firstDescendant(this._macrosPage,
+            (child): child is Gtk.ScrolledWindow => child instanceof Gtk.ScrolledWindow);
     }
 
     /**
@@ -1213,8 +1207,8 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
      *
      * On the default bubble phase, which is the whole difference from the last
      * time rows took a click. A press that a button, a dropdown or an entry on
-     * the row has already claimed never reaches here, so nudging a spin button
-     * no longer drags the mark along with it — that roaming was why the click
+     * the row has already claimed never reaches here, so stepping a number
+     * field no longer drags the mark along with it — that roaming was why the click
      * was taken away in the first place.
      */
     private _selectable(row: Gtk.Widget, target: string, macroId: string): void {
@@ -1523,12 +1517,15 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
             : `${escaped}  <span alpha="55%">${GLib.markup_escape_text(note, -1)}</span>`;
     }
 
-    /** "3 steps", "empty" — the same phrasing wherever a body is counted. */
-    private _countLabel(count: number): string {
+    /**
+     * "3 steps", "empty" — the same phrasing wherever something is counted.
+     * `words` is the singular and the plural, steps unless said otherwise.
+     */
+    private _countLabel(count: number, words = [_('step'), _('steps')]): string {
         if (count === 0) {
             return _('empty');
         }
-        return `${count} ${count === 1 ? _('step') : _('steps')}`;
+        return `${count} ${count === 1 ? words[0] : words[1]}`;
     }
 
     /**
@@ -1597,24 +1594,7 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
 
     /** A dimmed word between controls: "±" between a wait and its jitter. */
     private _joiner(text: string): Gtk.Label {
-        return new Gtk.Label({
-            label: text,
-            valign: Gtk.Align.CENTER,
-            css_classes: ['macroclickwerk-mode'],
-        });
-    }
-
-    /**
-     * Hold a slot open with an invisible copy of what would be there, so the
-     * buttons before it stay in their column: the chevron, on a step that does
-     * not fold.
-     */
-    private _slot<T extends Gtk.Widget>(widget: T): T {
-        widget.add_css_class('macroclickwerk-slot');
-        widget.set_can_target(false);
-        widget.set_can_focus(false);
-        widget.set_tooltip_text(null);
-        return widget;
+        return new Gtk.Label({ label: text, valign: Gtk.Align.CENTER, css_classes: ['dim-label'] });
     }
 
     /**
@@ -1629,12 +1609,7 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
     private _fixOpen(row: Adw.ExpanderRow): void {
         row.set_expanded(true);
         this._headerOf(row)?.set_activatable(false);
-        for (const child of descendants(row)) {
-            if (child instanceof Gtk.Image && child.has_css_class('expander-row-arrow')) {
-                child.set_opacity(0);
-                break;
-            }
-        }
+        firstDescendant(row, child => child.has_css_class('expander-row-arrow'))?.set_opacity(0);
     }
 
     /**
@@ -1643,12 +1618,8 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
      * holds come after it.
      */
     private _headerOf(row: Adw.ExpanderRow): Adw.ActionRow | null {
-        for (const child of descendants(row)) {
-            if (child instanceof Adw.ActionRow && child.has_css_class('header')) {
-                return child;
-            }
-        }
-        return null;
+        return firstDescendant(row, (child): child is Adw.ActionRow =>
+            child instanceof Adw.ActionRow && child.has_css_class('header'));
     }
 
     /**
@@ -1704,9 +1675,9 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
         macro: Macro,
         step: Step,
         under: Map<string, OnEventStep>,
-        indent = 0,
+        indent: number,
         /** For a When, the steps drawn inside it — see `_buildStepList`. */
-        block: Step[] = [],
+        block: Step[],
     ): Gtk.Widget[] {
         const stepKey = `step:${step.id}`;
         const children = childLists(step);
@@ -1717,14 +1688,15 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
         const inline = step.kind === 'loop';
         const props = { title: this._rowTitle(step), title_lines: 1 };
         // A When with steps after it holds them, in an expander that is always
-        // open: it is a block, not a fold.
+        // open: it is a block, not a fold. Everything else is a plain row.
         const holds = block.length > 0;
-        const row: Adw.ActionRow | Adw.ExpanderRow = step.kind === 'loop' || step.kind === 'if'
+        const expander = step.kind === 'loop' || step.kind === 'if'
             ? this._expander(stepKey, props, inline ? children[0].steps.length > 0 : true)
-            : holds ? new Adw.ExpanderRow(props) : new Adw.ActionRow(props);
-        if (holds) {
-            this._fixOpen(row as Adw.ExpanderRow);
-            row.add_css_class('macroclickwerk-event');
+            : holds ? new Adw.ExpanderRow(props) : null;
+        const row: Adw.ActionRow | Adw.ExpanderRow = expander ?? new Adw.ActionRow(props);
+        if (holds && expander) {
+            this._fixOpen(expander);
+            expander.add_css_class('macroclickwerk-event');
         }
         const widgets: Gtk.Widget[] = [row];
         const branchRows: Adw.ExpanderRow[] = [];
@@ -1768,7 +1740,7 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
                     ? { list: loc.list, at: loc.index + (where === 'after' ? 1 : 0) }
                     : null;
             },
-            inline && row instanceof Adw.ExpanderRow ? row : undefined);
+            inline ? expander ?? undefined : undefined);
         this._stepRows.set(step.id, {
             row,
             icon,
@@ -1789,14 +1761,16 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
             removeStep(macro.body, step.id);
             this._saveAndRebuild();
         }));
-        if (!(row instanceof Adw.ExpanderRow)) {
+        if (!expander) {
             // Where a folding row has its chevron: the header's own spacing
             // and the arrow's margin, less this box's.
-            suffixes.append(this._slot(new Gtk.Image({
+            suffixes.append(new Gtk.Image({
                 icon_name: 'pan-down-symbolic',
                 valign: Gtk.Align.CENTER,
                 margin_start: 7,
-            })));
+                opacity: 0,
+                can_target: false,
+            }));
         }
 
         this._selectable(row, `after:${step.id}`, macro.id);
@@ -1812,16 +1786,16 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
 
         if (holds) {
             for (const widget of this._buildStepList(macro, block, under, INDENT_PX)) {
-                (row as Adw.ExpanderRow).add_row(widget);
+                expander?.add_row(widget);
             }
         }
 
-        if (step.kind === 'if' && row instanceof Adw.ExpanderRow) {
+        if (step.kind === 'if') {
             for (const child of this._buildConditionSection(_('Condition'), step.cond, next => {
                 step.cond = next;
                 this._saveAndRebuild();
             }, 0)) {
-                row.add_row(child);
+                expander?.add_row(child);
             }
         }
 
@@ -1830,16 +1804,15 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
         // body is the step's own row (see `inline`); everything below is written
         // against whichever row is holding the steps.
         for (const list of children) {
-            const kind: BranchKind =
-                list.key === 'then' || list.key === 'else' ? list.key : 'body';
-            const style = BRANCH_STYLE[kind];
+            const branch = list.key === 'then' || list.key === 'else' ? list.key : null;
             let nested: Adw.ExpanderRow;
-            if (inline) {
-                nested = row as Adw.ExpanderRow;
+            if (inline && expander) {
+                nested = expander;
             } else {
+                const style = branchStyles()[branch ?? 'then'];
                 nested = new Adw.ExpanderRow({
-                    title: this._titleWith(_(style.title), this._countLabel(list.steps.length)),
-                    tooltip_text: _(style.hint),
+                    title: this._titleWith(style.title, this._countLabel(list.steps.length)),
+                    tooltip_text: style.hint,
                 });
                 this._fixOpen(nested);
                 nested.set_margin_start(indent + INDENT_PX);
@@ -1859,7 +1832,9 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
                     () => ({ list: list.steps, at: 0 }));
             }
             nested.add_css_class('macroclickwerk-branch');
-            nested.add_css_class(`macroclickwerk-branch-${kind}`);
+            if (branch) {
+                nested.add_css_class(`macroclickwerk-branch-${branch}`);
+            }
 
             const addNested = this._addStepRow(list.steps, macro.id, step.id, list.key);
             addNested.set_margin_start(INDENT_PX);   // lines up with the steps below it
@@ -1882,13 +1857,13 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
         // An if's blocks sit beside its row, not inside it (that is how the
         // rails line up), so its chevron would fold only the condition editor
         // and leave both blocks standing. Have them follow it by hand.
-        if (branchRows.length > 0 && row instanceof Adw.ExpanderRow) {
+        if (branchRows.length > 0 && expander) {
             const follow = () => {
                 for (const branch of branchRows) {
-                    branch.set_visible(row.get_expanded());
+                    branch.set_visible(expander.get_expanded());
                 }
             };
-            row.connect('notify::expanded', follow);
+            expander.connect('notify::expanded', follow);
             follow();
         }
 
@@ -1897,9 +1872,10 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
 
     /**
      * What a step does, as controls for its own line, in the order the line
-     * reads: what is acted on, how, for how long, and where. A control that
-     * comes and goes with a mode sits left of the toggle that sets the mode,
-     * so the toggle stays put under the pointer that pressed it.
+     * reads: what is acted on, how, for how long, and where. Controls that
+     * only some choices need come after the dropdown that makes the choice.
+     * The one toggle that hides a field — a repeat's ∞ — sits right of it, so
+     * the toggle stays put under the pointer that pressed it.
      */
     private _stepControls(macro: Macro, step: Step, follows: OnEventStep | null): Gtk.Widget[] {
         const save = () => this._save();
@@ -2188,7 +2164,7 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
         const group = condition.type === 'and' || condition.type === 'or' ? condition.of : null;
         const row = new Adw.ActionRow({
             title: this._titleWith(title, group
-                ? `${group.length} ${group.length === 1 ? _('condition') : _('conditions')}`
+                ? this._countLabel(group.length, [_('condition'), _('conditions')])
                 : undefined),
         });
         row.set_margin_start(depth * INDENT_PX);
@@ -2249,13 +2225,13 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
                         : _('whole screen')),
                     title_lines: 1,
                 });
-                areaRow.add_suffix(iconButton('find-location-symbolic',
-                    _('Drag a rectangle over the screen to select the area'),
-                    () => this._pickRegionFor(condition)));
+                for (const button of this._spotButtons({
+                    tooltip: _('Drag a rectangle over the screen to select the area'),
+                    run: () => this._pickRegionFor(condition),
+                }, region ? () => this._showMarker(region.x, region.y, region.w, region.h) : null)) {
+                    areaRow.add_suffix(button);
+                }
                 if (region) {
-                    areaRow.add_suffix(iconButton('view-reveal-symbolic',
-                        _('Flash this area on the screen for a couple of seconds'),
-                        () => this._showMarker(region.x, region.y, region.w, region.h)));
                     areaRow.add_suffix(iconButton('view-fullscreen-symbolic',
                         _('Check the whole screen instead'), () => {
                             condition.region = null;
@@ -2380,26 +2356,10 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
      */
     private _menuButton(
         label: string,
-        choices: { label: string; run: () => void }[],
+        choices: Choice[],
         icon?: string,
     ): Gtk.MenuButton {
-        const box = new Gtk.Box({
-            orientation: Gtk.Orientation.VERTICAL,
-            spacing: 0,
-            margin_top: 6,
-            margin_bottom: 6,
-            margin_start: 6,
-            margin_end: 6,
-        });
-        const popover = new Gtk.Popover({ child: box });
-        for (const choice of choices) {
-            const button = new Gtk.Button({ label: choice.label, css_classes: ['flat'] });
-            button.connect('clicked', () => {
-                popover.popdown();
-                choice.run();
-            });
-            box.append(button);
-        }
+        const popover = this._choicePopover(choices);
         if (!icon) {
             return new Gtk.MenuButton({ label, popover, valign: Gtk.Align.CENTER });
         }
@@ -2413,6 +2373,36 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
             valign: Gtk.Align.CENTER,
             css_classes: ['flat'],
         });
+    }
+
+    /**
+     * A popover listing things to do, each a flat button. The popover goes down
+     * before the choice runs: a choice may open a file dialog, minimise the
+     * window or rebuild the page, and a popover left up over any of those comes
+     * back with the window, or hangs over the dialog.
+     */
+    private _choicePopover(choices: Choice[]): Gtk.Popover {
+        const box = new Gtk.Box({
+            orientation: Gtk.Orientation.VERTICAL,
+            margin_top: 6,
+            margin_bottom: 6,
+            margin_start: 6,
+            margin_end: 6,
+        });
+        const popover = new Gtk.Popover({ child: box });
+        for (const choice of choices) {
+            const button = new Gtk.Button({ label: choice.label, css_classes: ['flat'] });
+            // Set apart: GJS refuses `undefined` for a property in a constructor.
+            if (choice.tooltip) {
+                button.set_tooltip_text(choice.tooltip);
+            }
+            button.connect('clicked', () => {
+                popover.popdown();
+                choice.run();
+            });
+            box.append(button);
+        }
+        return popover;
     }
 
     /**
@@ -2687,41 +2677,20 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
      * for the kinds that are one action each.
      */
     private _stepMenu(macro: Macro, step: Step, row: Gtk.Widget, x: number, y: number): void {
-        const box = new Gtk.Box({
-            orientation: Gtk.Orientation.VERTICAL,
-            margin_top: 6,
-            margin_bottom: 6,
-            margin_start: 6,
-            margin_end: 6,
-        });
-        const popover = new Gtk.Popover({ child: box, position: Gtk.PositionType.BOTTOM });
-
-        const run = new Gtk.Button({
+        const choices: Choice[] = [{
             label: _('Run from here'),
-            tooltip_text: _('Start the macro at this step and carry on from it'),
-            css_classes: ['flat'],
-        });
-        run.connect('clicked', () => {
-            // Down before the window goes, or the popover is left behind over
-            // a minimised window and comes back with it.
-            popover.popdown();
-            this._runFrom(macro, step);
-        });
-        box.append(run);
-
+            tooltip: _('Start the macro at this step and carry on from it'),
+            run: () => this._runFrom(macro, step),
+        }];
         if (RUNNABLE_ALONE.includes(step.kind)) {
-            const once = new Gtk.Button({
+            choices.push({
                 label: _('Run this step only'),
-                tooltip_text: _('Do this one step now, on the real screen'),
-                css_classes: ['flat'],
+                tooltip: _('Do this one step now, on the real screen'),
+                run: () => this._runStepNow(macro.id, step),
             });
-            once.connect('clicked', () => {
-                popover.popdown();
-                this._runStepNow(macro.id, step);
-            });
-            box.append(once);
         }
-
+        const popover = this._choicePopover(choices);
+        popover.set_position(Gtk.PositionType.BOTTOM);
         popover.set_parent(row);
         popover.set_pointing_to(new Gdk.Rectangle({
             x: Math.round(x), y: Math.round(y), width: 1, height: 1,
@@ -2776,7 +2745,7 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
                 // Stepping through a macro: the insertion point moves past what
                 // just ran, so anything recorded next goes on from there rather
                 // than back where the selection happened to be.
-                this._settings.set_string('record-into', `after:${step.id}`);
+                this._selectTarget(macroId, `after:${step.id}`);
             },
         });
     }

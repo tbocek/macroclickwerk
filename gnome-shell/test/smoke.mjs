@@ -1,12 +1,12 @@
 import {
     parseDocument, stringifyDocument, newStep, describeStep, describeCondition,
-    insertStep, moveStep, moveStepNested, parentOf, removeStep, cloneStep, walk, findStep, newMacro,
+    insertStep, removeStep, cloneStep, walk, findStep, newMacro,
     newCondition,
     resolveRecordTarget,
     resolveRunStart,
     macroEnabled,
     changedDefinitions,
-    STEP_KIND_LABELS, parseNumbers, reachesEnd, lastPointerEndpoint,
+    parseNumbers, reachesEnd, lastPointerEndpoint,
     AUTHORABLE_STEP_KINDS, EVENT_EDGES, followsEvent,
 } from '../dist/src/model.js';
 import { textToEvents, keyCode, keyName, charToKey, buttonFromCode } from '../dist/src/keymap.js';
@@ -24,7 +24,7 @@ const check = (name, cond, extra = '') => {
 };
 
 // every step kind builds and describes
-const kinds = Object.keys(STEP_KIND_LABELS);
+const kinds = AUTHORABLE_STEP_KINDS;
 for (const kind of kinds) {
     const step = newStep(kind);
     const text = describeStep(step);
@@ -41,73 +41,12 @@ const inner = newStep('key');
 insertStep(macro.body, inner, loop.id);
 check('insert into empty container', loop.body.length === 1 && loop.body[0].id === inner.id);
 check('findStep nested', findStep(macro.body, inner.id)?.step.id === inner.id);
-check('move down', moveStep(macro.body, a.id, 1) && macro.body[1].id === a.id);
-check('move past end returns false', moveStep(macro.body, loop.id, 1) === false);
 const clone = cloneStep(loop);
 check('clone gets fresh ids', clone.id !== loop.id && clone.body[0].id !== inner.id);
 check('remove', removeStep(macro.body, b.id)?.id === b.id);
 let counted = 0;
 walk(macro.body, () => counted++);
 check('walk visits nested', counted >= 3, String(counted));
-
-// moving with the folded/open cards of the editor in mind
-const closed = () => false;
-const open = () => true;
-{
-    const m = newMacro('m');
-    const one = newStep('click'), lp = newStep('loop'), two = newStep('wait');
-    const held = newStep('key');
-    lp.body.push(held);
-    m.body.push(one, lp, two);
-
-    check('folded loop is stepped over',
-          moveStepNested(m.body, one.id, 1, closed) &&
-          m.body.map(s => s.id).join() === [lp.id, one.id, two.id].join());
-    // put it back before the loop
-    moveStepNested(m.body, one.id, -1, closed);
-
-    check('open loop is stepped into',
-          moveStepNested(m.body, one.id, 1, open) &&
-          lp.body.map(s => s.id).join() === [one.id, held.id].join() &&
-          m.body.map(s => s.id).join() === [lp.id, two.id].join());
-    check('and the body knows who its parent is',
-          parentOf(m.body, one.id)?.step.id === lp.id);
-    check('the top of a body climbs back out above the loop',
-          moveStepNested(m.body, one.id, -1, open) &&
-          m.body.map(s => s.id).join() === [one.id, lp.id, two.id].join());
-
-    check('coming up from below lands at the bottom of the body',
-          moveStepNested(m.body, two.id, -1, open) &&
-          lp.body.map(s => s.id).join() === [held.id, two.id].join());
-    check('and the bottom of a body climbs out below the loop',
-          moveStepNested(m.body, two.id, 1, open) &&
-          m.body.map(s => s.id).join() === [one.id, lp.id, two.id].join());
-    check('the very first step has nowhere to go up',
-          moveStepNested(m.body, one.id, -1, open) === false);
-    check('the very last step has nowhere to go down',
-          moveStepNested(m.body, two.id, 1, open) === false);
-}
-{
-    // An if offers two bodies: enter by whichever side you arrive from, and only
-    // if that side is open.
-    const m = newMacro('m');
-    const before = newStep('click'), gate = newStep('if'), after = newStep('wait');
-    m.body.push(before, gate, after);
-    const elseOnly = (id, key) => key === 'else';
-
-    // The editor draws No above Yes, so that is the order a step travels
-    // through them: down from above lands in No, up from below lands in Yes.
-    check('moving down enters the No branch',
-          moveStepNested(m.body, before.id, 1, open) &&
-          gate.else.map(s => s.id).join() === before.id);
-    check('moving up enters the Yes branch',
-          moveStepNested(m.body, after.id, -1, open) &&
-          gate.then.map(s => s.id).join() === after.id);
-    moveStepNested(m.body, after.id, 1, open);   // back out below
-    check('a folded Yes is passed over from below',
-          moveStepNested(m.body, after.id, -1, elseOnly) &&
-          gate.else.map(s => s.id).join() === [before.id, after.id].join());
-}
 
 {
     // The row the editor selected, as the shell reads it back. Landing a
@@ -232,8 +171,7 @@ check('textToEvents balanced', ev.filter(e => e.value === 1).length === ev.filte
 check('textToEvents releases shift at end', ev[ev.length - 1].value === 0 && ev[ev.length - 1].code === 42);
 
 // the add-a-step menu should only offer things you can actually author
-check('verbatim steps are gone entirely', !AUTHORABLE_STEP_KINDS.includes('raw')
-      && STEP_KIND_LABELS['raw'] === undefined);
+check('verbatim steps are gone entirely', !AUTHORABLE_STEP_KINDS.includes('raw'));
 // a document from before verbatim recording was removed loses only those steps
 const rawDoc = JSON.stringify({ version: 1, macros: [{ id: 'm', name: 'r', body: [
     { id: 'a', kind: 'click', button: 'left', mode: 'abs', x: 1, y: 2 },
@@ -247,8 +185,6 @@ check('raw dropped at the top level', rawKept.map(s => s.kind).join(',') === 'cl
       rawKept.map(s => s.kind).join(','));
 check('raw dropped inside a loop', rawKept[1].body.map(s => s.kind).join(',') === 'wait',
       rawKept[1].body.map(s => s.kind).join(','));
-check('every offered kind has a label',
-      AUTHORABLE_STEP_KINDS.every(k => typeof STEP_KIND_LABELS[k] === 'string'));
 check('every offered kind builds something usable',
       AUTHORABLE_STEP_KINDS.every(k => newStep(k).kind === k));
 
@@ -596,7 +532,7 @@ clearProblems();
     check('remember reads as such', describeStep(first) === 'Remember pointer position', describeStep(first));
     const again = parseDocument(stringifyDocument(stored));
     check('a remember step survives a round trip', again.macros[0].body[0].kind === 'remember');
-    check('remember is offered in the add menu', AUTHORABLE_STEP_KINDS.includes('remember') && STEP_KIND_LABELS.remember);
+    check('remember is offered in the add menu', AUTHORABLE_STEP_KINDS.includes('remember'));
 }
 
 print(failures === 0 ? '\nALL PASSED' : `\n${failures} FAILURES`);

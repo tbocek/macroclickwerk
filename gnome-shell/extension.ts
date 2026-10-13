@@ -500,6 +500,28 @@ export default class MacroclickwerkExtension extends Extension {
         this._popup?.refresh();
     }
 
+    /**
+     * Stop these macros' runs, and no one else's. The daemon's stop is global
+     * — it aborts whatever is being played and lets go of every key — so it is
+     * asked for only by the last of these, and only when they are all that is
+     * playing; otherwise each run stops itself and lets go of its own keys.
+     * With nothing playing at all it is still sent, as it always was: a stop
+     * pressed on an idle macro is the way to free a key a crash left down.
+     */
+    private _stopRuns(ids: string[]): void {
+        const running = this._runningMacros();
+        if (running.length === 0) {
+            for (const id of ids) {
+                this._runners.get(id)?.stop();
+            }
+            return;
+        }
+        const stopping = running.filter(([id]) => ids.includes(id));
+        const everything = stopping.length === running.length;
+        stopping.forEach(([, runner], index) =>
+            runner.stop(everything && index === stopping.length - 1));
+    }
+
     /** Every macro with a runner going right now, as [id, runner]. */
     private _runningMacros(): [string, MacroRunner][] {
         return [...this._runners].filter(([, runner]) => runner.running);
@@ -516,22 +538,22 @@ export default class MacroclickwerkExtension extends Extension {
      * between the two halves of a press. Press play to run the new version.
      */
     private _stopEditedRuns(changed: Set<string>): void {
-        let stopped = false;
-        for (const [id, runner] of this._runningMacros()) {
-            if (!changed.has(id)) {
-                continue;
-            }
-            runner.stop();
+        const edited = this._runningMacros().map(([id]) => id).filter(id => changed.has(id));
+        if (edited.length === 0) {
+            return;
+        }
+        // In one go, so that when they are everything that is playing, the
+        // last of them can still ask the daemon to let go of the lot.
+        this._stopRuns(edited);
+        for (const id of edited) {
             this._stoppedByEdit.add(id);
-            stopped = true;
             this._onStatus(`Stopped “${this._store?.getMacro(id)?.name ?? 'macro'}” — it changed while running`);
         }
-        if (stopped) {
-            // Ahead of the run unwinding: the toast belongs next to the edit
-            // that caused it, not a moment later.
-            this._publishRunningPaths();
-        }
+        // Ahead of the run unwinding: the toast belongs next to the edit that
+        // caused it, not a moment later.
+        this._publishRunningPaths();
     }
+
 
     private _forgetDeletedRunners(): void {
         for (const [id, runner] of [...this._runners]) {
@@ -597,6 +619,8 @@ export default class MacroclickwerkExtension extends Extension {
             const alone = this._runningMacros().length === 1;
             if (action === 'start') {
                 this._restarting.set(macroId, at);
+            } else {
+                this._restarting.delete(macroId);
             }
             runner.stop(alone);
         } else if (action === 'start') {
@@ -686,13 +710,22 @@ export default class MacroclickwerkExtension extends Extension {
         }
     }
 
-    private _clearMark(): void {
+    /**
+     * Forget where a run was left off — anywhere, or with `macro`, only a place
+     * inside that macro: stopping one macro must not throw away the spot
+     * another was paused at.
+     */
+    private _clearMark(macro?: Macro): void {
         const current = this._settings?.get_string('record-into') ?? '';
         // A body picked for recording is not somewhere a run was left off, so
         // there is nothing to forget and clearing it would move that choice.
-        if (current.startsWith('after:')) {
-            this._settings?.set_string('record-into', '');
+        if (!current.startsWith('after:')) {
+            return;
         }
+        if (macro && !resolveRunStart(macro.body, current)) {
+            return;
+        }
+        this._settings?.set_string('record-into', '');
     }
 
     /**
@@ -850,6 +883,9 @@ export default class MacroclickwerkExtension extends Extension {
         if (request.action === 'stop' || request.action === 'pause') {
             const runner = this._runners.get(macro.id);
             const paused = request.action === 'pause';
+            // A start step may have asked for this macro to begin again once
+            // it ends. This press is more recent than that, and says otherwise.
+            this._restarting.delete(macro.id);
             if (paused) {
                 // Read before stopping: the path is cleared as the run unwinds.
                 // Writing it is the whole difference between the two buttons —
@@ -860,10 +896,10 @@ export default class MacroclickwerkExtension extends Extension {
                     this._select(macro.id, `after:${id}`);
                 }
             } else {
-                this._clearMark();
+                this._clearMark(macro);
             }
             if (runner) {
-                runner.stop(this._runningMacros().length === 1);
+                this._stopRuns([macro.id]);
             } else {
                 // Nothing is running under that id, so whatever the published
                 // state says about it is out of date. Say so here, because the

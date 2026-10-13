@@ -218,8 +218,17 @@ export class MacroRunner {
      * before stopping a run, to record where to pick it up again.
      */
     get currentStepId(): string {
-        return this._path.length > 0 ? this._path[this._path.length - 1].id : '';
+        return this._holdingBefore
+            || (this._path.length > 0 ? this._path[this._path.length - 1].id : '');
     }
+
+    /**
+     * The step a run is holding in front of while the pointer is over the
+     * menu. It has not started, and the one before it has finished, so the
+     * path names neither — but it is where a pause pressed now has to
+     * continue from, and pausing from the panel always happens over the menu.
+     */
+    private _holdingBefore = '';
 
     /** The step that threw, after a run ended in an error. */
     get failedStepId(): string {
@@ -294,12 +303,14 @@ export class MacroRunner {
             const signal = await this._runList(macro.body);
             if (this._cancelled) {
                 reason = 'stopped';
+                await this._releaseHeld();
             } else if (signal === 'stop') {
                 reason = 'done';
             }
         } catch (error) {
             if (this._cancelled) {
                 reason = 'stopped';
+                await this._releaseHeld();
             } else {
                 reason = 'error';
                 failure = error as Error;
@@ -380,6 +391,10 @@ export class MacroRunner {
      * Only what this run pressed. The daemon's own stop lifts every key on the
      * machine, which is right for the panic shortcut and wrong here, where
      * another macro may be halfway through holding something of its own.
+     *
+     * A run that is stopped lets go the same way. Stopping one macro while
+     * another is going cannot use the daemon's stop, for the same reason, so
+     * without this a pause or a ■ in the middle of a hold left the key down.
      */
     private async _releaseHeld(): Promise<void> {
         const codes = [...this._held].reverse();
@@ -469,7 +484,12 @@ export class MacroRunner {
             this._resume = [];
         }
 
-        await this._waitWhilePaused();
+        this._holdingBefore = step.id;
+        try {
+            await this._waitWhilePaused();
+        } finally {
+            this._holdingBefore = '';
+        }
         if (this._cancelled) {
             return 'stop';
         }
