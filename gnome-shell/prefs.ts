@@ -284,8 +284,8 @@ const EDITOR_MAX_WIDTH = 900;
  */
 const EDITOR_WINDOW_WIDTH = 900;
 
-/** How wide the Input page may get — see `_buildInputPage`. */
-const INPUT_MAX_WIDTH = 860;
+/** How wide the Shortcuts page may get — see `_buildShortcutsPage`. */
+const SHORTCUTS_MAX_WIDTH = 860;
 
 /**
  * Nesting is the thing you have to be able to read at a glance, and stacked
@@ -479,14 +479,79 @@ const triggerSourceLabels = (): Record<string, string> => ({
     custom: _('A key…'),
 });
 
-const TRIGGER_ACTIONS = ['none', 'run', 'pause', 'stop'] as const;
+const TRIGGER_ACTIONS = ['none', 'run', 'pause', 'stop', 'record', 'capture', 'panic'] as const;
 
 const triggerActionLabels = (): Record<string, string> => ({
     none: _('Nothing yet'),
     run: _('Starts'),
     pause: _('Pauses'),
     stop: _('Stops'),
+    record: _('Starts or stops recording'),
+    capture: _('Captures a step'),
+    panic: _('Emergency stop'),
 });
+
+/** How a modifier is written by people, and how GTK spells it. */
+const MODIFIERS: [string, string][] = [
+    ['Ctrl', '<Control>'], ['Shift', '<Shift>'], ['Alt', '<Alt>'], ['Super', '<Super>'],
+];
+
+/** <Control><Shift>F6 → Ctrl+Shift+F6, the way people write a shortcut. */
+function shortcutLabel(accel: string): string {
+    let rest = accel.replace(/<Primary>|<Ctrl>/gi, '<Control>');
+    const parts: string[] = [];
+    for (const [label, spelled] of MODIFIERS) {
+        if (rest.toLowerCase().includes(spelled.toLowerCase())) {
+            parts.push(label);
+            rest = rest.replace(new RegExp(spelled, 'ig'), '');
+        }
+    }
+    return [...parts, rest.replace(/<[^>]*>/g, '')].filter(Boolean).join('+');
+}
+
+/**
+ * Ctrl+Shift+F6 → <Control><Shift>F6, for the settings; GTK's own spelling is
+ * taken as it is. Null when it does not read as a shortcut — a key, after any
+ * number of modifiers.
+ */
+function shortcutAccel(text: string): string | null {
+    const typed = text.trim();
+    if (typed.includes('<')) {
+        const [ok, keyval] = Gtk.accelerator_parse(typed);
+        return ok && keyval !== 0 ? typed : null;
+    }
+    const parts = typed.split('+').map(part => part.trim()).filter(Boolean);
+    const key = parts.pop() ?? '';
+    const mods = parts.map(part => MODIFIERS.find(([label]) =>
+        label.toLowerCase() === part.toLowerCase() || (label === 'Ctrl' && part.toLowerCase() === 'control'))?.[1]);
+    if (!key || mods.some(mod => !mod)) {
+        return null;
+    }
+    // GTK's key names are case-sensitive — F5, not f5 — and people type them
+    // either way, so the key is tried as typed, then as GTK would spell it.
+    for (const spelling of [key, key.toUpperCase(), key[0].toUpperCase() + key.slice(1).toLowerCase()]) {
+        const accel = `${mods.join('')}${spelling}`;
+        const [ok, keyval] = Gtk.accelerator_parse(accel);
+        if (ok && keyval !== 0) {
+            return accel;
+        }
+    }
+    return null;
+}
+
+/** The actions that name a macro; the rest act on their own. */
+const MACRO_TRIGGER_ACTIONS: readonly string[] = ['run', 'pause', 'stop'];
+
+/**
+ * The keyboard shortcuts, by settings key, and what each does — said the way a
+ * trigger's action is, since they share one list.
+ */
+const keyboardShortcuts = (): [string, string][] => [
+    ['run-macro', _('Starts or pauses everything switched on')],
+    ['record-toggle', _('Starts or stops recording')],
+    ['capture-step', _('Captures a step')],
+    ['panic-stop', _('Emergency stop')],
+];
 
 
 /**
@@ -519,7 +584,7 @@ function promptHelp(kind: 'chat' | 'decision', thresholdPercent: number): string
     if (kind === 'decision') {
         lines.push(
             _('<b>When the model is not sure, the answer is No.</b> It only says Yes from') +
-                ` ${thresholdPercent}% ` + _('sure. Raise that under Settings → Model → <b>Yes from (%)</b> and the macro ' +
+                ` ${thresholdPercent}% ` + _('sure. Raise that under Settings → Setup → <b>Yes from (%)</b> and the macro ' +
                 'acts only when the model is very sure; when it is unsure, it waits.'),
             '',
         );
@@ -527,7 +592,7 @@ function promptHelp(kind: 'chat' | 'decision', thresholdPercent: number): string
     if (kind === 'decision') {
         lines.push(
             _('<b>Sent to a decision model</b> as one yes/no question about the screenshot. It answers with how likely yes is, ' +
-              'and the check counts as yes from') + ` ${thresholdPercent}% ` + _('(Settings → Model):'),
+              'and the check counts as yes from') + ` ${thresholdPercent}% ` + _('(Settings → Setup):'),
             '',
             `<tt>${GLib.markup_escape_text(JSON.stringify(
                 { questions: { check: { type: 'noul', instructions: _('…your words go here…') } } }, null, 1), -1)}</tt>`,
@@ -2279,7 +2344,7 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
         return [row, ...rows];
     }
 
-    /** Which kind of model the checks go to — see the Model page. */
+    /** Which kind of model the checks go to — see the Setup page. */
     private _llmKind(): 'chat' | 'decision' {
         return this._settings.get_string('llm-kind') === 'decision' ? 'decision' : 'chat';
     }
@@ -2778,7 +2843,7 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
         for (const page of this._settingsPages) {
             window.remove(page);
         }
-        this._settingsPages = [this._buildLlmPage(), this._buildInputPage(), this._buildShortcutsPage()];
+        this._settingsPages = [this._buildSetupPage(), this._buildShortcutsPage()];
         for (const page of this._settingsPages) {
             window.add(page);
         }
@@ -3124,12 +3189,22 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
 
     // --- other pages -------------------------------------------------------
 
-    private _buildLlmPage(): Adw.PreferencesPage {
+    /**
+     * Everything that is set up once and then left alone, on one page: the
+     * vision model and its screenshots first, since those are what gets
+     * changed, then recording, then the daemon, which is set up at install.
+     */
+    private _buildSetupPage(): Adw.PreferencesPage {
         const page = new Adw.PreferencesPage({
-            title: _('Model'),
-            iconName: 'view-reveal-symbolic',
+            title: _('Setup'),
+            iconName: 'preferences-system-symbolic',
         });
+        this._addModelGroups(page);
+        this._addInputGroups(page);
+        return page;
+    }
 
+    private _addModelGroups(page: Adw.PreferencesPage): void {
         const group = new Adw.PreferencesGroup({
             title: _('Vision model'),
             description: _('A chat model on any OpenAI-compatible endpoint — llama.cpp-server, LM Studio, vLLM, ' +
@@ -3242,20 +3317,16 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
             this._settings.set_int('llm-max-width', Number(value));
         }));
         page.add(imageGroup);
-
-        return page;
     }
 
-    private _buildInputPage(): Adw.PreferencesPage {
-        const page = new Adw.PreferencesPage({
-            title: _('Input'),
-            iconName: 'input-keyboard-symbolic',
-        });
-        // A trigger is a line of its own — what is taken over, what happens
-        // instead, and the key or macro that names — and at the settings width
-        // of 600 its dropdowns were cut down to "A…". Wider, like the editor,
-        // though not as wide: the other rows here are ordinary settings.
-        this._widen(page, INPUT_MAX_WIDTH);
+    private _addInputGroups(page: Adw.PreferencesPage): void {
+        const recording = new Adw.PreferencesGroup({ title: _('Recording') });
+        recording.add(spinRow(
+            _('Pauses longer than this become waits (ms, 0 = never)'),
+            this._settings.get_int('record-gap-ms'), 0, 60000, 10,
+            value => this._settings.set_int('record-gap-ms', Math.round(value)),
+        ));
+        page.add(recording);
 
         const daemon = new Adw.PreferencesGroup({
             title: _('Daemon'),
@@ -3268,36 +3339,60 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
             this._settings.set_string('event-socket', text);
         }));
         page.add(daemon);
-
-        const recording = new Adw.PreferencesGroup({ title: _('Recording') });
-        recording.add(spinRow(
-            _('Pauses longer than this become waits (ms, 0 = never)'),
-            this._settings.get_int('record-gap-ms'), 0, 60000, 10,
-            value => this._settings.set_int('record-gap-ms', Math.round(value)),
-        ));
-        page.add(recording);
-
-        page.add(this._buildTriggersGroup());
-
-        return page;
     }
 
     // --- triggers -----------------------------------------------------------
 
+    /**
+     * One list of what a key or button does: the keyboard shortcuts first, then
+     * the triggers. Both are "when this is pressed, do that", and both are
+     * shown that way. They differ in what is pressed — a shortcut is a key
+     * combination that works anywhere and leaves the keys alone otherwise, a
+     * trigger takes a whole mouse button or key over through the daemon — so
+     * a shortcut's action is fixed and a trigger's is chosen.
+     */
     private _buildTriggersGroup(): Adw.PreferencesGroup {
         this._triggersGroup = new Adw.PreferencesGroup({
-            title: _('Triggers'),
-            description: _('Use a spare mouse button or key to start, pause or stop your macros — ' +
-                'even when none of them is running. The game never sees that press. To make a ' +
-                'button press something else instead, use a When step in a macro.'),
+            title: _('Shortcuts'),
+            description: _('What a key or button does. Keyboard shortcuts work anywhere. ' +
+                'With + you add a mouse button or key that is taken over completely — the game never ' +
+                'sees it — even when no macro is running.'),
         });
-        this._triggersGroup.set_header_suffix(iconButton('list-add-symbolic', _('Add a trigger'), () => {
+        this._triggersGroup.set_header_suffix(iconButton('list-add-symbolic', _('Add a mouse button or key'), () => {
             const triggers = this._loadTriggers();
             triggers.push({ id: newId(), source: 'BTN_SIDE', action: 'none' });
             this._saveTriggers(triggers, true);
         }));
+        for (const [key, does] of keyboardShortcuts()) {
+            this._triggersGroup.add(this._shortcutRow(key, does));
+        }
         this._fillTriggersGroup();
         return this._triggersGroup;
+    }
+
+    /**
+     * A keyboard shortcut as a trigger reads: When [keys] → does this. The
+     * keys are shown and typed the way people write them — Ctrl+Shift+F6 —
+     * and empty removes the shortcut.
+     */
+    private _shortcutRow(key: string, does: string): Adw.ActionRow {
+        const row = new Adw.ActionRow({ title: _('When') });
+        row.add_prefix(new Gtk.Image({ icon_name: 'input-keyboard-symbolic', valign: Gtk.Align.CENTER }));
+        const line = new Gtk.Box({ spacing: 4, valign: Gtk.Align.CENTER, css_classes: ['macroclickwerk-line'] });
+        const keys = suffixEntry(shortcutLabel(this._settings.get_strv(key)[0] ?? ''), 'Ctrl+Shift+F6',
+            _('The keys, like Ctrl+Shift+F6. Empty: no shortcut'), text => {
+                // Empty is a shortcut removed, not a shortcut typed wrong.
+                const accel = text.trim() === '' ? '' : shortcutAccel(text);
+                setClass(keys, 'error', accel === null);
+                if (accel !== null) {
+                    this._settings.set_strv(key, accel === '' ? [] : [accel]);
+                }
+            }, { width: 10, max: 16, settle: true });
+        line.append(keys);
+        line.append(this._joiner('→'));
+        line.append(new Gtk.Label({ label: does, valign: Gtk.Align.CENTER }));
+        row.add_suffix(line);
+        return row;
     }
 
     private _loadTriggers(): Trigger[] {
@@ -3323,16 +3418,6 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
             this._triggerRows.push(row);
             this._triggersGroup.add(row);
         });
-        // An empty list is a heading over nothing, which says nothing about
-        // where to start. Say it.
-        if (triggers.length === 0) {
-            const empty = new Adw.ActionRow({
-                title: _('No triggers yet'),
-                subtitle: _('Press + to have a spare button start a macro, say'),
-            });
-            this._triggerRows.push(empty);
-            this._triggersGroup.add(empty);
-        }
     }
 
     /**
@@ -3374,7 +3459,7 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
                 this._saveTriggers(triggers, true);
             }, 14));
 
-        if (trigger.action !== 'none') {
+        if (MACRO_TRIGGER_ACTIONS.includes(trigger.action)) {
             const macros = this._store.macros;
             const options = ['', ...macros.map(macro => macro.id)];
             const labels: Record<string, string> = { '': _('Everything switched on') };
@@ -3410,37 +3495,11 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
             title: _('Shortcuts'),
             iconName: 'preferences-desktop-keyboard-shortcuts-symbolic',
         });
-
-        const group = new Adw.PreferencesGroup({
-            title: _('Shortcuts'),
-            description: _('GTK accelerator syntax, for example &lt;Control&gt;&lt;Shift&gt;F5'),
-        });
-
-        const shortcuts: [string, string][] = [
-            ['run-macro', _('Run or stop the selected macro')],
-            ['record-toggle', _('Start or stop recording')],
-            ['capture-step', _('Capture one click or move as a step')],
-            ['panic-stop', _('Emergency stop')],
-        ];
-
-        for (const [key, title] of shortcuts) {
-            const current = this._settings.get_strv(key)[0] ?? '';
-            const row = new Adw.EntryRow({ title });
-            row.set_text(current);
-            const commit = debounce(() => {
-                const text = (row.get_text() ?? '').trim();
-                // Empty is a shortcut removed, not a shortcut typed wrong.
-                const [ok] = text === '' ? [true] : Gtk.accelerator_parse(text);
-                setClass(row, 'error', !ok);
-                if (ok) {
-                    this._settings.set_strv(key, text === '' ? [] : [text]);
-                }
-            });
-            row.connect('changed', commit);
-            group.add(row);
-        }
-
-        page.add(group);
+        // Each row is a sentence — what is pressed, what it does, and the
+        // macro it names — and at the settings width of 600 its dropdowns were
+        // cut down to "A…". Wider, like the editor.
+        this._widen(page, SHORTCUTS_MAX_WIDTH);
+        page.add(this._buildTriggersGroup());
         return page;
     }
 }

@@ -23,6 +23,7 @@ function recordingActions() {
     return {
         done,
         control: (action, macroId) => done.push(`${action} ${macroId || '(all)'}`),
+        command: action => done.push(action),
     };
 }
 
@@ -251,6 +252,23 @@ check('the inert ones claim no code',
     await Promise.resolve();
     check('and the wait that the press ended still reports the press',
           ended === 'press', ended);
+}
+
+// --- what a keyboard shortcut does, from a button ----------------------------
+{
+    const map = armedByCode([
+        { id: 'p', source: 'BTN_EXTRA', action: 'panic' },
+        { id: 'r', source: 'BTN_MIDDLE', action: 'record' },
+        { id: 'c', source: 'KEY_F14', action: 'capture' },
+    ]);
+    const actions = recordingActions();
+    dispatch(map, trig(BUTTON_CODES.extra, 1), actions);
+    dispatch(map, trig(BUTTON_CODES.middle, 1), actions);
+    dispatch(map, trig(KEY_CODES.KEY_F14, 1), actions);
+    dispatch(map, trig(KEY_CODES.KEY_F14, 0), actions);
+    check('a button can stop everything, record or capture, once per press',
+          actions.done.join(' | ') === 'panic | record | capture', actions.done.join(' | '));
+    check('those survive a save', parseTriggers(JSON.stringify([{ id: 'p', source: 'BTN_EXTRA', action: 'panic' }])).length === 1);
 }
 
 // --- pressing a key in place of a button is a When step, not a trigger -------

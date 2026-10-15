@@ -144,6 +144,9 @@ export default class MacroclickwerkExtension extends Extension {
         });
 
         this._triggers = new TriggerEngine(this._daemon, config.eventSocket, {
+            // The same as the keyboard shortcut for it, from a button.
+            command: action => this._onShortcut(
+                action === 'record' ? 'record-toggle' : action === 'capture' ? 'capture-step' : 'panic-stop'),
             control: (action, macroId) => {
                 if (macroId !== '') {
                     this._runOneMacro({ macroId, action });

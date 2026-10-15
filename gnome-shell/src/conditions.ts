@@ -190,7 +190,7 @@ export class ConditionEvaluator {
             reportProblem('Model', message, {
                 where: describeCondition(condition),
                 hint: `Macroclickwerk asked ${this._config.llmEndpoint || '(no endpoint set)'} — start that server, ` +
-                    'point Settings → Model somewhere else, or replace the check with a colour test.',
+                    'point Settings → Setup at another model, or replace the check with a colour test.',
             });
             throw new Error(`the model could not answer: ${message}`);
         }

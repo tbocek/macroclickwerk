@@ -83,9 +83,9 @@ away and marks the branch the If would take — "Yes — model says yes · 97% s
 
 ### A decision model, in a third of a second
 
-![Settings → Model with a decision model selected: Kind, endpoint, model, Yes from 80%](docs/decision-model.png)
+![Settings → Setup with a decision model selected: Kind, endpoint, model, Yes from 80%](docs/decision-model.png)
 
-Under **Settings → Model**, **Kind** is either **Chat** — any OpenAI-compatible
+Under **Settings → Setup**, **Kind** is either **Chat** — any OpenAI-compatible
 chat endpoint, asked for a one-line JSON verdict — or **Decision**: a decision
 model such as Cloudflare's Clef on llama.cpp-server's `/v1/systemone`, asked one
 yes/no question and answering with a probability, with nothing generated. On
@@ -94,18 +94,21 @@ chat model took 1–2 s. **Yes from (%)** sets how sure it must be: below
 that the answer is No, so raising it makes a macro act only when the model is
 very sure. **Test** sends one small picture and says what came back.
 
-### Triggers: a spare button as a switch for your macros
+### Shortcuts: keys and spare buttons
 
-![Settings → Input → Triggers: F13 starts Auto-ready, the side button pauses everything, the extra button stops everything](docs/triggers.png)
+![Settings → Shortcuts: the keyboard shortcuts, then F13 starts Auto-ready, the side button pauses everything, the extra button is an emergency stop](docs/shortcuts.png)
 
-A trigger turns a spare mouse button or key into a switch for your macros: it
-starts, pauses or stops one of them — or everything switched on — even when
-none is running. The press is consumed, so the game never sees it. Until you
-pick what a trigger does, its button works as usual, and so does every button
-whenever Macroclickwerk is not running. To make a button press something else
-inside a game, use a When step in a macro, as in the side-button tricks above.
-While a macro is waiting on a button in a When, that press goes to the When,
-not to a trigger on the same button.
+**Settings → Shortcuts** is one list of what a key or button does. The keyboard
+shortcuts come first — `Ctrl+Shift+F6` starts or pauses everything switched on,
+`Ctrl+Shift+F5` is the emergency stop — and work anywhere. With **+** you add a
+spare mouse button or key that is taken over completely, so the game never sees
+it: it can start, pause or stop a macro, or everything switched on, even when
+none is running; start or stop recording; capture a step; or stop everything.
+Until you pick what it does, its button works as usual, and so does every
+button whenever Macroclickwerk is not running. To make a button press something
+else inside a game, use a When step in a macro, as in the side-button tricks
+above. While a macro is waiting on a button in a When, that press goes to the
+When, not to the shortcut list.
 
 ## Features
 
@@ -125,8 +128,9 @@ not to a trigger on the same button.
 - **Questions you can trust** — the wording is checked as you type, and
   **▶ Check now** asks the model about the real screen and marks the branch the
   If would take.
-- **Triggers** — a spare mouse button or key that starts, pauses or stops your
-  macros, even when none is running.
+- **Shortcuts for keys and spare buttons** — keyboard shortcuts, and mouse
+  buttons or keys taken over to start, pause or stop macros, record, capture or
+  stop everything, even when no macro is running.
 - **Pause and continue** — halting a run remembers the step it was on, and
   clicking a row is what says where the next run starts.
 - **See what a check is looking at** — **Flash** outlines the checked area for
@@ -305,7 +309,7 @@ Log out and back in (Wayland has no `Alt+F2 r`), then enable *Macroclickwerk*.
 
 ### A vision model
 
-Only needed for model checks. Two kinds work, chosen under *Settings → Model →
+Only needed for model checks. Two kinds work, chosen under *Settings → Setup →
 Kind*; the endpoint and the model's name are yours to fill in, whatever your
 server calls it.
 
@@ -357,6 +361,9 @@ the panel popup says why.
 | `Ctrl+Shift+F6` | Run the macros that are switched on / pause them / continue |
 | `Ctrl+Shift+R` | Start / stop recording into the selected macro |
 | `Ctrl+Shift+M` | Capture one click or move, appended to the selected macro |
+
+All four can be changed, and spare mouse buttons added, under *Settings →
+Shortcuts*.
 
 The panel popup holds only a run switch, a **Stop**, what is running, and a
 **Settings** button. It is also where progress shows up: the current step, the
@@ -676,7 +683,7 @@ systemctl mask systemd-udev-settle.service
 ## Troubleshooting
 
 - **Popup says it cannot reach the daemon** — `systemctl status macroclickwerk`, and
-  check the socket path in *Settings → Input*.
+  check the socket path in *Settings → Setup*.
 - **"The macroclickwerk daemon is out of date"** — the extension needs API v2; rerun
   `sudo make install`.
 - **Clicks land in the wrong place** — check whether the target grabs the
@@ -690,7 +697,7 @@ systemctl mask systemd-udev-settle.service
   login.
 - **Every model check fails with "model … not found"** — the model's name has
   to match what the server calls it, exactly; servers rename models when their
-  settings change. **Test the connection** under *Settings → Model* shows the
+  settings change. **Test the connection** under *Settings → Setup* shows the
   server's answer.
 - **The game misses an action** — give the step a ⏰ wait (30–50 ms is a frame
   or two), so the next step does not arrive before the game has looked; for a

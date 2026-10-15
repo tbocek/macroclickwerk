@@ -1,7 +1,9 @@
-// Input triggers: a button (or key) the daemon consumes, and the macro it
-// starts, pauses or stops in its place — a spare button as a switch for the
-// macros, which works whether or not any of them is running. Making a button
-// press something else is a When step in a macro, not a trigger.
+// Input triggers: a button (or key) the daemon consumes, and what it does in
+// its place — start, pause or stop a macro, start or stop recording, capture a
+// step, or stop everything: what a keyboard shortcut does, from a button the
+// whole of which is taken over, and which works whether or not a macro is
+// running. Making a button press something else is a When step in a macro,
+// not a trigger.
 //
 // The split mirrors who can do what. Only the daemon, holding the grab, can
 // withhold the original event from the desktop; only the extension knows what
@@ -18,6 +20,14 @@ import { BUTTON_CODES, EV_KEY, keyCode } from './keymap.js';
 import type { EventEdge } from './model.js';
 import { reportProblem } from './problems.js';
 
+/** What a trigger does to a macro, or to everything switched on. */
+export type MacroAction = 'run' | 'pause' | 'stop';
+
+/** What a trigger does that a keyboard shortcut also does, with no macro to name. */
+export type Command = 'record' | 'capture' | 'panic';
+
+const MACRO_ACTIONS: readonly string[] = ['run', 'pause', 'stop'];
+
 export interface Trigger {
     id: string;
     /** evdev name of what is consumed: BTN_SIDE, KEY_F13, … */
@@ -26,13 +36,13 @@ export interface Trigger {
      * What a press does. 'none' is a trigger still being set up: nothing is
      * consumed and the source keeps working as itself.
      */
-    action: 'none' | 'run' | 'pause' | 'stop';
-    /** Macro for run/pause/stop. '' means every enabled macro. */
+    action: 'none' | MacroAction | Command;
+    /** Macro for run/pause/stop. '' means every enabled macro. Unused by commands. */
     macro?: string;
 }
 
 /** What a trigger can do. */
-const TRIGGER_ACTIONS: readonly string[] = ['none', 'run', 'pause', 'stop'];
+const TRIGGER_ACTIONS: readonly string[] = ['none', ...MACRO_ACTIONS, 'record', 'capture', 'panic'];
 
 /**
  * The stored JSON, tolerantly: a bad document is no triggers, not a crash.
@@ -82,8 +92,10 @@ export function isArmed(trigger: Trigger): boolean {
 }
 
 export interface TriggerActions {
+    /** Record, capture or stop everything — what the keyboard shortcuts do. */
+    command(action: Command): void;
     /** Drive a macro; macroId '' means every enabled macro. */
-    control(action: 'run' | 'pause' | 'stop', macroId: string): void;
+    control(action: MacroAction, macroId: string): void;
 }
 
 /** The armed triggers, keyed by the evdev code the daemon consumes for them. */
@@ -113,8 +125,13 @@ export function dispatch(
     // A trigger fires on the press alone; the release is just the finger
     // coming back up. ('none' never reaches here — an unarmed trigger is not
     // in the map — but the type does not know that.)
-    if (event.value === 1 && trigger.action !== 'none') {
-        actions.control(trigger.action, trigger.macro ?? '');
+    if (event.value !== 1 || trigger.action === 'none') {
+        return;
+    }
+    if (MACRO_ACTIONS.includes(trigger.action)) {
+        actions.control(trigger.action as MacroAction, trigger.macro ?? '');
+    } else {
+        actions.command(trigger.action as Command);
     }
 }
 
