@@ -34,9 +34,9 @@ once a second, whether the Ready button is green; when it is, the Mouse step
 clicks it and waits three seconds, give or take half a second. The question
 names an area — `938, 414, 194, 82` — so the model looks at the button and not
 at the whole screen, and **Flash** draws a green outline over that area every
-time the check runs, so you can watch it look where you meant. The `then 50ms`
-on the click is the game's turn: the next step waits until the game has had a
-frame to register the click.
+time the check runs, so you can watch it look where you meant. On the click,
+**↓ 20ms** is how long the button is held down, and **⏰ 50ms** is the game's
+turn: the next step waits until the game has had a frame to register the click.
 
 ### Skip waves on a colour, with no model at all
 
@@ -117,7 +117,7 @@ not to a trigger on the same button.
   Repeat and If fold from the arrow on their left; steps move by dragging the
   grip. Times step with − and +; every number field with ↑/↓, or the scroll
   wheel once focused.
-- **A wait after any action** — `then 30ms` on a click, move, key, text or
+- **A wait after any action** — the ⏰ time on a click, move, key, text or
   scroll gives the game a frame to register it before the next step.
 - **Two kinds of vision model** — a chat model on any OpenAI-compatible
   endpoint, or a decision model that answers with a probability in a third of a
@@ -169,9 +169,10 @@ coordinate involved is correct. A person moving a mouse and clicking never gets
 close to being that quick. The wait is skipped when the pointer was already
 there, so a macro clicking the same button in a loop pays it once.
 
-What comes *after* a step is yours to set: `then 30ms` on a click, move, key,
+What comes *after* a step is yours to set: the ⏰ time on a click, move, key,
 text or scroll holds the next step back until the game has had a frame or two
-to register this one. A game reads input once a frame; two actions in the same
+to register this one. A click or a key press also has a **↓** time, how long it
+is held down, so the game sees it go down and come back up as two moments. A game reads input once a frame; two actions in the same
 millisecond can both land before it looks, and it sees only the last.
 
 If a target swallows the warp (a pointer-confining grab), the extension falls
@@ -691,8 +692,9 @@ systemctl mask systemd-udev-settle.service
   to match what the server calls it, exactly; servers rename models when their
   settings change. **Test the connection** under *Settings → Model* shows the
   server's answer.
-- **The game misses an action** — give the step a `then` wait (30–50 ms is a
-  frame or two), so the next step does not arrive before the game has looked.
+- **The game misses an action** — give the step a ⏰ wait (30–50 ms is a frame
+  or two), so the next step does not arrive before the game has looked; for a
+  click the game does not notice at all, a longer ↓ hold.
 
 ## Contributing
 

@@ -1640,6 +1640,11 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
                 this._saveAndRebuild();   // the hold field comes and goes with tap
             }));
         if ((step.action ?? 'tap') === 'tap') {
+            // Greyed, like the clock after it: this one is how long it is
+            // held down, that one how long to wait once it is let go.
+            const held = this._joiner('↓');
+            held.set_tooltip_text(words.hold);
+            widgets.push(held);
             widgets.push(numberEntry(step.holdMs ?? 20, 0, 10000, words.hold, value => {
                 step.holdMs = value;
                 this._save();
@@ -1837,7 +1842,13 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
 
         if (THEN_WAIT_KINDS.includes(step.kind)) {
             const acting = step as Step & { afterMs?: number };
-            suffixes.append(this._joiner(_('then')));
+            // The Wait step's own clock, greyed: wait, after this one.
+            suffixes.append(new Gtk.Image({
+                icon_name: STEP_ICONS.wait,
+                valign: Gtk.Align.CENTER,
+                css_classes: ['dim-label'],
+                tooltip_text: _('Then wait this long before the next step'),
+            }));
             suffixes.append(numberEntry(acting.afterMs ?? 0, 0, 600000,
                 _('Then wait this long before the next step, so the game has registered it. 0: go straight on'),
                 value => {
