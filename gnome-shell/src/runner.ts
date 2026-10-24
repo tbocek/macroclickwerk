@@ -116,9 +116,8 @@ export class Turn {
         }
     }
 
-    /** Let the next one go, if `who` has the turn; and stop waiting for it. */
+    /** Let the next one go, if `who` has the turn. */
     give(who: object): void {
-        this.leave(who);
         if (this._holder === who) {
             const next = this._queue.shift();
             this._holder = next?.who ?? null;
@@ -453,11 +452,11 @@ export class MacroRunner {
      * loop stops either way; at worst one already-submitted step finishes.
      */
     stop(abortDaemon = true): void {
+        // Waiting for the turn ends; having it lasts until the run has unwound.
+        this._turn?.leave(this);
         if (!abortDaemon) {
             this._cancelled = true;
             this._wakeNow();
-            // Waiting for the turn ends; having it lasts until the run has unwound.
-            this._turn?.leave(this);
             return;
         }
         if (!this._running && !this._cancelled) {
@@ -467,7 +466,6 @@ export class MacroRunner {
         }
         this._cancelled = true;
         this._wakeNow();
-        this._turn?.leave(this);
         void this._daemon.stop().catch(error => {
             // Worth surfacing: this is the request that releases a held key, so
             // failing it can leave a modifier stuck down.
@@ -517,18 +515,32 @@ export class MacroRunner {
             this._resume = [];
         }
 
+        // Wait and On Event stand still, which needs no turn: they start at
+        // once, so an On Event is listening from the moment it is reached.
+        const needsTurn = step.kind !== 'wait' && step.kind !== 'onevent';
         this._holdingBefore = step.id;
         try {
-            await this._waitWhilePaused();
+            for (;;) {
+                await this._waitWhilePaused();
+                if (this._cancelled) {
+                    return 'stop';
+                }
+                if (!needsTurn) {
+                    break;
+                }
+                await this._turn?.take(this);
+                if (this._cancelled) {
+                    return 'stop';
+                }
+                // The pointer may have reached the menu while this run waited
+                // for the turn: hold again — which hands the turn on — rather
+                // than act over it.
+                if (!this._callbacks.shouldPause?.()) {
+                    break;
+                }
+            }
         } finally {
             this._holdingBefore = '';
-        }
-        if (this._cancelled) {
-            return 'stop';
-        }
-        await this._turn?.take(this);
-        if (this._cancelled) {
-            return 'stop';
         }
         // A container stays on the path for as long as its body runs, so the
         // editor can mark the loop you are in as well as the step inside it.

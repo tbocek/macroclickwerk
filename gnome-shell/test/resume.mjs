@@ -258,6 +258,39 @@ check('pathToStep of a missing step is empty', pathToStep(flat.body, 'gone').len
     await Promise.all([runner(turn).run(rounds('x', 3)), runner(turn).run(rounds('y', 3))]);
     check('each round of a Repeat lets the other in', trace.join() === 'x,y,x,y,x,y', trace.join());
 
+    // A Wait needs no turn: it starts at once, though another has the turn.
+    trace.length = 0;
+    const started = Date.now();
+    let waited = 0;
+    const busy = runner(turn).run(macro('b', [step('key', 'b1', { code: 'KEY_B', afterMs: 300 })]));
+    await until(() => trace.includes('b1'));
+    await runner(turn).run(macro('w', [step('wait', null, { ms: 50 })]));
+    waited = Date.now() - started;
+    await busy;
+    check('a Wait starts at once, without waiting for the turn', waited < 250, `${waited} ms`);
+
+    // The pointer reaching the menu while a run waits for the turn: it holds
+    // there, rather than act over the menu once the turn comes to it.
+    trace.length = 0;
+    let overMenu = false;
+    const held = cbTurn => new MacroRunner(shared, evaluator, {
+        shouldPause: () => overMenu,
+        onStepsChanged: path => {
+            const label = path.length > 0 ? NAMES.get(path[path.length - 1].id) : undefined;
+            if (label) trace.push(label);
+        },
+    }, cbTurn);
+    const first2 = held(turn).run(macro('a', [step('key', 'a1', { code: 'KEY_A', afterMs: 80 }), step('key', 'a2', { code: 'KEY_A' })]));
+    await until(() => trace.includes('a1'));
+    const second2 = held(turn).run(macro('b', [step('key', 'b1', { code: 'KEY_B' })]));
+    overMenu = true;
+    await new Promise(resolve => GLib.timeout_add(GLib.PRIORITY_DEFAULT, 400, () => { resolve(); return GLib.SOURCE_REMOVE; }));
+    const whileOver = trace.join();
+    overMenu = false;
+    await Promise.all([first2, second2]);
+    check('nothing acts while the pointer is over the menu, turn or not', whileOver === 'a1', whileOver);
+    check('…and both go on after', trace.includes('a2') && trace.includes('b1'), trace.join());
+
     // A run stopped while it waits for the turn unwinds, and does not act.
     trace.length = 0;
     const holder = runner(turn), waiter = runner(turn);

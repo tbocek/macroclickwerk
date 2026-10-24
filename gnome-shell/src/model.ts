@@ -367,6 +367,14 @@ export function collectionPaths(doc: MacroDocument): string[] {
         .filter(path => doc.macros.some(macro => macro.collection === path));
 }
 
+/**
+ * Forget the collections left with no macros — before one comes in at a path
+ * that may have been one, so it starts afresh: on, and saved as it is.
+ */
+export function forgetEmptyCollections(doc: MacroDocument): void {
+    doc.collections = (doc.collections ?? []).filter(ref => doc.macros.some(macro => macro.collection === ref.path));
+}
+
 /** Whether a collection is switched on. */
 export function collectionOn(doc: MacroDocument, path: string): boolean {
     return (doc.collections ?? []).find(ref => ref.path === path)?.off !== true;
@@ -479,6 +487,7 @@ export function loadCollection(doc: MacroDocument, path: string, text: string): 
     if (collectionPaths(doc).includes(path)) {
         throw new Error(`“${collectionName(path)}” is already loaded`);
     }
+    forgetEmptyCollections(doc);
     // Checked here rather than left to parseDocument, which makes an empty
     // document of anything else — and Save would then write that over the file.
     let raw: unknown;
@@ -610,7 +619,13 @@ function cleanPoints(raw: unknown): NamedPoint[] {
 export function pointAt(doc: MacroDocument, x: number | undefined, y: number | undefined): NamedPoint | undefined {
     const points = doc.points ?? [];
     return points.find(point => point.w === undefined && point.x === x && point.y === y)
-        ?? points.find(point => point.w !== undefined && placeCentre(point).x === x && placeCentre(point).y === y);
+        ?? points.find(point => {
+            if (point.w === undefined) {
+                return false;
+            }
+            const centre = placeCentre(point);
+            return centre.x === x && centre.y === y;
+        });
 }
 
 /** The named area that is exactly this one, if there is one. */
@@ -631,8 +646,11 @@ export function namePlace(doc: MacroDocument, place: Place, name: string): strin
         doc.points = points.filter(point => point !== here);
         return null;
     }
-    if (points.some(point => point.name === wanted && point !== here)) {
-        return `“${wanted}” is already another place`;
+    const taken = points.find(point => point.name === wanted && point !== here);
+    if (taken) {
+        return livePoints(doc).includes(taken)
+            ? `“${wanted}” is already another place`
+            : `“${wanted}” is already a place in a collection that is switched off`;
     }
     if (here) {
         here.name = wanted;
@@ -695,7 +713,8 @@ export function movePoint(doc: MacroDocument, name: string, to: Place): string |
     const from = placeCentre(point);
     const centre = placeCentre(to);
     eachAim(doc.macros, step => {
-        if (step.x === from.x && step.y === from.y) {
+        // Only what shows this name: a point and an area can share a middle.
+        if (step.x === from.x && step.y === from.y && pointAt(doc, step.x, step.y) === point) {
             step.x = centre.x;
             step.y = centre.y;
         }

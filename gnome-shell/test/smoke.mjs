@@ -567,6 +567,13 @@ clearProblems();
     doc.macros = doc.macros.filter(macro => macro.collection !== other);
     check('a collection with no macros left is gone', !collectionPaths(doc).includes(other)
           && !parseDocument(stringifyDocument(doc)).collections.some(ref => ref.path === other));
+    {
+        // A collection emptied, then loaded again at the same path, starts afresh.
+        const again = { version: 1, macros: [], collections: [{ path: '/home/me/again.json', saved: 'x', off: true }] };
+        loadCollection(again, '/home/me/again.json', JSON.stringify({ version: 1, macros: [newMacro('Back')] }));
+        check('a collection loaded where an empty one was starts on', again.collections.length === 1
+              && collectionOn(again, '/home/me/again.json') && macroLive(again, again.macros[0]));
+    }
     let empty = '';
     try { loadCollection(doc, '/home/me/empty.json', '{"version": 1, "macros": []}'); } catch (e) { empty = e.message; }
     check('…so an empty one is not loaded', empty.includes('no macros'), empty);
@@ -644,6 +651,14 @@ clearProblems();
               && middle.x === 5 && middle.y === 5 && adoc.points[0].w === 10);
         check('summaries call a named place by its name', describeStep(check2, undefined, undefined, adoc) === 'If not (avg of Button ≈ #00ff00 ±9)'
               && describeStep(middle, undefined, undefined, adoc) === 'Click left @ Button', describeStep(check2, undefined, undefined, adoc));
+        {
+            const shared = { version: 1, macros: [Object.assign(newMacro('m'), { body: [aimed(50, 50)] })] };
+            namePlace(shared, { x: 50, y: 50 }, 'OK');
+            namePlace(shared, { x: 40, y: 40, w: 20, h: 20 }, 'Box');
+            movePoint(shared, 'Box', { x: 400, y: 400, w: 20, h: 20 });
+            check('moving an area leaves a click that shows another name where it is', shared.macros[0].body[0].x === 50
+                  && pointAt(shared, 50, 50)?.name === 'OK');
+        }
         check('areas survive a save', parseDocument(stringifyDocument(adoc)).points.map(p => `${p.name}:${p.w ?? '-'}`).join() === 'Button:10,Corner:-');
         areas.collection = '/home/me/areas.json';
         adoc.collections = [{ path: '/home/me/areas.json', saved: '' }];

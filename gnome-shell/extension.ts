@@ -177,6 +177,7 @@ export default class MacroclickwerkExtension extends Extension {
         this._storeUnsubscribe = this._store.onChanged((external, changed) => {
             if (external) {
                 this._stopEditedRuns(changed);
+                this._stopSwitchedOffRuns();
             }
             this._forgetDeletedRunners();
             this._popup?.refresh();
@@ -549,6 +550,21 @@ export default class MacroclickwerkExtension extends Extension {
         this._publishRunningPaths();
     }
 
+
+    /** A collection switched off takes its macros out of running — those going now too. */
+    private _stopSwitchedOffRuns(): void {
+        const doc = this._store?.document;
+        const off = this._runningMacros().map(([id]) => this._store?.getMacro(id))
+            .filter((macro): macro is Macro => Boolean(macro && doc && !macroLive(doc, macro)));
+        if (off.length === 0) {
+            return;
+        }
+        this._stopRuns(off.map(macro => macro.id));
+        for (const macro of off) {
+            this._onStatus(`Stopped “${macro.name}” — its collection was switched off`);
+        }
+        this._publishRunningPaths();
+    }
 
     private _forgetDeletedRunners(): void {
         for (const [id, runner] of [...this._runners]) {

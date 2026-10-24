@@ -33,6 +33,7 @@ import {
     collectionUnsaved,
     copyMacro,
     emptyDocument,
+    forgetEmptyCollections,
     livePoints,
     loadCollection,
     macroLive,
@@ -805,10 +806,10 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
             }, 14);
         const widgets: Gtk.Widget[] = [dropdown];
 
-        const nameButton = this._placeNameButton(
+        const nameButton = () => this._placeNameButton(
             () => pointAt(doc, step.x, step.y), () => ({ x: step.x ?? 0, y: step.y ?? 0 }), true);
         if (centre) {
-            widgets.push(nameButton, ...this._spotButtons(null, () => this._showMarker(centre.x, centre.y)));
+            widgets.push(nameButton(), ...this._spotButtons(null, () => this._showMarker(centre.x, centre.y)));
             return widgets;
         }
         const numbers = opts.places.find(place => place.mode === step.mode)?.numbers;
@@ -824,7 +825,7 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
                 step.y = y;
                 this._save();
             });
-            widgets.push(entry, nameButton, ...this._spotButtons({
+            widgets.push(entry, nameButton(), ...this._spotButtons({
                 tooltip: _('Click the spot on the screen: that position lands here'),
                 run: () => this._pickPointInto(({ x, y }) => entry.set_text(`${x}, ${y}`)),
             }, () => {
@@ -1770,8 +1771,9 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
             exclusive.set_icon_name(on ? 'changes-prevent-symbolic' : 'changes-allow-symbolic');
             exclusive.set_tooltip_text(on
                 ? _('One at a time — takes turns with the others that do: acts until a Wait, an On Event, ' +
-                    'a pause or the next round of a Repeat, then lets them go first')
-                : _('Side by side — acts whenever it likes, without waiting for or holding up any other'));
+                    'a pause or the next round of a Repeat, then lets them go first. From its next run')
+                : _('Side by side — acts whenever it likes, without waiting for or holding up any other. ' +
+                    'From its next run'));
         };
         showExclusive();
         exclusive.connect('toggled', () => {
@@ -1791,16 +1793,14 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
             this._save();
         });
         nameRow.add_css_class('macroclickwerk-macro-name');
-        // Moving it up and down, and between collections: built as it opens,
-        // since what there is to move to changes with every load.
+        // Into and out of collections: built as it opens, since what there is
+        // to move to changes with every load.
         const more = this._livePopupButton(new Gtk.MenuButton({
             icon_name: 'view-more-symbolic',
             valign: Gtk.Align.CENTER,
             css_classes: ['flat'],
             tooltip_text: _('Move or copy it to a collection'),
         }), () => this._macroChoices(macro));
-        // The order every line in the editor keeps: what this line is about,
-        // then ▶, then the bin last.
         // Its place in the list, on its line: a step up or down among the
         // macros shown, greyed out at either end.
         const doc = this._store.document;
@@ -1815,6 +1815,8 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
             button.set_sensitive(delta < 0 ? index > 0 : index < shown.length - 1);
             return button;
         };
+        // The order every line in the editor keeps: what this line is about,
+        // then ▶, then the bin last.
         for (const widget of [step(-1), step(1), exclusive, enabled, runButton, stopButton, more, remove]) {
             nameRow.add_suffix(widget);
         }
@@ -3000,6 +3002,7 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
             });
         }
         const intoNew = (copy: boolean) => () => this._chooseFile('save', `${_('Collection')}.json`, path => {
+            forgetEmptyCollections(doc);
             const collections = doc.collections;
             const from = macro.collection;
             const added = copy ? copyMacro(doc, macro.id, path) : null;
@@ -3030,6 +3033,7 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
             this._toast(`“${collectionName(path)}” ${_('is already a collection here — pick another file')}`);
             return;
         }
+        forgetEmptyCollections(doc);
         const macro = newMacro(`Macro ${doc.macros.length + 1}`);
         macro.collection = path;
         doc.macros.push(macro);
@@ -3081,10 +3085,6 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
         }
     }
 
-    /**
-     * Take a collection's macros out of the editor. With unsaved changes it
-     * asks first — save them, throw them away, or leave it loaded.
-     */
     /**
      * A popover listing things to do, each a flat button. The popover goes down
      * before the choice runs: a choice may open a file dialog, minimise the
