@@ -58,8 +58,9 @@ you always see which green you mean.
 A **Start** step starts another macro — or restarts it, if it is already going
 — from the top or from any step you pick. Here a watcher notices the round is
 over, clicks **Restart Match**, and hands over to Auto-ready from the top. A
-**Stop** step ends one. Switch several macros on and **Run** starts them side
-by side, interleaving a step at a time over the one pointer and keyboard.
+**Stop** step ends one. Switch several macros on and **Run** starts them
+together, taking turns: one acts until it reaches a Wait or comes round a
+Repeat, and the other gets its go then.
 
 ### Side-button tricks: hold to sprint, three-shot burst
 
@@ -387,13 +388,25 @@ in the Settings window.
 Each macro has a switch next to its name in the editor, and **Run** starts every
 macro that is switched on — all of them, at the same time. They are independent:
 each keeps its own place in its own steps, and one finishing or failing does not
-touch the others. What they share is the machine, so their steps interleave,
-taking turns at the pointer and keyboard one step each. A step is the unit: a
+touch the others. What they share is the machine, so they take turns at it.
+
+With **One at a time** on — the switch at the top of the Macros page, and the
+default — a macro that has the turn keeps it until it stands still on purpose:
+a **Wait** step, an **On Event** waiting for its button, or a pause — or until
+it comes round a **Repeat**, which gives the others a go after every round.
+Only then does the next one act. The first does not leave its Wait the moment
+the time is up: it carries on once nobody else is acting, so the other always
+finishes what it is doing first. Everything else keeps it: the hold of a click, the ⏰ wait after
+a key, an If asking the model and then clicking on its answer — so "look, then
+click" is never cut in half by another macro clicking somewhere else in
+between. The price is that a macro waiting for the turn waits for as long as
+the other one acts; a long model check in one holds up the rest, an On Event
+reacting to a side button included.
+
+With it off, they act side by side, a step each. A step is still the unit: a
 click at a fixed position holds the pointer for the whole move *and* the click
 at the end of it, so no other macro can land a nudge in the middle and leave it
-clicking somewhere else. Two macros both moving the mouse still take it in turns
-and will end up somewhere neither meant; two watching different corners of the
-screen and clicking different buttons will not.
+clicking somewhere else.
 
 Beside the switch is a **▶** that runs that one macro, on or off, right now —
 and turns into **⏸** while it runs, which is also how the editor shows you which
@@ -562,8 +575,9 @@ rectangle shows the name, and once there are named areas, a dropdown before the
 numbers offers them, with **x,y,w,h** to see the numbers again. A click or move
 can be aimed at a named area too: it lists them with the points, and goes to
 the middle of the rectangle. Picking a named area again — dragging a new
-rectangle — moves the checks over it and the clicks at its middle along with
-it. A name means one place, point or area.
+rectangle, from a check over it — moves the checks over it and the clicks at
+its middle along with it; on a click, the crosshair is greyed out for an area,
+since a click picks a point. A name means one place, point or area.
 
 A model check is one line: the yes/no question, then its area — `x, y, width,
 height`, or empty for the whole screen. **Pick** drops the window out of the way

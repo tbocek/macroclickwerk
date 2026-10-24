@@ -15,7 +15,7 @@ import { Extension } from 'resource:///org/gnome/shell/extensions/extension.js';
 
 import { ConditionEvaluator, type EvaluationTrace } from './src/conditions.js';
 import { DaemonClient } from './src/daemon.js';
-import { MacroRunner, type FinishReason, type RunningStep } from './src/runner.js';
+import { MacroRunner, Turn, type FinishReason, type RunningStep } from './src/runner.js';
 import { Recorder, acceleratorToEvdevCodes } from './src/recorder.js';
 import { MacroStore, type Config } from './src/store.js';
 import { starterMacro } from './src/starter.js';
@@ -77,10 +77,12 @@ export default class MacroclickwerkExtension extends Extension {
     /**
      * One runner per macro, made when that macro first runs and kept afterwards.
      * Several can be going at once — every enabled macro starts together — and
-     * they interleave a step at a time, because there is one pointer, one
-     * keyboard and one daemon between them.
+     * they take turns, because there is one pointer, one keyboard and one
+     * daemon between them: see `Turn`.
      */
     private _runners = new Map<string, MacroRunner>();
+    /** Whose turn it is to act, shared by every runner — see `exclusive-runs`. */
+    private _turn = new Turn();
     /**
      * Macros a `start` step asked for while they were already running, mapped
      * to the step the new run should begin at ('' for the top). A run cannot
@@ -130,6 +132,7 @@ export default class MacroclickwerkExtension extends Extension {
         const config = this._store.config;
         this._daemon = new DaemonClient(config.controlSocket, config.eventSocket);
         this._evaluator = new ConditionEvaluator(config, trace => this._onTrace(trace), flashRegion);
+        this._turn.exclusive = this._settings.get_boolean('exclusive-runs');
         this._recorder = new Recorder(this._daemon, config, {
             onStatus: text => this._onStatus(text),
             onError: error => {
@@ -452,7 +455,7 @@ export default class MacroclickwerkExtension extends Extension {
                 onMacroControl: (action, target, at) => this._macroControl(action, target, at ?? ''),
                 macroName: id => this._store?.getMacro(id)?.name,
                 waitForInput: (source, edge) => this._triggers?.waitFor(source, edge),
-            });
+            }, this._turn);
         this._runners.set(macroId, runner);
         return runner;
     }
@@ -558,8 +561,7 @@ export default class MacroclickwerkExtension extends Extension {
 
     /**
      * The one toggle behind both the shortcut and the popup switch: start every
-     * enabled macro, or pause them. They run alongside each other, taking turns
-     * at the pointer a step at a time.
+     * enabled macro, or pause them. They run together, taking turns — see `Turn`.
      *
      * Pausing is not a suspend — the runs end — but with a single macro it
      * writes down the step it was on, so pressing the shortcut again picks up
@@ -1130,6 +1132,10 @@ export default class MacroclickwerkExtension extends Extension {
         }
         if (key === 'triggers') {
             this._triggers?.setTriggers(parseTriggers(this._settings?.get_string('triggers') ?? '[]'));
+            return;
+        }
+        if (key === 'exclusive-runs') {
+            this._turn.exclusive = this._settings?.get_boolean(key) ?? true;
             return;
         }
         if (key === 'expanded-rows') {

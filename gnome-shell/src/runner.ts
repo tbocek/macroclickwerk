@@ -83,6 +83,59 @@ export interface RunnerCallbacks {
     } | null | undefined;
 }
 
+/**
+ * Whose turn it is to act, when macros run one at a time. A run takes the
+ * turn before each step and holds it through everything the step does — the
+ * hold of a click, the wait after a key, the question an If asks and what it
+ * then clicks — and gives it up only where it stands still on purpose: a Wait
+ * step, an On Event, a pause — and after each round of a Repeat. Whoever asked
+ * next goes then, in the order they asked, and a run that wants the turn back
+ * waits until no one else has it. With `exclusive` off, everyone always has
+ * the turn.
+ */
+export class Turn {
+    private _exclusive = true;
+    private _holder: object | null = null;
+    private _queue: { who: object; go: () => void }[] = [];
+
+    set exclusive(on: boolean) {
+        this._exclusive = on;
+        if (!on) {
+            this._holder = null;
+            this._queue.splice(0).forEach(waiting => waiting.go());
+        }
+    }
+
+    take(who: object): Promise<void> {
+        if (!this._exclusive || this._holder === who) {
+            return Promise.resolve();
+        }
+        if (this._holder === null) {
+            this._holder = who;
+            return Promise.resolve();
+        }
+        return new Promise(go => this._queue.push({ who, go }));
+    }
+
+    /** Stop waiting for the turn — a run that was stopped while it waited. */
+    leave(who: object): void {
+        const queued = this._queue.findIndex(waiting => waiting.who === who);
+        if (queued >= 0) {
+            this._queue.splice(queued, 1)[0].go();
+        }
+    }
+
+    /** Let the next one go, if `who` has the turn; and stop waiting for it. */
+    give(who: object): void {
+        this.leave(who);
+        if (this._holder === who) {
+            const next = this._queue.shift();
+            this._holder = next?.who ?? null;
+            next?.go();
+        }
+    }
+}
+
 // A warp lands exactly, so a couple of passes only cover the pointer being
 // moved between warp and measure — by a hand on the mouse, mostly.
 const MAX_WARP_ITERATIONS = 3;
@@ -179,14 +232,19 @@ export class MacroRunner {
      */
     private _held = new Set<number>();
 
+    /** Shared by every runner when macros take turns; none, and this one never waits for another. */
+    private _turn: Turn | null;
+
     constructor(
         daemon: DaemonClient,
         evaluator: ConditionEvaluator,
         callbacks: RunnerCallbacks = {},
+        turn: Turn | null = null,
     ) {
         this._daemon = daemon;
         this._evaluator = evaluator;
         this._callbacks = callbacks;
+        this._turn = turn;
     }
 
     get running(): boolean {
@@ -231,6 +289,7 @@ export class MacroRunner {
             if (!announced) {
                 announced = true;
                 this._paused = true;
+                this._turn?.give(this);
                 // Not "paused": that word now belongs to the deliberate kind,
                 // the one you continue from. This is the run holding its breath.
                 this._status('Holding — pointer is over the menu');
@@ -299,6 +358,7 @@ export class MacroRunner {
                 });
             }
         } finally {
+            this._turn?.give(this);
             this._running = false;
             this._path = [];
             this._callbacks.onStepsChanged?.([]);
@@ -343,6 +403,7 @@ export class MacroRunner {
                 error: error as Error,
             });
         } finally {
+            this._turn?.give(this);
             this._running = false;
             this._path = [];
             this._callbacks.onStepsChanged?.([]);
@@ -400,6 +461,8 @@ export class MacroRunner {
         if (!abortDaemon) {
             this._cancelled = true;
             this._wakeNow();
+            // Waiting for the turn ends; having it lasts until the run has unwound.
+            this._turn?.leave(this);
             return;
         }
         if (!this._running && !this._cancelled) {
@@ -409,6 +472,7 @@ export class MacroRunner {
         }
         this._cancelled = true;
         this._wakeNow();
+        this._turn?.leave(this);
         void this._daemon.stop().catch(error => {
             // Worth surfacing: this is the request that releases a held key, so
             // failing it can leave a modifier stuck down.
@@ -464,6 +528,10 @@ export class MacroRunner {
         } finally {
             this._holdingBefore = '';
         }
+        if (this._cancelled) {
+            return 'stop';
+        }
+        await this._turn?.take(this);
         if (this._cancelled) {
             return 'stop';
         }
@@ -559,6 +627,11 @@ export class MacroRunner {
                     if (signal === 'stop') {
                         return 'stop';
                     }
+                    // Each round is a yield: whoever is waiting for the turn
+                    // goes now, and the next round takes it back after them.
+                    // A repeat with no Wait in it would otherwise keep it for
+                    // good.
+                    this._turn?.give(this);
                     // Yield to the main loop so a body with no waits in it cannot
                     // starve the compositor.
                     await this._sleep(0);
@@ -965,6 +1038,8 @@ export class MacroRunner {
     }
 
     private async _doWait(step: WaitStep): Promise<void> {
+        // Standing still on purpose: someone else's turn.
+        this._turn?.give(this);
         const jitter = Math.max(0, step.jitterMs ?? 0);
         const offset = jitter > 0 ? (Math.random() * 2 - 1) * jitter : 0;
         await this._sleep(Math.max(0, Math.round(step.ms + offset)));
@@ -979,6 +1054,7 @@ export class MacroRunner {
             throw new Error(`“${step.source}” names no button or key`);
         }
         this._status(`Waiting until ${prettySource(step.source, step.edge)}`);
+        this._turn?.give(this);
         this._waitCancel = wait.cancel;
         try {
             // Resolves null when cancelled — a stopped run, not a failure; the

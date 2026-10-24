@@ -4,7 +4,7 @@
 
 import GLib from 'gi://GLib';
 
-import { MacroRunner } from '../dist/src/runner.js';
+import { MacroRunner, Turn } from '../dist/src/runner.js';
 import { followsEvent, moveStepTo, newMacro, newStep, pathToStep } from '../dist/src/model.js';
 import { BUTTON_CODES } from '../dist/src/keymap.js';
 import { clearProblems, listProblems } from '../dist/src/problems.js';
@@ -200,6 +200,80 @@ check('pathToStep of a missing step is empty', pathToStep(flat.body, 'gone').len
     check('both macros ran', order.filter(n => n === 'a').length === 3 &&
           order.filter(n => n === 'b').length === 3, order.join(''));
     check('and their steps interleaved', order.join('') !== 'aaabbb', order.join(''));
+}
+
+// --- one at a time --------------------------------------------------------
+
+// With a shared turn, a macro acts until it stands still on purpose — a Wait
+// step — and only then does another get in. The wait after a key is not that.
+{
+    const shared = {
+        play: async () => { await null; return { aborted: false }; },
+        stop: async () => {},
+    };
+    const trace = [];
+    const step = (kind, label, fields = {}) => {
+        const made = Object.assign(newStep(kind), fields);
+        if (label) NAMES.set(made.id, label);
+        return made;
+    };
+    const macro = (name, body) => Object.assign(newMacro(name), { body });
+    const runner = turn => new MacroRunner(shared, evaluator, {
+        onStepsChanged: path => {
+            const label = path.length > 0 ? NAMES.get(path[path.length - 1].id) : undefined;
+            if (label) trace.push(label);
+        },
+    }, turn);
+    const a = () => macro('a', [step('key', 'a1', { code: 'KEY_A' }), step('wait', null, { ms: 40 }), step('key', 'a2', { code: 'KEY_A' })]);
+    const b = () => macro('b', [step('key', 'b1', { code: 'KEY_B', afterMs: 40 }), step('key', 'b2', { code: 'KEY_B' })]);
+
+    const turn = new Turn();
+    await Promise.all([runner(turn).run(a()), runner(turn).run(b())]);
+    check('one at a time: the other acts only in a Wait step', trace.join() === 'a1,b1,b2,a2', trace.join());
+
+    trace.length = 0;
+    await Promise.all([runner(turn).run(b()), runner(turn).run(a())]);
+    check('…and the wait after a key keeps the turn', trace.join() === 'b1,b2,a1,a2', trace.join());
+
+    trace.length = 0;
+    const loose = new Turn();
+    loose.exclusive = false;
+    await Promise.all([runner(loose).run(b()), runner(loose).run(a())]);
+    check('switched off, they act side by side', trace.join().startsWith('b1,a1'), trace.join());
+
+    // A Wait lets the other in, but ends only once the other gives the turn
+    // up: here b's ten keys all go before a2, though a waited only 1 ms.
+    trace.length = 0;
+    const tenKeys = macro('b', Array.from({ length: 10 }, (_, i) => step('key', `b${i}`, { code: 'KEY_B' })));
+    const quick = macro('a', [step('key', 'a1', { code: 'KEY_A' }), step('wait', null, { ms: 1 }), step('key', 'a2', { code: 'KEY_A' })]);
+    await Promise.all([runner(turn).run(quick), runner(turn).run(tenKeys)]);
+    check('a Wait ends only when the other has given the turn up', trace.join() === `a1,${tenKeys.body.map((_, i) => `b${i}`).join()},a2`, trace.join());
+
+    // Each round of a Repeat is a yield too.
+    trace.length = 0;
+    const rounds = (name, count) => macro(name, [step('loop', null, { count, body: [step('key', name, { code: 'KEY_A' })] })]);
+    await Promise.all([runner(turn).run(rounds('x', 3)), runner(turn).run(rounds('y', 3))]);
+    check('each round of a Repeat lets the other in', trace.join() === 'x,y,x,y,x,y', trace.join());
+
+    // A run stopped while it waits for the turn unwinds, and does not act.
+    trace.length = 0;
+    const holder = runner(turn), waiter = runner(turn);
+    const first = holder.run(b());
+    const second = waiter.run(macro('c', [step('key', 'c1', { code: 'KEY_C' })]));
+    waiter.stop(false);
+    await Promise.all([first, second]);
+    check('a run stopped while waiting for its turn never acts', trace.join() === 'b1,b2', trace.join());
+
+    // Switching it off mid-run lets the waiting one go at once.
+    trace.length = 0;
+    const late = runner(turn);
+    const going = runner(turn).run(b());
+    const queued = late.run(macro('d', [step('key', 'd1', { code: 'KEY_D' })]));
+    await until(() => trace.includes('b1'));
+    turn.exclusive = false;
+    await Promise.all([going, queued]);
+    check('switching it off lets the waiting one in', trace.indexOf('d1') < trace.indexOf('b2'), trace.join());
+    turn.exclusive = true;
 }
 
 // --- and one macro's walk to a coordinate is not cut into ------------------

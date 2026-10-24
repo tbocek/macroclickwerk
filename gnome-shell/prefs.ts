@@ -805,7 +805,7 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
         const widgets: Gtk.Widget[] = [dropdown];
 
         const nameButton = this._placeNameButton(
-            () => pointAt(doc, step.x, step.y), () => ({ x: step.x ?? 0, y: step.y ?? 0 }));
+            () => pointAt(doc, step.x, step.y), () => ({ x: step.x ?? 0, y: step.y ?? 0 }), true);
         if (centre) {
             widgets.push(nameButton, ...this._spotButtons(null, () => this._showMarker(centre.x, centre.y)));
             return widgets;
@@ -843,8 +843,14 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
      *
      * `named` is the named place this field is at, if any; `place` what naming
      * it would name — read when the popup opens, from the numbers as they are.
+     * A spot field is no place to pick an area again: there the target is
+     * greyed out for an area, which is picked again from a check over it.
      */
-    private _placeNameButton(named: () => NamedPoint | undefined, place: () => Place | null): Gtk.MenuButton {
+    private _placeNameButton(
+        named: () => NamedPoint | undefined,
+        place: () => Place | null,
+        spot = false,
+    ): Gtk.MenuButton {
         const doc = this._store.document;
         const entry = new Gtk.Entry({ placeholder_text: _('Name this place'), width_chars: 14 });
         const trash = iconButton('user-trash-symbolic', _('Forget this name — everything keeps its coordinates'), () => {
@@ -895,6 +901,11 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
             ok.set_visible(nameable);
             trash.set_visible(point !== undefined);
             target.set_visible(point !== undefined);
+            const fromArea = spot && point?.w !== undefined;
+            target.set_sensitive(!fromArea);
+            target.set_tooltip_text(fromArea
+                ? _('The middle of an area — pick the area again from a check over it')
+                : _('Pick it again on the screen: everything aimed at it moves there'));
             entry.grab_focus();
         });
         popover.connect('closed', () => {
@@ -1251,6 +1262,19 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
             this._rebuildMacros();
         });
         const headerButtons = new Gtk.Box({ spacing: 6, valign: Gtk.Align.CENTER });
+        // Whether macros running together take turns. Bound, not read once:
+        // it is the shell that acts on it, and it does so as soon as it flips.
+        const oneAtATime = new Gtk.Box({
+            spacing: 6,
+            margin_end: 6,
+            tooltip_text: _('One macro acts at a time: another gets its turn only while this one is in a Wait step, ' +
+                'an On Event or a pause — not in the wait after a click or a key. Off: they act side by side'),
+        });
+        const exclusive = new Gtk.Switch({ valign: Gtk.Align.CENTER });
+        this._settings.bind('exclusive-runs', exclusive, 'active', Gio.SettingsBindFlags.DEFAULT);
+        oneAtATime.append(new Gtk.Label({ label: _('One at a time') }));
+        oneAtATime.append(exclusive);
+        headerButtons.append(oneAtATime);
         headerButtons.append(this._livePopupButton(new Gtk.MenuButton({
             label: _('Collections'),
             valign: Gtk.Align.CENTER,
