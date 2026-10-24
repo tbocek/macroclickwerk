@@ -302,24 +302,30 @@ export interface MacroDocument {
     version: number;
     macros: Macro[];
     /**
-     * The collections loaded, in the order they were loaded. Kept apart from
-     * the macros so a collection stays loaded while it is empty — just made,
-     * or with everything moved out of it.
+     * The collections loaded, in the order they were loaded, with what each
+     * held when last loaded or saved.
      */
     collections?: CollectionRef[];
     /**
-     * Names for places on the screen. A click or move aimed at the very
-     * coordinates of one shows its name — the name belongs to the coordinates,
-     * not to any step, so every step at that spot shares it.
+     * Names for places on the screen: points, and areas. The name belongs to
+     * the coordinates, not to any step, so everything aimed there shares it —
+     * a click or move at a point, or at the middle of an area, and a check
+     * over exactly that area.
      */
     points?: NamedPoint[];
 }
 
+/** A named point — or a named area, when it has a size. */
 export interface NamedPoint {
     name: string;
     x: number;
     y: number;
+    w?: number;
+    h?: number;
 }
+
+/** A place to name: a point, or an area with its size. */
+export type Place = Omit<NamedPoint, 'name'>;
 
 /** A loaded collection: its file, and what it held when last loaded or saved. */
 export interface CollectionRef {
@@ -484,10 +490,10 @@ export function loadCollection(doc: MacroDocument, path: string, text: string): 
     let asInFile = true;
     for (const point of file.points ?? []) {
         const points = doc.points ?? [];
-        const clash = points.find(p => p.name === point.name || (p.x === point.x && p.y === point.y));
+        const clash = points.find(p => p.name === point.name || samePlace(p, point));
         if (!clash) {
             doc.points = [...points, point];
-        } else if (clash.name !== point.name || clash.x !== point.x || clash.y !== point.y) {
+        } else if (clash.name !== point.name || !samePlace(clash, point)) {
             asInFile = false;
         }
     }
@@ -562,50 +568,140 @@ export function copyMacro(doc: MacroDocument, id: string, collection?: string): 
 
 // --- named points -------------------------------------------------------------
 
-/** The stored points, tolerantly: each needs a name and two numbers; first of a name or a spot wins. */
+/** Whether two places are the same: the same point, or the same area. */
+function samePlace(a: Place, b: Place): boolean {
+    return a.x === b.x && a.y === b.y && a.w === b.w && a.h === b.h;
+}
+
+/** Where a click aimed at a place lands: the point, or the middle of the area. */
+export function placeCentre(place: Place): { x: number; y: number } {
+    return place.w === undefined || place.h === undefined
+        ? { x: place.x, y: place.y }
+        : { x: place.x + Math.floor(place.w / 2), y: place.y + Math.floor(place.h / 2) };
+}
+
+/** The stored points and areas, tolerantly; first of a name or a place wins. */
 function cleanPoints(raw: unknown): NamedPoint[] {
     const points: NamedPoint[] = [];
     for (const point of Array.isArray(raw) ? raw : []) {
-        const { name, x, y } = (point ?? {}) as Partial<NamedPoint>;
-        if (typeof name === 'string' && name.trim() !== '' && Number.isFinite(x) && Number.isFinite(y) &&
-            !points.some(p => p.name === name.trim() || (p.x === x && p.y === y))) {
-            points.push({ name: name.trim(), x: x!, y: y! });
+        const { name, x, y, w, h } = (point ?? {}) as Partial<NamedPoint>;
+        const area = Number.isFinite(w) && Number.isFinite(h) && w! > 0 && h! > 0;
+        const place: NamedPoint = { name: (name ?? '').trim(), x: x!, y: y!, ...(area ? { w, h } : {}) };
+        if (typeof name === 'string' && place.name !== '' && Number.isFinite(x) && Number.isFinite(y) &&
+            !points.some(p => p.name === place.name || samePlace(p, place))) {
+            points.push(place);
         }
     }
     return points;
 }
 
-/** The named point at exactly these coordinates, if there is one. */
+/** The named place a click or move at x, y is aimed at: a point there, or an area with its middle there. */
 export function pointAt(doc: MacroDocument, x: number | undefined, y: number | undefined): NamedPoint | undefined {
-    return (doc.points ?? []).find(point => point.x === x && point.y === y);
+    const points = doc.points ?? [];
+    return points.find(point => point.w === undefined && point.x === x && point.y === y)
+        ?? points.find(point => point.w !== undefined && placeCentre(point).x === x && placeCentre(point).y === y);
+}
+
+/** The named area that is exactly this one, if there is one. */
+export function areaAt(doc: MacroDocument, area: Region | null | undefined): NamedPoint | undefined {
+    return area ? (doc.points ?? []).find(point => point.w !== undefined && samePlace(point, area)) : undefined;
 }
 
 /**
- * Name the spot at x, y. A spot that has a name already is renamed; an empty
- * name takes the name away. Returns why not, when a name is already used for
- * another spot — a name means one place.
+ * Name a place. One that has a name already is renamed; an empty name takes
+ * the name away. Returns why not, when the name is already another place's —
+ * a name means one place.
  */
-export function namePoint(doc: MacroDocument, x: number, y: number, name: string): string | null {
+export function namePlace(doc: MacroDocument, place: Place, name: string): string | null {
     const wanted = name.trim();
     const points = doc.points ?? [];
-    const here = points.find(point => point.x === x && point.y === y);
+    const here = points.find(point => samePlace(point, place));
     if (wanted === '') {
         doc.points = points.filter(point => point !== here);
         return null;
     }
     if (points.some(point => point.name === wanted && point !== here)) {
-        return `“${wanted}” is already another point`;
+        return `“${wanted}” is already another place`;
     }
     if (here) {
         here.name = wanted;
     } else {
-        doc.points = [...points, { name: wanted, x, y }];
+        const { x, y, w, h } = place;
+        doc.points = [...points, { name: wanted, x, y, ...(w !== undefined && h !== undefined ? { w, h } : {}) }];
+    }
+    return null;
+}
+
+/** The areas the checks of a condition look at, as the objects that hold them. */
+function conditionAreas(cond: Condition | null | undefined): Region[] {
+    if (!cond) {
+        return [];
+    }
+    switch (cond.type) {
+        case 'llm':
+            return cond.region ? [cond.region] : [];
+        case 'color':
+            return [cond];
+        case 'and':
+        case 'or':
+            return cond.of.flatMap(conditionAreas);
+        case 'not':
+            return conditionAreas(cond.of);
+        default:
+            return [];
+    }
+}
+
+/** Every click and move aimed at x, y, and every area a check looks at, in these macros. */
+function eachAim(macros: Macro[], onSpot: (step: { x?: number; y?: number }) => void, onArea: (area: Region) => void): void {
+    for (const macro of macros) {
+        walk(macro.body, ({ step }) => {
+            if ((step.kind === 'click' || step.kind === 'move') && step.mode === 'abs') {
+                onSpot(step);
+            } else if (step.kind === 'if') {
+                conditionAreas(step.cond).forEach(onArea);
+            }
+        });
+    }
+}
+
+/**
+ * Move a named place, and everything aimed at it along with it — a click or
+ * move at the point or the middle of the area, a check over the area — in
+ * every macro, switched off or not, since the name is the place and nothing
+ * should be left at the old one. Returns why not, when another name already
+ * has that place.
+ */
+export function movePoint(doc: MacroDocument, name: string, to: Place): string | null {
+    const point = (doc.points ?? []).find(each => each.name === name);
+    if (!point) {
+        return `there is no place “${name}”`;
+    }
+    const there = (doc.points ?? []).find(each => samePlace(each, to));
+    if (there && there !== point) {
+        return `that place is already “${there.name}”`;
+    }
+    const from = placeCentre(point);
+    const centre = placeCentre(to);
+    eachAim(doc.macros, step => {
+        if (step.x === from.x && step.y === from.y) {
+            step.x = centre.x;
+            step.y = centre.y;
+        }
+    }, area => {
+        if (point.w !== undefined && to.w !== undefined && to.h !== undefined && samePlace(area, point)) {
+            Object.assign(area, { x: to.x, y: to.y, w: to.w, h: to.h });
+        }
+    });
+    Object.assign(point, { x: to.x, y: to.y });
+    if (point.w !== undefined) {
+        Object.assign(point, { w: to.w, h: to.h });
     }
     return null;
 }
 
 /**
- * The named points to offer: all but those only macros of a collection
+ * The named places to offer: all but those only macros of a collection
  * switched off are aimed at — they are its names, and go with it.
  */
 export function livePoints(doc: MacroDocument): NamedPoint[] {
@@ -614,19 +710,10 @@ export function livePoints(doc: MacroDocument): NamedPoint[] {
     return (doc.points ?? []).filter(point => !off.includes(point) || on.includes(point));
 }
 
-/** The named points that clicks and moves in these macros are aimed at. */
+/** The named places that clicks, moves and checks in these macros are aimed at. */
 function pointsUsedBy(doc: MacroDocument, macros: Macro[]): NamedPoint[] {
-    const used = new Set<NamedPoint>();
-    for (const macro of macros) {
-        walk(macro.body, ({ step }) => {
-            if ((step.kind === 'click' || step.kind === 'move') && step.mode === 'abs') {
-                const point = pointAt(doc, step.x, step.y);
-                if (point) {
-                    used.add(point);
-                }
-            }
-        });
-    }
+    const used = new Set<NamedPoint | undefined>();
+    eachAim(macros, step => used.add(pointAt(doc, step.x, step.y)), area => used.add(areaAt(doc, area)));
     return (doc.points ?? []).filter(point => used.has(point));
 }
 
@@ -1424,7 +1511,8 @@ function truncate(text: string, max = 42): string {
     return clean.length > max ? `${clean.slice(0, max - 1)}…` : clean;
 }
 
-export function describeCondition(cond: Condition | null | undefined): string {
+/** With `doc`, an area that has a name is called by it. */
+export function describeCondition(cond: Condition | null | undefined, doc?: MacroDocument): string {
     if (!cond) {
         return 'always';
     }
@@ -1435,16 +1523,19 @@ export function describeCondition(cond: Condition | null | undefined): string {
             return 'never';
         case 'llm':
             return `LLM: "${truncate(cond.prompt)}"`;
-        case 'color':
-            return cond.w * cond.h === 1
-                ? `pixel ${cond.x},${cond.y} ≈ ${cond.color} ±${cond.tolerance}`
-                : `avg of ${cond.w}×${cond.h} @ ${cond.x},${cond.y} ≈ ${cond.color} ±${cond.tolerance}`;
+        case 'color': {
+            const name = doc && areaAt(doc, cond)?.name;
+            const where = cond.w * cond.h === 1
+                ? `pixel ${name ?? `${cond.x},${cond.y}`}`
+                : `avg of ${name ?? `${cond.w}×${cond.h} @ ${cond.x},${cond.y}`}`;
+            return `${where} ≈ ${cond.color} ±${cond.tolerance}`;
+        }
         case 'and':
-            return cond.of.length ? cond.of.map(describeCondition).join(' and ') : 'always';
+            return cond.of.length ? cond.of.map(each => describeCondition(each, doc)).join(' and ') : 'always';
         case 'or':
-            return cond.of.length ? cond.of.map(describeCondition).join(' or ') : 'never';
+            return cond.of.length ? cond.of.map(each => describeCondition(each, doc)).join(' or ') : 'never';
         case 'not':
-            return `not (${describeCondition(cond.of)})`;
+            return `not (${describeCondition(cond.of, doc)})`;
     }
 }
 
@@ -1494,17 +1585,21 @@ export function describeStep(
     step: Step,
     macroName?: (id: string) => string | undefined,
     stepLabel?: (stepId: string) => string | undefined,
+    doc?: MacroDocument,
 ): string {
     const after = (step as ThenWait).afterMs;
-    const action = describeAction(step, macroName, stepLabel);
+    const action = describeAction(step, macroName, stepLabel, doc);
     return after && after > 0 ? `${action}, then wait ${formatMs(after)}` : action;
 }
 
+/** With `doc`, a place that has a name is called by it. */
 function describeAction(
     step: Step,
     macroName?: (id: string) => string | undefined,
     stepLabel?: (stepId: string) => string | undefined,
+    doc?: MacroDocument,
 ): string {
+    const spot = (x = 0, y = 0) => (doc && pointAt(doc, x, y)?.name) ?? `${x},${y}`;
     switch (step.kind) {
         case 'click': {
             // Absent is the follow, and a follow reads as the plain word: what
@@ -1517,11 +1612,11 @@ function describeAction(
             // `pressVerb`.
             const verb = step.action === 'down' ? 'Press'
                 : step.action === 'up' ? 'Release' : 'Click';
-            return step.mode === 'abs' ? `${verb} ${step.button} @ ${step.x ?? 0},${step.y ?? 0}`
+            return step.mode === 'abs' ? `${verb} ${step.button} @ ${spot(step.x, step.y)}`
                 : `${verb} ${step.button} at pointer`;
         }
         case 'move':
-            return step.mode === 'abs' ? `Move to ${step.x ?? 0},${step.y ?? 0}`
+            return step.mode === 'abs' ? `Move to ${spot(step.x, step.y)}`
                 : `Move by ${step.dx ?? 0},${step.dy ?? 0}`;
         case 'scroll':
             return `Scroll ${step.dx ? `${step.dx} horizontally` : ''}${step.dx && step.dy ? ', ' : ''}${step.dy ? `${step.dy} vertically` : ''}`.trim() || 'Scroll';
@@ -1542,7 +1637,7 @@ function describeAction(
         case 'loop':
             return step.count === 'forever' ? 'Repeat forever' : `Repeat ${step.count}×`;
         case 'if':
-            return `If ${describeCondition(step.cond)}`;
+            return `If ${describeCondition(step.cond, doc)}`;
         case 'break':
             return 'Break out of the loop';
         case 'continue':

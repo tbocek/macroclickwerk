@@ -32,11 +32,12 @@ Every step is one line in the editor, and everything about it is on that line.
 The screenshot above is the macro this was built for. A Repeat asks the model,
 once a second, whether the Ready button is green; when it is, the Mouse step
 clicks it and waits three seconds, give or take half a second. The question
-names an area — `938, 414, 194, 82` — so the model looks at the button and not
-at the whole screen, and a green outline flashes over that area every time the
-check runs, so you can watch it look where you meant. The click is aimed at
-**Ready** — a named point, the button's coordinates under a name — and the
-macro lives in the *Tower defense* collection, a file of its own. On the click,
+looks at **Ready** — a named area, the button's rectangle under a name — so the
+model looks at the button and not at the whole screen, and a green outline
+flashes over that area every time the check runs, so you can watch it look
+where you meant. The click is aimed at **Ready** too, which for a click is the
+middle of the area. The macro lives in the *Tower defense* collection, a file
+of its own. On the click,
 **↓ 20ms** is how long the button is held down, and **⏰ 50ms** is the game's
 turn: the next step waits until the game has had a frame to register the click.
 
@@ -142,9 +143,10 @@ goes to the On Event, not to the shortcut list.
   running, and a way into the settings.
 - **Emergency stop** that aborts mid-macro and releases every held key; a
   stopped or paused macro also lets go of whatever it was holding down.
-- **Named points** — give a spot on the screen a name, and every click or
-  move aimed at it says the name instead of the numbers; other steps pick it
-  from the same list.
+- **Named points and areas** — give a spot or a rectangle on the screen a
+  name, and everything aimed at it says the name instead of the numbers; other
+  steps and checks pick it from a list, a click at an area goes to its middle,
+  and picking the place again moves everything aimed at it.
 - **Collections** — keep macros in files of their own, one per game, saved
   and loaded alongside the rest, and switched on and off as one; a ⋯ on each
   macro moves or copies it into one, or up and down the list.
@@ -545,12 +547,23 @@ being a place, so **Pick** and **Show**, which are about a spot on the screen,
 go instead.
 
 The **▾** after a spot names it: type a name — "Ready", "Shop" — and press
-Enter. The name belongs to the spot, not to the step, so every click or move
-aimed at those exact coordinates shows the name in its dropdown instead of the
-numbers, and every other one lists it next to x,y to pick. Choosing **x,y** on
-a named step shows its numbers again, to change them; a step moved off the
-spot stops showing the name. The trash in the same popup forgets the name, and
-the steps keep their coordinates.
+**OK** or Enter. The name belongs to the spot, not to the step, so every click
+or move aimed at those exact coordinates shows the name in its dropdown instead
+of the numbers, and every other one lists it next to x,y to pick. Choosing
+**x,y** on a named step shows its numbers again, to change them; a step moved
+off the spot stops showing the name. The target in the same popup moves the
+point: click the new spot on the screen, and every step aimed at it moves there
+too — when a button moves, one pick fixes every macro that clicks it. The trash
+forgets the name, and the steps keep their coordinates.
+
+An area — the rectangle a model check or a colour check looks at — is named the
+same way, with the **▾** after its numbers. Every check over exactly that
+rectangle shows the name, and once there are named areas, a dropdown before the
+numbers offers them, with **x,y,w,h** to see the numbers again. A click or move
+can be aimed at a named area too: it lists them with the points, and goes to
+the middle of the rectangle. Picking a named area again — dragging a new
+rectangle — moves the checks over it and the clicks at its middle along with
+it. A name means one place, point or area.
 
 A model check is one line: the yes/no question, then its area — `x, y, width,
 height`, or empty for the whole screen. **Pick** drops the window out of the way
@@ -612,16 +625,18 @@ have. Importing settings skips anything the schema does not know or will not
 take, and says which keys it ignored.
 
 **Collections**, beside Export, keep macros in files of their own — the macros
-for one game, say — loaded next to the ones you have. Each has a switch in the
+for one game, say — loaded next to the ones you have. **New collection…** makes
+one: a file you name, with a first macro in it to record into; **Load
+collection…** brings one in, or any export of macros. Each has a switch in the
 menu: off puts its macros away — out of the editor, out of Run, and a shortcut
 or a Start aimed at one says the collection is off — and on brings them back,
-nothing forgotten in between. Its named points come and go with it. A macro
+nothing forgotten in between. Its named points and areas come and go with it. A macro
 from a collection says so above its name, and the ⋯ on every macro moves it up
 or down, moves or copies it into a collection or a new one, or takes it out of
 the one it is in; a collection left with no macros is gone. **Save** writes a
 collection back to its file, marked with a • while it has changes that are not
 in the file yet; **Save as** writes it somewhere else and keeps working on that
-one. A collection file is just the macros and the named points they use, so it
+one. A collection file is just the macros and the named points and areas they use, so it
 is also how macros are shared.
 
 ### Daemon HTTP API

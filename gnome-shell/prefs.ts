@@ -40,8 +40,13 @@ import {
     collectionOn,
     markCollectionSaved,
     moveMacro,
-    namePoint,
+    areaAt,
+    movePoint,
+    namePlace,
+    placeCentre,
     pointAt,
+    type NamedPoint,
+    type Place,
     renameCollection,
     findStep,
     eventFollows,
@@ -701,9 +706,9 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
     // Drag state: the row currently painted as the drop spot, and the folded
     // container a hovering drag is about to spring open.
     private _dropHighlight: Gtk.Widget | null = null;
-    // Steps at a named point whose numbers were asked for with x,y — for this
-    // window only, since by the coordinates alone they are still the point.
-    private _showNumbers = new Set<string>();
+    // Steps and checks at a named place whose numbers were asked for — for
+    // this window only, since by the coordinates alone they are still the place.
+    private _showNumbers = new WeakSet<object>();
     private _springId = 0;
     private _springRow: Adw.ExpanderRow | null = null;
 
@@ -777,30 +782,32 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
         for (const point of points) {
             labels[`point:${point.name}`] = point.name;
         }
-        const named = step.mode === spot && !this._showNumbers.has(step.id)
+        const named = step.mode === spot && !this._showNumbers.has(step)
             ? pointAt(doc, step.x, step.y) : undefined;
+        // An area is aimed at its middle.
+        const centre = named ? placeCentre(named) : undefined;
         const dropdown = chooser(
             [...opts.places.map(place => place.mode as string), ...points.map(point => `point:${point.name}`)],
             labels, named ? `point:${named.name}` : step.mode,
-            named ? `${_('Where this acts')}: ${named.x}, ${named.y}` : _('Where this acts'),
+            centre ? `${_('Where this acts')}: ${centre.x}, ${centre.y}` : _('Where this acts'),
             value => {
                 const point = points.find(p => `point:${p.name}` === value);
                 if (point) {
                     step.mode = spot;
-                    step.x = point.x;
-                    step.y = point.y;
-                    this._showNumbers.delete(step.id);
+                    Object.assign(step, placeCentre(point));
+                    this._showNumbers.delete(step);
                 } else {
                     step.mode = value as M;
-                    this._showNumbers.add(step.id); // only matters at x,y
+                    this._showNumbers.add(step); // only matters at x,y
                 }
                 this._saveAndRebuild();
             }, 14);
         const widgets: Gtk.Widget[] = [dropdown];
 
-        if (named) {
-            widgets.push(this._pointNameButton(step), ...this._spotButtons(null,
-                () => this._showMarker(named.x, named.y)));
+        const nameButton = this._placeNameButton(
+            () => pointAt(doc, step.x, step.y), () => ({ x: step.x ?? 0, y: step.y ?? 0 }));
+        if (centre) {
+            widgets.push(nameButton, ...this._spotButtons(null, () => this._showMarker(centre.x, centre.y)));
             return widgets;
         }
         const numbers = opts.places.find(place => place.mode === step.mode)?.numbers;
@@ -816,7 +823,7 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
                 step.y = y;
                 this._save();
             });
-            widgets.push(entry, this._pointNameButton(step), ...this._spotButtons({
+            widgets.push(entry, nameButton, ...this._spotButtons({
                 tooltip: _('Click the spot on the screen: that position lands here'),
                 run: () => this._pickPointInto(({ x, y }) => entry.set_text(`${x}, ${y}`)),
             }, () => {
@@ -828,42 +835,76 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
     }
 
     /**
-     * The ▾ after a spot: a name for it, so other steps can pick it from the
-     * list. The name belongs to the coordinates — every step aimed at the same
-     * spot shows it — and the trash takes it away again, leaving the numbers.
+     * The ▾ after a spot or an area: a name for it, so other steps and checks
+     * can pick it from their list. The name belongs to the coordinates —
+     * everything aimed at the same place shows it. The target moves the place,
+     * and everything aimed at it with it; the trash takes the name away again,
+     * leaving the numbers.
+     *
+     * `named` is the named place this field is at, if any; `place` what naming
+     * it would name — read when the popup opens, from the numbers as they are.
      */
-    private _pointNameButton(step: { x?: number; y?: number }): Gtk.MenuButton {
+    private _placeNameButton(named: () => NamedPoint | undefined, place: () => Place | null): Gtk.MenuButton {
         const doc = this._store.document;
-        const entry = new Gtk.Entry({ placeholder_text: _('Name this point'), width_chars: 14 });
-        const trash = iconButton('user-trash-symbolic', _('Forget this name — the steps keep their coordinates'), () => {
+        const entry = new Gtk.Entry({ placeholder_text: _('Name this place'), width_chars: 14 });
+        const trash = iconButton('user-trash-symbolic', _('Forget this name — everything keeps its coordinates'), () => {
             entry.set_text('');
             button.popdown();
         });
+        const ok = new Gtk.Button({ label: _('OK'), css_classes: ['suggested-action'], tooltip_text: _('Save the name') });
+        ok.connect('clicked', () => button.popdown());
+        const moved = (point: NamedPoint) => (to: Place) => {
+            const problem = movePoint(doc, point.name, to);
+            if (problem) {
+                this._toast(problem);
+            } else {
+                this._saveAndRebuild();
+            }
+        };
+        const target = iconButton('find-location-symbolic',
+            _('Pick it again on the screen: everything aimed at it moves there'), () => {
+                const point = named();
+                button.popdown();
+                if (point?.w !== undefined) {
+                    this._pickRegionInto(moved(point));
+                } else if (point) {
+                    this._pickPointInto(moved(point));
+                }
+            });
         const box = new Gtk.Box({ spacing: 6, margin_top: 6, margin_bottom: 6, margin_start: 6, margin_end: 6 });
         box.append(entry);
+        box.append(ok);
+        box.append(target);
         box.append(trash);
         const popover = new Gtk.Popover({ child: box });
         const button = new Gtk.MenuButton({
             icon_name: 'pan-down-symbolic',
-            tooltip_text: _('Name this point'),
+            tooltip_text: _('Name this place'),
             valign: Gtk.Align.CENTER,
             popover,
         });
         button.add_css_class('flat');
-        // Filled in on opening, from the numbers as they are by then, and
-        // taken however it closes — Enter, a click elsewhere, the trash.
+        // Taken however it closes — OK, Enter, a click elsewhere, the trash.
         popover.connect('show', () => {
-            const point = pointAt(doc, step.x, step.y);
+            const point = named();
             entry.set_text(point?.name ?? '');
+            // The whole screen is no place to name.
+            const nameable = point !== undefined || place() !== null;
+            entry.set_sensitive(nameable);
+            entry.set_placeholder_text(nameable ? _('Name this place') : _('Pick an area first'));
+            ok.set_visible(nameable);
             trash.set_visible(point !== undefined);
+            target.set_visible(point !== undefined);
             entry.grab_focus();
         });
         popover.connect('closed', () => {
             const name = (entry.get_text() ?? '').trim();
-            if (name === (pointAt(doc, step.x, step.y)?.name ?? '')) {
+            const point = named();
+            const where = point ?? place();
+            if (name === (point?.name ?? '') || !where) {
                 return;
             }
-            const problem = namePoint(doc, step.x ?? 0, step.y ?? 0, name);
+            const problem = namePlace(doc, where, name);
             if (problem) {
                 this._toast(problem);
             } else {
@@ -872,6 +913,50 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
         });
         entry.connect('activate', () => button.popdown());
         return button;
+    }
+
+    /**
+     * Where a check looks, when there are named areas to choose from: a
+     * dropdown of them, before the numbers. A check over exactly a named area
+     * shows its name instead of its numbers — until x,y,w,h is picked to see
+     * and change them. The ▾ to name the area comes after the numbers' field,
+     * `numbers[0]`; the rest of `numbers` are its buttons.
+     */
+    private _areaControls(
+        holder: object,
+        area: () => Region | null,
+        set: (area: Region) => void,
+        numbers: Gtk.Widget[],
+    ): Gtk.Widget[] {
+        const doc = this._store.document;
+        const nameButton = this._placeNameButton(() => areaAt(doc, area()), area);
+        const named = this._showNumbers.has(holder) ? undefined : areaAt(doc, area());
+        const areas = livePoints(doc).filter(point => point.w !== undefined);
+        if (areas.length === 0) {
+            return [numbers[0], nameButton, ...numbers.slice(1)];
+        }
+        const labels: Record<string, string> = { '': _('x,y,w,h') };
+        for (const each of areas) {
+            labels[`area:${each.name}`] = each.name;
+        }
+        const dropdown = chooser(['', ...areas.map(each => `area:${each.name}`)], labels,
+            named ? `area:${named.name}` : '',
+            named ? `${_('Where this looks')}: ${named.x}, ${named.y}, ${named.w}, ${named.h}` : _('Where this looks'),
+            value => {
+                const chosen = areas.find(each => `area:${each.name}` === value);
+                if (chosen) {
+                    set({ x: chosen.x, y: chosen.y, w: chosen.w!, h: chosen.h! });
+                    this._showNumbers.delete(holder);
+                } else {
+                    this._showNumbers.add(holder);
+                }
+                this._saveAndRebuild();
+            }, 14);
+        if (named) {
+            return [dropdown, nameButton, ...this._spotButtons(null,
+                () => this._showMarker(named.x, named.y, named.w, named.h))];
+        }
+        return [dropdown, numbers[0], nameButton, ...numbers.slice(1)];
     }
 
     /**
@@ -1709,15 +1794,16 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
      * through which one the caller is editing.
      */
     private _describe(step: Step): string {
+        const doc = this._store.document;
         return describeStep(step, id => this._store.getMacro(id)?.name, stepId => {
             for (const macro of this._store.macros) {
                 const loc = findStep(macro.body, stepId);
                 if (loc) {
-                    return describeStep(loc.step, id => this._store.getMacro(id)?.name);
+                    return describeStep(loc.step, id => this._store.getMacro(id)?.name, undefined, doc);
                 }
             }
             return undefined;
-        });
+        }, doc);
     }
 
     /**
@@ -2579,12 +2665,15 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
                     infoButton(_('How to word this, and what is actually sent'),
                         promptHelp(this._llmKind(), this._settings.get_int('llm-decision-threshold')), 64),
                     this._joiner(_('in')),
-                    area.entry,
-                    ...this._spotButtons({
+                    ...this._areaControls(condition, () => condition.region ?? null, next => {
+                        condition.region = next;
+                    }, [area.entry, ...this._spotButtons({
                         tooltip: _('Drag a rectangle over the screen to select the area'),
-                        run: () => this._pickRegionFor(condition),
-                    }, null),
-                    area.show,
+                        run: () => this._pickRegionInto(region => {
+                            condition.region = region;
+                            this._saveAndRebuild();
+                        }),
+                    }, null), area.show]),
                 ]) {
                     promptRow.add_suffix(widget);
                 }
@@ -2638,15 +2727,17 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
                         _('Fill the colour in from the screen as it is now — over an area, its average'),
                         () => this._readColorFor(condition)),
                     this._joiner(_('in')),
-                    area,
-                    ...this._spotButtons({
-                        tooltip: _('Click a pixel on the screen, or drag over an area: where it is and what colour it is both land here'),
-                        run: () => this._pickColorFor(condition),
-                    }, () => {
-                        const [x, y, w, h] = parseNumbers(area.get_text() ?? '', 4)
-                            ?? [condition.x, condition.y, condition.w, condition.h];
-                        this._showMarker(x, y, Math.max(1, w), Math.max(1, h));
-                    }),
+                    ...this._areaControls(condition,
+                        () => ({ x: condition.x, y: condition.y, w: condition.w, h: condition.h }),
+                        next => this._setColorArea(condition, next),
+                        [area, ...this._spotButtons({
+                            tooltip: _('Click a pixel on the screen, or drag over an area: where it is and what colour it is both land here'),
+                            run: () => this._pickColorFor(condition),
+                        }, () => {
+                            const [x, y, w, h] = parseNumbers(area.get_text() ?? '', 4)
+                                ?? [condition.x, condition.y, condition.w, condition.h];
+                            this._showMarker(x, y, Math.max(1, w), Math.max(1, h));
+                        })]),
                 ]) {
                     line.add_suffix(widget);
                 }
@@ -2760,9 +2851,15 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
     private _collectionChoices(): Choice[] {
         const doc = this._store.document;
         const choices: Choice[] = [{
+            label: _('New collection…'),
+            tooltip: _('A new file, with a new macro in it to start from'),
+            run: () => this._chooseFile('save', `${_('Collection')}.json`, path => this._newCollection(path),
+                _('New collection')),
+        }, {
             label: _('Load collection…'),
             tooltip: _('Add the macros of a file — a collection, or an export of macros'),
-            run: () => this._chooseFile('open', 'macros.json', path => this._loadCollection(path)),
+            run: () => this._chooseFile('open', 'macros.json', path => this._loadCollection(path),
+                _('Load collection')),
         }];
         for (const path of collectionPaths(doc)) {
             const name = collectionName(path);
@@ -2781,7 +2878,8 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
                 run: () => this._saveCollection(path),
             }, {
                 label: `${_('Save')} “${name}” ${_('as…')}`,
-                run: () => this._chooseFile('save', `${name}.json`, to => this._saveCollectionAs(path, to)),
+                run: () => this._chooseFile('save', `${name}.json`, to => this._saveCollectionAs(path, to),
+                    `${_('Save')} “${name}” ${_('as')}`),
             });
         }
         return choices;
@@ -2823,7 +2921,7 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
                 run: act(() => { macro.collection = undefined; }),
             });
         }
-        const intoNew = (copy: boolean) => () => this._chooseFile('save', `${macro.name}.json`, path => {
+        const intoNew = (copy: boolean) => () => this._chooseFile('save', `${_('Collection')}.json`, path => {
             const collections = doc.collections;
             const from = macro.collection;
             const added = copy ? copyMacro(doc, macro.id, path) : null;
@@ -2835,12 +2933,31 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
                 doc.macros = doc.macros.filter(other => other !== added);
                 macro.collection = from;
             }
-        });
+        }, copy ? _('Copy to a new collection') : _('Move to a new collection'));
         choices.push(
             { label: _('Move to a new collection…'), run: intoNew(false) },
             { label: _('Copy to a new collection…'), run: intoNew(true) },
         );
         return choices;
+    }
+
+    /**
+     * A collection is its macros, so a new one starts with one: empty, and
+     * ready to record into. Written straight away, so it is a file from the
+     * start; if it cannot be, nothing changes.
+     */
+    private _newCollection(path: string): void {
+        const doc = this._store.document;
+        if (collectionPaths(doc).includes(path)) {
+            this._toast(`“${collectionName(path)}” ${_('is already a collection here — pick another file')}`);
+            return;
+        }
+        const macro = newMacro(`Macro ${doc.macros.length + 1}`);
+        macro.collection = path;
+        doc.macros.push(macro);
+        if (!this._saveCollection(path)) {
+            doc.macros = doc.macros.filter(other => other !== macro);
+        }
     }
 
     private _loadCollection(path: string): void {
@@ -2935,6 +3052,7 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
         mode: 'open' | 'save',
         suggestedName: string,
         onChosen: (path: string) => void,
+        title = mode === 'save' ? _('Export to…') : _('Import from…'),
     ): void {
         const json = new Gtk.FileFilter({ name: _('JSON files') });
         json.add_suffix('json');
@@ -2945,7 +3063,7 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
         filters.append(any);
 
         const dialog = new Gtk.FileDialog({
-            title: mode === 'save' ? _('Export to…') : _('Import from…'),
+            title,
             modal: true,
             filters,
             default_filter: json,
@@ -3310,13 +3428,13 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
         });
     }
 
-    private _pickRegionFor(condition: LlmCondition): void {
+    /** As `_pickPointInto`, for a rectangle dragged over the screen. */
+    private _pickRegionInto(onRegion: (region: Region) => void): void {
         this._askShell('pick-region', {}, {
             minimize: true,
             onResult: answer => {
                 if (answer.region) {
-                    condition.region = answer.region as Region;
-                    this._saveAndRebuild();
+                    onRegion(answer.region as Region);
                 }
             },
         });

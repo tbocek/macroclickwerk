@@ -16,7 +16,7 @@ import {
     collectionName, collectionPaths, collectionText, collectionUnsaved, copyMacro, loadCollection,
     macrosOf, markCollectionSaved, moveMacro, renameCollection,
     collectionOn, setCollectionOn, macroLive, livePoints,
-    namePoint, pointAt,
+    movePoint, namePlace, pointAt, areaAt, placeCentre,
 } from '../dist/src/model.js';
 import {
     reportProblem, listProblems, problemCount, clearProblems, onProblemsChanged,
@@ -615,18 +615,48 @@ clearProblems();
     macro.body.push(a, b, c);
     const doc = { version: 1, macros: [macro] };
 
-    check('a spot can be named', namePoint(doc, 10, 20, ' Start ') === null && pointAt(doc, 10, 20)?.name === 'Start');
+    check('a spot can be named', namePlace(doc, { x: 10, y: 20 }, ' Start ') === null && pointAt(doc, 10, 20)?.name === 'Start');
     check('…and every step at the same spot shares it', pointAt(doc, b.x, b.y)?.name === 'Start' && !pointAt(doc, c.x, c.y));
-    check('a name means one place', namePoint(doc, 30, 40, 'Start') !== null && !pointAt(doc, 30, 40));
-    check('naming a named spot renames it', namePoint(doc, 10, 20, 'Go') === null && doc.points.length === 1
+    check('a name means one place', namePlace(doc, { x: 30, y: 40 }, 'Start') !== null && !pointAt(doc, 30, 40));
+    check('naming a named spot renames it', namePlace(doc, { x: 10, y: 20 }, 'Go') === null && doc.points.length === 1
           && doc.points[0].name === 'Go');
-    namePoint(doc, 30, 40, 'Shop');
-    namePoint(doc, 10, 20, '');
+    namePlace(doc, { x: 30, y: 40 }, 'Shop');
+    namePlace(doc, { x: 10, y: 20 }, '');
     check('forgetting a name keeps the coordinates', !pointAt(doc, 10, 20) && a.x === 10 && a.y === 20
           && doc.points.map(p => p.name).join() === 'Shop');
-    check('an empty name takes the name away', namePoint(doc, 30, 40, '  ') === null && (doc.points ?? []).length === 0);
+    check('an empty name takes the name away', namePlace(doc, { x: 30, y: 40 }, '  ') === null && (doc.points ?? []).length === 0);
 
-    namePoint(doc, 10, 20, 'Go');
+    // Areas: a check over one shows its name, a click at its middle too.
+    {
+        const check1 = Object.assign(newStep('if'), { cond: { type: 'llm', prompt: 'ready?', region: { x: 100, y: 200, w: 50, h: 21 } } });
+        const check2 = Object.assign(newStep('if'), { cond: { type: 'not', of: { type: 'color', x: 100, y: 200, w: 50, h: 21, color: '#00ff00', tolerance: 9 } } });
+        const middle = aimed(125, 210);
+        const areas = Object.assign(newMacro('Areas'), { body: [check1, check2, middle] });
+        const adoc = { version: 1, macros: [areas] };
+        check('an area is aimed at its middle', JSON.stringify(placeCentre({ x: 100, y: 200, w: 50, h: 21 })) === '{"x":125,"y":210}');
+        check('an area can be named', namePlace(adoc, { x: 100, y: 200, w: 50, h: 21 }, 'Button') === null
+              && areaAt(adoc, check1.cond.region)?.name === 'Button' && areaAt(adoc, check2.cond.of)?.name === 'Button');
+        check('…and a click at its middle shows the name', pointAt(adoc, 125, 210)?.name === 'Button');
+        check('…but a point of the same corner is another place', namePlace(adoc, { x: 100, y: 200 }, 'Corner') === null
+              && adoc.points.length === 2 && namePlace(adoc, { x: 1, y: 1 }, 'Button') !== null);
+        check('moving an area moves its checks and the clicks at its middle', movePoint(adoc, 'Button', { x: 0, y: 0, w: 10, h: 10 }) === null
+              && JSON.stringify(check1.cond.region) === '{"x":0,"y":0,"w":10,"h":10}' && check2.cond.of.x === 0 && check2.cond.of.w === 10
+              && middle.x === 5 && middle.y === 5 && adoc.points[0].w === 10);
+        check('summaries call a named place by its name', describeStep(check2, undefined, undefined, adoc) === 'If not (avg of Button ≈ #00ff00 ±9)'
+              && describeStep(middle, undefined, undefined, adoc) === 'Click left @ Button', describeStep(check2, undefined, undefined, adoc));
+        check('areas survive a save', parseDocument(stringifyDocument(adoc)).points.map(p => `${p.name}:${p.w ?? '-'}`).join() === 'Button:10,Corner:-');
+        areas.collection = '/home/me/areas.json';
+        adoc.collections = [{ path: '/home/me/areas.json', saved: '' }];
+        check('a collection takes along the areas its checks use', JSON.parse(collectionText(adoc, '/home/me/areas.json')).points.map(p => p.name).join() === 'Button');
+    }
+
+    namePlace(doc, { x: 10, y: 20 }, 'Go');
+    namePlace(doc, { x: 30, y: 40 }, 'Shop');
+    check('a point cannot move onto another', movePoint(doc, 'Go', { x: 30, y: 40 }) !== null && a.x === 10);
+    check('moving a point takes every step at it along', movePoint(doc, 'Go', { x: 11, y: 22 }) === null
+          && a.x === 11 && a.y === 22 && b.x === 11 && b.y === 22 && c.x === 30 && pointAt(doc, 11, 22)?.name === 'Go');
+    movePoint(doc, 'Go', { x: 10, y: 20 });
+    namePlace(doc, { x: 30, y: 40 }, '');
     const kept = parseDocument(stringifyDocument(doc));
     check('points survive a save', kept.points?.length === 1 && kept.points[0].name === 'Go');
     check('bad and doubled points are dropped on load', parseDocument(JSON.stringify({
@@ -635,7 +665,7 @@ clearProblems();
     })).points.map(p => p.name).join() === 'A');
 
     // A collection carries the names its steps are aimed at, and only those.
-    namePoint(doc, 99, 99, 'Unused');
+    namePlace(doc, { x: 99, y: 99 }, 'Unused');
     macro.collection = '/home/me/aim.json';
     const file = JSON.parse(collectionText(doc, '/home/me/aim.json'));
     check('a collection takes along the names it uses', file.points.map(p => p.name).join() === 'Go');
@@ -654,7 +684,7 @@ clearProblems();
     check('a collection switched off takes its names out of the list', livePoints(fresh).length === 0
           && fresh.points.length === 1);
     fresh.macros.push(Object.assign(newMacro('Mine too'), { body: [aimed(10, 20)] }));
-    namePoint(fresh, 7, 7, 'Mine, unused');
+    namePlace(fresh, { x: 7, y: 7 }, 'Mine, unused');
     check('…but not one a macro still here uses, nor ones of your own',
           livePoints(fresh).map(p => p.name).join() === 'Go,Mine, unused', livePoints(fresh).map(p => p.name).join());
 }
