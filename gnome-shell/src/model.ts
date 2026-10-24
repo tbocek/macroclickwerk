@@ -267,12 +267,23 @@ export interface Macro {
      */
     enabled?: boolean;
     /**
+     * Whether this one takes turns with the others that do — see `Turn`.
+     * Absent counts as yes; one that does not acts whenever it likes, and
+     * neither waits for the turn nor holds anyone else up.
+     */
+    exclusive?: boolean;
+    /**
      * The file of the collection this macro belongs to, when it was loaded
      * from one or put into one — see `loadCollection`. Absent: in no
      * collection. Never written into a collection's own file.
      */
     collection?: string;
     body: Step[];
+}
+
+/** Absent means yes: see `Macro.exclusive`. */
+export function macroExclusive(macro: Macro): boolean {
+    return macro.exclusive !== false;
 }
 
 /** Absent means on: see `Macro.enabled`. */
@@ -1408,6 +1419,7 @@ export function parseDocument(json: string): MacroDocument {
                 // the store tells a document from before the flag existed by
                 // the fact that nothing in it carries one.
                 enabled: typeof macro.enabled === 'boolean' ? macro.enabled : undefined,
+                exclusive: macro.exclusive === false ? false : undefined,
                 collection: typeof macro.collection === 'string' && macro.collection !== ''
                     ? macro.collection : undefined,
                 body: Array.isArray(macro.body) ? macro.body : [],

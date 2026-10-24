@@ -51,6 +51,7 @@ import {
     findStep,
     eventFollows,
     macroEnabled,
+    macroExclusive,
     moveStepTo,
     newCondition,
     newId,
@@ -1022,11 +1023,12 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
         if (this._closed) {
             return;
         }
-        // Keys are `step:<id>`, for the repeats and ifs that fold. Keys of
-        // deleted steps are dropped here, or every step ever removed would
-        // leave its state behind forever.
+        // Keys are `step:<id>`, for the repeats and ifs that fold, and
+        // `macro:<id>` for the macros. Keys of deleted ones are dropped here,
+        // or everything ever removed would leave its state behind forever.
         const ids = new Set<string>();
         for (const macro of this._store.macros) {
+            ids.add(macro.id);
             walk(macro.body, location => { ids.add(location.step.id); });
         }
         const alive = (key: string) => ids.has(key.split(':')[1] ?? '');
@@ -1262,19 +1264,6 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
             this._rebuildMacros();
         });
         const headerButtons = new Gtk.Box({ spacing: 6, valign: Gtk.Align.CENTER });
-        // Whether macros running together take turns. Bound, not read once:
-        // it is the shell that acts on it, and it does so as soon as it flips.
-        const oneAtATime = new Gtk.Box({
-            spacing: 6,
-            margin_end: 6,
-            tooltip_text: _('One macro acts at a time: another gets its turn only while this one is in a Wait step, ' +
-                'an On Event or a pause — not in the wait after a click or a key. Off: they act side by side'),
-        });
-        const exclusive = new Gtk.Switch({ valign: Gtk.Align.CENTER });
-        this._settings.bind('exclusive-runs', exclusive, 'active', Gio.SettingsBindFlags.DEFAULT);
-        oneAtATime.append(new Gtk.Label({ label: _('One at a time') }));
-        oneAtATime.append(exclusive);
-        headerButtons.append(oneAtATime);
         headerButtons.append(this._livePopupButton(new Gtk.MenuButton({
             label: _('Collections'),
             valign: Gtk.Align.CENTER,
@@ -1390,7 +1379,10 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
         // run obeys another would be worse than no mark at all.
         const macro = this._store.activeMacro;
         const first = macro?.body[0];
-        if (macro && first && !this._targetRows.has(this._settings.get_string('record-into'))) {
+        // A folded macro has no rows to find the selection among, which is not
+        // the same as the selection being gone: it stays where it was.
+        if (macro && first && !this._macroFolded(macro) &&
+            !this._targetRows.has(this._settings.get_string('record-into'))) {
             this._selectTarget(macro.id, `after:${first.id}`);
         }
 
@@ -1766,6 +1758,28 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
             this._save();
         });
 
+        // One at a time: a lock, pressed in while it takes turns with the
+        // others — a second switch beside the on/off one would read as the same.
+        const exclusive = new Gtk.ToggleButton({
+            active: macroExclusive(macro),
+            valign: Gtk.Align.CENTER,
+            css_classes: ['flat'],
+        });
+        const showExclusive = () => {
+            const on = exclusive.get_active();
+            exclusive.set_icon_name(on ? 'changes-prevent-symbolic' : 'changes-allow-symbolic');
+            exclusive.set_tooltip_text(on
+                ? _('One at a time — takes turns with the others that do: acts until a Wait, an On Event, ' +
+                    'a pause or the next round of a Repeat, then lets them go first')
+                : _('Side by side — acts whenever it likes, without waiting for or holding up any other'));
+        };
+        showExclusive();
+        exclusive.connect('toggled', () => {
+            macro.exclusive = exclusive.get_active() ? undefined : false;
+            showExclusive();
+            this._save();
+        });
+
         const remove = iconButton('user-trash-symbolic', _('Delete this macro'), () => {
             this._store.removeMacro(macro.id);
             this._rebuildMacros();
@@ -1783,14 +1797,58 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
             icon_name: 'view-more-symbolic',
             valign: Gtk.Align.CENTER,
             css_classes: ['flat'],
-            tooltip_text: _('Move up or down, or to another collection'),
+            tooltip_text: _('Move or copy it to a collection'),
         }), () => this._macroChoices(macro));
         // The order every line in the editor keeps: what this line is about,
         // then ▶, then the bin last.
-        for (const widget of [enabled, runButton, stopButton, more, remove]) {
+        // Its place in the list, on its line: a step up or down among the
+        // macros shown, greyed out at either end.
+        const doc = this._store.document;
+        const shown = doc.macros.filter(other => macroLive(doc, other));
+        const index = shown.indexOf(macro);
+        const step = (delta: 1 | -1) => {
+            const button = iconButton(delta < 0 ? 'go-up-symbolic' : 'go-down-symbolic',
+                delta < 0 ? _('Move this macro up') : _('Move this macro down'), () => {
+                    moveMacro(doc, macro.id, delta);
+                    this._saveAndRebuild();
+                });
+            button.set_sensitive(delta < 0 ? index > 0 : index < shown.length - 1);
+            return button;
+        };
+        for (const widget of [step(-1), step(1), exclusive, enabled, runButton, stopButton, more, remove]) {
             nameRow.add_suffix(widget);
         }
         group.add(nameRow);
+
+        // Folded, a macro is its one line: the arrow on the left, the way a
+        // Repeat or an If folds, and remembered the same way. Drawn that way
+        // rather than hidden after: folding redraws the page, so nothing under
+        // the line can come back on its own — an If's Yes and No follow their
+        // If, and would otherwise follow it back into view.
+        const folded = this._macroFolded(macro);
+        const fold = new Gtk.Button({
+            valign: Gtk.Align.CENTER,
+            icon_name: folded ? 'pan-end-symbolic' : 'pan-down-symbolic',
+            css_classes: ['flat', 'macroclickwerk-fold'],
+            tooltip_text: _('Fold or unfold'),
+        });
+        fold.connect('clicked', () => {
+            const key = `macro:${macro.id}`;
+            if (folded) {
+                this._collapsed.delete(key);
+            } else {
+                this._collapsed.add(key);
+            }
+            this._persistExpansion();
+            this._rebuildMacros();
+        });
+        nameRow.add_prefix(fold);
+        if (folded) {
+            // It still says how much is in it, as a folded Repeat does.
+            const count = macro.body.length;
+            nameRow.set_title(`${nameRow.get_title()} · ${count} ${count === 1 ? _('step') : _('steps')}`);
+            return group;
+        }
 
         const addRow = this._addStepRow(macro.body, macro.id, null, null);
         this._selectable(addRow, `end:${macro.id}`, macro.id);
@@ -2914,22 +2972,18 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
         return macroLive(this._store.document, macro) ? macro.name : `${macro.name} (${_('off')})`;
     }
 
-    /** What a macro's ⋯ offers: its place in the list, and its collection. */
+    private _macroFolded(macro: Macro): boolean {
+        return this._collapsed.has(`macro:${macro.id}`);
+    }
+
+    /** What a macro's ⋯ offers: its collection. */
     private _macroChoices(macro: Macro): Choice[] {
         const doc = this._store.document;
-        const shown = doc.macros.filter(other => macroLive(doc, other));
-        const index = shown.indexOf(macro);
         const choices: Choice[] = [];
         const act = (change: () => void) => () => {
             change();
             this._saveAndRebuild();
         };
-        if (index > 0) {
-            choices.push({ label: _('Move up'), run: act(() => moveMacro(doc, macro.id, -1)) });
-        }
-        if (index >= 0 && index < shown.length - 1) {
-            choices.push({ label: _('Move down'), run: act(() => moveMacro(doc, macro.id, 1)) });
-        }
         for (const path of collectionPaths(doc)) {
             const name = collectionName(path);
             // Into one switched off is out of sight, so it says so.

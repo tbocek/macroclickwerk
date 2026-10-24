@@ -251,13 +251,6 @@
             <description>Unix socket the daemon streams recorded input events on</description>
         </key>
 
-        <!-- Running -->
-        <key name="exclusive-runs" type="b">
-            <default>true</default>
-            <summary>One macro at a time</summary>
-            <description>Macros running together take turns: one acts until it reaches a Wait step, an On Event or a pause, and only then does another get to act</description>
-        </key>
-
         <!-- Recording -->
         <key name="record-gap-ms" type="i">
             <default>250</default>

@@ -33,7 +33,7 @@ import type {
     TextStep,
     WaitStep,
 } from './model.js';
-import { describeStep, findStep, pathToStep, prettySource } from './model.js';
+import { describeStep, findStep, macroExclusive, pathToStep, prettySource } from './model.js';
 import { reportProblem } from './problems.js';
 
 export type FinishReason = 'done' | 'stopped' | 'error';
@@ -90,24 +90,15 @@ export interface RunnerCallbacks {
  * then clicks — and gives it up only where it stands still on purpose: a Wait
  * step, an On Event, a pause — and after each round of a Repeat. Whoever asked
  * next goes then, in the order they asked, and a run that wants the turn back
- * waits until no one else has it. With `exclusive` off, everyone always has
- * the turn.
+ * waits until no one else has it. Only macros that are one at a time take
+ * part; see `Macro.exclusive`.
  */
 export class Turn {
-    private _exclusive = true;
     private _holder: object | null = null;
     private _queue: { who: object; go: () => void }[] = [];
 
-    set exclusive(on: boolean) {
-        this._exclusive = on;
-        if (!on) {
-            this._holder = null;
-            this._queue.splice(0).forEach(waiting => waiting.go());
-        }
-    }
-
     take(who: object): Promise<void> {
-        if (!this._exclusive || this._holder === who) {
+        if (this._holder === who) {
             return Promise.resolve();
         }
         if (this._holder === null) {
@@ -232,8 +223,10 @@ export class MacroRunner {
      */
     private _held = new Set<number>();
 
-    /** Shared by every runner when macros take turns; none, and this one never waits for another. */
-    private _turn: Turn | null;
+    /** Shared by every runner, for the macros that take turns. */
+    private _sharedTurn: Turn | null;
+    /** The shared turn while running a macro that takes turns; null otherwise. */
+    private _turn: Turn | null = null;
 
     constructor(
         daemon: DaemonClient,
@@ -244,7 +237,7 @@ export class MacroRunner {
         this._daemon = daemon;
         this._evaluator = evaluator;
         this._callbacks = callbacks;
-        this._turn = turn;
+        this._sharedTurn = turn;
     }
 
     get running(): boolean {
@@ -320,6 +313,7 @@ export class MacroRunner {
         this._failedAt = '';
         this._failedStepId = '';
         this._macroId = macro.id;
+        this._turn = macroExclusive(macro) ? this._sharedTurn : null;
         this._inputEdge = null;
         this._warnedEmptyLoops.clear();
         this._held.clear();
@@ -386,6 +380,8 @@ export class MacroRunner {
         this._cancelled = false;
         this._path = [];
         this._failedAt = '';
+        // A single step tried from the editor is not a turn of anyone's.
+        this._turn = null;
         this._inputEdge = null;
         this._warnedEmptyLoops.clear();
         this._callbacks.onRunningChanged?.(true);
@@ -403,7 +399,6 @@ export class MacroRunner {
                 error: error as Error,
             });
         } finally {
-            this._turn?.give(this);
             this._running = false;
             this._path = [];
             this._callbacks.onStepsChanged?.([]);

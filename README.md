@@ -121,8 +121,8 @@ goes to the On Event, not to the shortcut list.
   wherever it comes to rest, and idle gaps become waits. Record into any row —
   into the middle of a loop, say — and watch that row go red while it runs.
 - **A one-line-per-step editor** — every setting of a step on its own line;
-  Repeat and If fold from the arrow on their left; steps move by dragging the
-  grip. Times step with − and +; every number field with ↑/↓, or the scroll
+  macros, Repeat and If fold from the arrow on their left; steps move by
+  dragging the grip, macros by the ↑ ↓ on their line. Times step with − and +; every number field with ↑/↓, or the scroll
   wheel once focused.
 - **A wait after any action** — the ⏰ time on a click, move, key, text or
   scroll gives the game a frame to register it before the next step.
@@ -150,7 +150,7 @@ goes to the On Event, not to the shortcut list.
   and picking the place again moves everything aimed at it.
 - **Collections** — keep macros in files of their own, one per game, saved
   and loaded alongside the rest, and switched on and off as one; a ⋯ on each
-  macro moves or copies it into one, or up and down the list.
+  macro moves or copies it into one.
 - **Backup** — **Export** and **Import** next to **Add macro**, for the macros
   and for the settings, to a file you choose.
 
@@ -390,20 +390,22 @@ macro that is switched on — all of them, at the same time. They are independen
 each keeps its own place in its own steps, and one finishing or failing does not
 touch the others. What they share is the machine, so they take turns at it.
 
-With **One at a time** on — the switch at the top of the Macros page, and the
-default — a macro that has the turn keeps it until it stands still on purpose:
-a **Wait** step, an **On Event** waiting for its button, or a pause — or until
-it comes round a **Repeat**, which gives the others a go after every round.
-Only then does the next one act. The first does not leave its Wait the moment
-the time is up: it carries on once nobody else is acting, so the other always
-finishes what it is doing first. Everything else keeps it: the hold of a click, the ⏰ wait after
-a key, an If asking the model and then clicking on its answer — so "look, then
-click" is never cut in half by another macro clicking somewhere else in
-between. The price is that a macro waiting for the turn waits for as long as
-the other one acts; a long model check in one holds up the rest, an On Event
-reacting to a side button included.
+A macro that is **one at a time** — the 🔒 beside its switch, pressed in by
+default — takes turns with the others that are. One that has the turn keeps it
+until it stands still on purpose: a **Wait** step, an **On Event** waiting for
+its button, or a pause — or until it comes round a **Repeat**, which gives the
+others a go after every round. Only then does the next one act. The first does
+not leave its Wait the moment the time is up: it carries on once no other is
+acting, so the other always finishes what it is doing first. Everything else
+keeps the turn: the hold of a click, the ⏰ wait after a key, an If asking the
+model and then clicking on its answer — so "look, then click" is never cut in
+half by another macro clicking somewhere else in between. The price is that a
+macro waiting for the turn waits for as long as the other one acts; a long
+model check in one holds up the rest.
 
-With it off, they act side by side, a step each. A step is still the unit: a
+A macro with the lock open acts side by side with everything, a step at a time,
+neither waiting for the turn nor holding anyone up — for something like a
+hold-to-sprint button that must answer at once. A step is still the unit: a
 click at a fixed position holds the pointer for the whole move *and* the click
 at the end of it, so no other macro can land a nudge in the middle and leave it
 clicking somewhere else.
@@ -523,6 +525,11 @@ put the step before it, the bottom half to put it after; drop on a Repeat or
 On Event header to put it first inside, and hover over a folded Repeat to spring it
 open. A step moves with everything inside it. Repeat and If fold from the arrow
 on their left; the rest of the header is for selecting, like any other row.
+
+A macro folds the same way, from the arrow left of its name, down to its one
+line — which then says how many steps it holds — and stays folded the next
+time the window opens. The **↑** and **↓** on that line move the macro up and
+down the list, greyed out at either end.
 
 Coordinates are single fields — `100, 200` for a point, `10, 20, 40, 40` for an
 area — sized to what is in them. Beside each, **⌖ Pick** fills the field by
@@ -645,8 +652,8 @@ collection…** brings one in, or any export of macros. Each has a switch in the
 menu: off puts its macros away — out of the editor, out of Run, and a shortcut
 or a Start aimed at one says the collection is off — and on brings them back,
 nothing forgotten in between. Its named points and areas come and go with it. A macro
-from a collection says so above its name, and the ⋯ on every macro moves it up
-or down, moves or copies it into a collection or a new one, or takes it out of
+from a collection says so above its name, and the ⋯ on every macro moves or
+copies it into a collection or a new one, or takes it out of
 the one it is in; a collection left with no macros is gone. **Save** writes a
 collection back to its file, marked with a • while it has changes that are not
 in the file yet; **Save as** writes it somewhere else and keeps working on that

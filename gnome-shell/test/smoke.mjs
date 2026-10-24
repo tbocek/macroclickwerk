@@ -689,6 +689,15 @@ clearProblems();
           livePoints(fresh).map(p => p.name).join() === 'Go,Mine, unused', livePoints(fresh).map(p => p.name).join());
 }
 
+// --- one at a time, per macro ----------------------------------------------
+{
+    const kept = parseDocument(JSON.stringify({ version: 1, macros: [
+        { ...newMacro('turns'), exclusive: true }, { ...newMacro('free'), exclusive: false }, newMacro('plain'),
+    ] })).macros;
+    check('one at a time is the default, and off is kept', kept.map(m => m.exclusive).join() === ',false,'
+          && !JSON.stringify(kept[0]).includes('exclusive'), JSON.stringify(kept.map(m => m.exclusive)));
+}
+
 // --- the wait after an action ----------------------------------------------
 {
     const c = newStep('click');

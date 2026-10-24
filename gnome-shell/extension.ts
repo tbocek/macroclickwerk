@@ -81,7 +81,7 @@ export default class MacroclickwerkExtension extends Extension {
      * daemon between them: see `Turn`.
      */
     private _runners = new Map<string, MacroRunner>();
-    /** Whose turn it is to act, shared by every runner — see `exclusive-runs`. */
+    /** Whose turn it is to act, shared by every runner — see `Turn`. */
     private _turn = new Turn();
     /**
      * Macros a `start` step asked for while they were already running, mapped
@@ -132,7 +132,6 @@ export default class MacroclickwerkExtension extends Extension {
         const config = this._store.config;
         this._daemon = new DaemonClient(config.controlSocket, config.eventSocket);
         this._evaluator = new ConditionEvaluator(config, trace => this._onTrace(trace), flashRegion);
-        this._turn.exclusive = this._settings.get_boolean('exclusive-runs');
         this._recorder = new Recorder(this._daemon, config, {
             onStatus: text => this._onStatus(text),
             onError: error => {
@@ -1132,10 +1131,6 @@ export default class MacroclickwerkExtension extends Extension {
         }
         if (key === 'triggers') {
             this._triggers?.setTriggers(parseTriggers(this._settings?.get_string('triggers') ?? '[]'));
-            return;
-        }
-        if (key === 'exclusive-runs') {
-            this._turn.exclusive = this._settings?.get_boolean(key) ?? true;
             return;
         }
         if (key === 'expanded-rows') {
