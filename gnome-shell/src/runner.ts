@@ -516,8 +516,9 @@ export class MacroRunner {
         }
 
         // Wait and On Event stand still, which needs no turn: they start at
-        // once, so an On Event is listening from the moment it is reached.
-        const needsTurn = step.kind !== 'wait' && step.kind !== 'onevent';
+        // once, so an On Event is listening from the moment it is reached. A
+        // Wait that keeps the turn is the exception — it holds the others off.
+        const needsTurn = step.kind !== 'onevent' && !(step.kind === 'wait' && !step.keepTurn);
         this._holdingBefore = step.id;
         try {
             for (;;) {
@@ -637,8 +638,10 @@ export class MacroRunner {
                     // Each round is a yield: whoever is waiting for the turn
                     // goes now, and the next round takes it back after them.
                     // A repeat with no Wait in it would otherwise keep it for
-                    // good.
-                    this._turn?.give(this);
+                    // good — unless keeping it is what it was told to do.
+                    if (!step.keepTurn) {
+                        this._turn?.give(this);
+                    }
                     // Yield to the main loop so a body with no waits in it cannot
                     // starve the compositor.
                     await this._sleep(0);
@@ -1045,8 +1048,11 @@ export class MacroRunner {
     }
 
     private async _doWait(step: WaitStep): Promise<void> {
-        // Standing still on purpose: someone else's turn.
-        this._turn?.give(this);
+        // Standing still on purpose: someone else's turn — unless this wait
+        // keeps it.
+        if (!step.keepTurn) {
+            this._turn?.give(this);
+        }
         const jitter = Math.max(0, step.jitterMs ?? 0);
         const offset = jitter > 0 ? (Math.random() * 2 - 1) * jitter : 0;
         await this._sleep(Math.max(0, Math.round(step.ms + offset)));

@@ -18,6 +18,8 @@ import {
     type ConditionType,
     type KeyStep,
     type LlmCondition,
+    type LoopStep,
+    type WaitStep,
     type Macro,
     type MouseButton,
     type OnEventStep,
@@ -1778,8 +1780,8 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
         showExclusive();
         exclusive.connect('toggled', () => {
             macro.exclusive = exclusive.get_active() ? undefined : false;
-            showExclusive();
-            this._save();
+            // Redrawn: the locks on its Waits and Repeats grey out with it.
+            this._saveAndRebuild();
         });
 
         const remove = iconButton('user-trash-symbolic', _('Delete this macro'), () => {
@@ -2323,6 +2325,44 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
     }
 
     /**
+     * Whether a Wait or a Repeat lets the other macros have their turn — the
+     * lock the macro's own line has, saying the same thing: open lets them in,
+     * the default; closed keeps them out, through the wait or between rounds.
+     * Greyed out in a macro that runs side by side, which has no turn to keep.
+     */
+    private _turnToggle(macro: Macro, step: WaitStep | LoopStep): Gtk.ToggleButton {
+        const button = new Gtk.ToggleButton({
+            active: step.keepTurn === true,
+            valign: Gtk.Align.CENTER,
+            css_classes: ['flat', 'image-button'],
+            sensitive: macroExclusive(macro),
+        });
+        const wait = step.kind === 'wait';
+        const show = () => {
+            const keep = button.get_active();
+            button.set_icon_name(keep ? 'changes-prevent-symbolic' : 'changes-allow-symbolic');
+            button.set_tooltip_text(!macroExclusive(macro)
+                ? _('This macro runs side by side, so it has no turn to give up or keep')
+                : keep
+                    ? (wait ? _('Keeps the turn: no other macro acts during this wait')
+                        : _('Keeps the turn: goes round without letting other macros act between rounds'))
+                    : (wait ? _('Lets the others go: other macros may act during this wait')
+                        : _('Lets the others go: other macros may act after every round')));
+        };
+        show();
+        button.connect('toggled', () => {
+            if (button.get_active()) {
+                step.keepTurn = true;
+            } else {
+                delete step.keepTurn;
+            }
+            show();
+            this._save();
+        });
+        return button;
+    }
+
+    /**
      * What a step does, as controls for its own line, in the order the line
      * reads: what is acted on, how, for how long, and where. Controls that
      * only some choices need come after the dropdown that makes the choice.
@@ -2353,7 +2393,7 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
                 spin.set_visible(!forever.get_active());
                 save();
             });
-            return [spin, forever];
+            return [spin, forever, this._turnToggle(macro, step)];
         }
 
         case 'click':
@@ -2439,6 +2479,7 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
                         step.jitterMs = value;
                         save();
                     }, true),
+                this._turnToggle(macro, step),
             ];
 
         case 'scroll':

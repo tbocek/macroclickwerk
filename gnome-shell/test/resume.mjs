@@ -258,6 +258,19 @@ check('pathToStep of a missing step is empty', pathToStep(flat.body, 'gone').len
     await Promise.all([runner(turn).run(rounds('x', 3)), runner(turn).run(rounds('y', 3))]);
     check('each round of a Repeat lets the other in', trace.join() === 'x,y,x,y,x,y', trace.join());
 
+    // …unless it keeps the turn: then its rounds go back to back.
+    trace.length = 0;
+    const keeping = rounds('x', 3);
+    keeping.body[0].keepTurn = true;
+    await Promise.all([runner(turn).run(keeping), runner(turn).run(rounds('y', 3))]);
+    check('a Repeat that keeps the turn goes round without letting the other in', trace.join() === 'x,x,x,y,y,y', trace.join());
+
+    // A Wait that keeps the turn holds the other off for its whole length.
+    trace.length = 0;
+    const holding = macro('a', [step('key', 'a1', { code: 'KEY_A' }), step('wait', null, { ms: 40, keepTurn: true }), step('key', 'a2', { code: 'KEY_A' })]);
+    await Promise.all([runner(turn).run(holding), runner(turn).run(b())]);
+    check('a Wait that keeps the turn lets no one in', trace.join() === 'a1,a2,b1,b2', trace.join());
+
     // A Wait needs no turn: it starts at once, though another has the turn.
     trace.length = 0;
     const started = Date.now();

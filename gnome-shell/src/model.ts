@@ -168,6 +168,8 @@ export type WaitStep = StepCommon & {
     kind: 'wait';
     ms: number;
     jitterMs?: number;
+    /** Hold on to the turn through the wait, rather than let the others go — see `Turn`. */
+    keepTurn?: boolean;
 };
 
 /**
@@ -207,6 +209,8 @@ export type LoopStep = StepCommon & {
     /** Iteration cap, or 'forever' for none. */
     count: number | 'forever';
     body: Step[];
+    /** Go round without letting the others go between rounds — see `Turn`. */
+    keepTurn?: boolean;
 };
 
 export type IfStep = StepCommon & {

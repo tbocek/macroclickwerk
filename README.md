@@ -403,6 +403,12 @@ half by another macro clicking somewhere else in between. The price is that a
 macro waiting for the turn waits for as long as the other one acts; a long
 model check in one holds up the rest.
 
+Wait and Repeat lines carry the same lock, open by default: open, they let the
+others go. Close it on a Wait and no other macro acts until the wait is over —
+a pause that belongs to what this macro is doing, like letting an animation
+finish before the next click. Close it on a Repeat and its rounds go back to
+back without letting anyone in between.
+
 A macro with the lock open acts side by side with everything, a step at a time,
 neither waiting for the turn nor holding anyone up — for something like a
 hold-to-sprint button that must answer at once. A step is still the unit: a
