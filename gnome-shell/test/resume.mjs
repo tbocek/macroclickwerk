@@ -314,6 +314,30 @@ check('pathToStep of a missing step is empty', pathToStep(flat.body, 'gone').len
     check('a start step passes the step to begin at through the callback',
           asked.join(' ') === 'start:self@landing', asked.join(' '));
 
+    // Start another macro, then "Stop: This one": the start must not keep
+    // this run alive, inside a loop that would otherwise go on for ever, and
+    // nothing after the stop runs.
+    asked.length = 0;
+    const loop = newStep('loop');
+    const tail = newStep('wait');
+    tail.ms = 0;
+    loop.body.push(other('start'), newStep('stop'), tail);
+    const looped = await runWith([loop]);
+    check('start another, then stop this one: this run ends, in a forever loop',
+          asked.join(' ') === 'start:other' && looped.entered === 3,
+          `${asked.join(' ')} entered=${looped.entered}`);
+
+    asked.length = 0;
+    const gate = newStep('if');
+    gate.cond = { type: 'always' };
+    gate.then.push(newStep('stop'));
+    const loop2 = newStep('loop');
+    loop2.body.push(other('start'), gate, tail);
+    const nested = await runWith([loop2]);
+    check('…and from inside an If in the loop too',
+          asked.join(' ') === 'start:other' && nested.entered === 4,
+          `${asked.join(' ')} entered=${nested.entered}`);
+
     const missing = newStep('stop');
     missing.macro = 'gone';
     const failed = await runWith([missing]);

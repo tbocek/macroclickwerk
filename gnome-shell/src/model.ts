@@ -34,8 +34,6 @@ export interface LlmCondition {
     prompt: string;
     /** null/undefined means "the whole screen". */
     region?: Region | null;
-    /** Flash a green outline over the checked area whenever this check runs. */
-    flash?: boolean;
 }
 
 /**
@@ -52,8 +50,6 @@ export interface ColorCondition {
     color: string;
     /** How far the average may be from `color`, as an RGB distance. */
     tolerance: number;
-    /** Flash a green outline over the checked area whenever this check runs. */
-    flash?: boolean;
 }
 
 export interface AndCondition {
@@ -270,6 +266,12 @@ export interface Macro {
      * explicit flags once, on the way in.
      */
     enabled?: boolean;
+    /**
+     * The file of the collection this macro belongs to, when it was loaded
+     * from one or put into one — see `loadCollection`. Absent: in no
+     * collection. Never written into a collection's own file.
+     */
+    collection?: string;
     body: Step[];
 }
 
@@ -299,6 +301,333 @@ export function changedDefinitions(before: Macro[], after: Macro[]): Set<string>
 export interface MacroDocument {
     version: number;
     macros: Macro[];
+    /**
+     * The collections loaded, in the order they were loaded. Kept apart from
+     * the macros so a collection stays loaded while it is empty — just made,
+     * or with everything moved out of it.
+     */
+    collections?: CollectionRef[];
+    /**
+     * Names for places on the screen. A click or move aimed at the very
+     * coordinates of one shows its name — the name belongs to the coordinates,
+     * not to any step, so every step at that spot shares it.
+     */
+    points?: NamedPoint[];
+}
+
+export interface NamedPoint {
+    name: string;
+    x: number;
+    y: number;
+}
+
+/** A loaded collection: its file, and what it held when last loaded or saved. */
+export interface CollectionRef {
+    path: string;
+    /** Checksum of `collectionText` at the last load or save — see `collectionUnsaved`. */
+    saved: string;
+    /**
+     * Switched off: its macros are out of the editor and do not run, by Run,
+     * a shortcut or a Start — kept, not forgotten, until it is switched on.
+     */
+    off?: boolean;
+}
+
+// --- collections ------------------------------------------------------------
+
+/** What a collection is called: its file's name, without the .json. */
+export function collectionName(path: string): string {
+    const file = path.split('/').pop() ?? path;
+    return file.replace(/\.json$/i, '') || file;
+}
+
+/**
+ * The files of the loaded collections, in the order they were loaded. One
+ * left with no macros is not one any more: there is nothing in it to show.
+ */
+export function collectionPaths(doc: MacroDocument): string[] {
+    return (doc.collections ?? []).map(ref => ref.path)
+        .filter(path => doc.macros.some(macro => macro.collection === path));
+}
+
+/** Whether a collection is switched on. */
+export function collectionOn(doc: MacroDocument, path: string): boolean {
+    return (doc.collections ?? []).find(ref => ref.path === path)?.off !== true;
+}
+
+export function setCollectionOn(doc: MacroDocument, path: string, on: boolean): void {
+    for (const ref of doc.collections ?? []) {
+        if (ref.path === path) {
+            if (on) {
+                delete ref.off;
+            } else {
+                ref.off = true;
+            }
+        }
+    }
+}
+
+/** A macro of a collection switched off is out of the editor and does not run. */
+export function macroLive(doc: MacroDocument, macro: Macro): boolean {
+    return !macro.collection || collectionOn(doc, macro.collection);
+}
+
+function digest(text: string): string {
+    return GLib.compute_checksum_for_string(GLib.ChecksumType.SHA256, text, -1) ?? text;
+}
+
+/** Whether a collection's macros have changed since it was last loaded or saved. */
+export function collectionUnsaved(doc: MacroDocument, path: string): boolean {
+    const ref = (doc.collections ?? []).find(other => other.path === path);
+    return !ref || ref.saved !== digest(collectionText(doc, path));
+}
+
+/** Note that a collection has just been written to its file as it is now. */
+export function markCollectionSaved(doc: MacroDocument, path: string): void {
+    const ref = (doc.collections ?? []).find(other => other.path === path);
+    if (ref) {
+        ref.saved = digest(collectionText(doc, path));
+    } else {
+        doc.collections = [...(doc.collections ?? []), { path, saved: digest(collectionText(doc, path)) }];
+    }
+}
+
+/** The macros of one collection, in the order the editor shows them. */
+export function macrosOf(doc: MacroDocument, path: string): Macro[] {
+    return doc.macros.filter(macro => macro.collection === path);
+}
+
+/**
+ * A collection as its file holds it: the same form as an export of macros, so
+ * either can be loaded as the other. Without the membership, which is the
+ * editor's business and would only be wrong on another machine.
+ */
+export function collectionText(doc: MacroDocument, path: string): string {
+    const macros = macrosOf(doc, path).map(({ collection: _collection, ...macro }) => macro);
+    const points = pointsUsedBy(doc, macros);
+    return JSON.stringify({ version: DOCUMENT_VERSION, macros, ...(points.length > 0 ? { points } : {}) }, null, 2);
+}
+
+/**
+ * Give a set of macros fresh ids — the macros and every step in them — and
+ * carry the references among them along: a Start or Stop naming one of them,
+ * and a Start's step to begin at. References that point outside the set are
+ * left as they are.
+ *
+ * With `taken`, only the ids that are taken — or used twice in the set — are
+ * renewed, so whatever else points at the rest still finds it.
+ */
+export function freshIds(macros: Macro[], taken?: Set<string>): void {
+    const ids = new Map<string, string>();
+    const used = new Set(taken);
+    const met = new Set<string>();
+    const give = (id: string): string => {
+        const keep = taken !== undefined && !used.has(id);
+        const next = keep ? id : newId();
+        used.add(next);
+        // A reference means the first of the ids it names.
+        if (!met.has(id)) {
+            met.add(id);
+            if (!keep) {
+                ids.set(id, next);
+            }
+        }
+        return next;
+    };
+    for (const macro of macros) {
+        macro.id = give(macro.id);
+        walk(macro.body, ({ step }) => { step.id = give(step.id); });
+    }
+    for (const macro of macros) {
+        walk(macro.body, ({ step }) => {
+            if (step.kind === 'start' || step.kind === 'stop') {
+                if (step.macro && ids.has(step.macro)) {
+                    step.macro = ids.get(step.macro);
+                }
+                if (step.kind === 'start' && step.at && ids.has(step.at)) {
+                    step.at = ids.get(step.at);
+                }
+            }
+        });
+    }
+}
+
+/**
+ * Add a collection's macros to the document, marked as coming from `path`.
+ * Ids already taken — the same file loaded under two names, say — are renewed,
+ * so nothing in the document is ever named twice. Throws when `path` is
+ * already loaded or holds no macros; returns how many macros came in.
+ */
+export function loadCollection(doc: MacroDocument, path: string, text: string): number {
+    if (collectionPaths(doc).includes(path)) {
+        throw new Error(`“${collectionName(path)}” is already loaded`);
+    }
+    // Checked here rather than left to parseDocument, which makes an empty
+    // document of anything else — and Save would then write that over the file.
+    let raw: unknown;
+    try {
+        raw = JSON.parse(text);
+    } catch {
+        raw = null;
+    }
+    if (!Array.isArray((raw as Partial<MacroDocument> | null)?.macros)) {
+        throw new Error('this is not a file of macros');
+    }
+    const file = parseDocument(text);
+    const loaded = file.macros;
+    if (loaded.length === 0) {
+        throw new Error('there are no macros in it');
+    }
+    // Its named points come along, unless the name or the spot already has
+    // one here: what is already named stays as it is. Then the file no longer
+    // says what the editor shows, and the collection starts out unsaved.
+    let asInFile = true;
+    for (const point of file.points ?? []) {
+        const points = doc.points ?? [];
+        const clash = points.find(p => p.name === point.name || (p.x === point.x && p.y === point.y));
+        if (!clash) {
+            doc.points = [...points, point];
+        } else if (clash.name !== point.name || clash.x !== point.x || clash.y !== point.y) {
+            asInFile = false;
+        }
+    }
+    const taken = new Set<string>();
+    for (const macro of doc.macros) {
+        taken.add(macro.id);
+        walk(macro.body, ({ step }) => { taken.add(step.id); });
+    }
+    freshIds(loaded, taken);
+    for (const macro of loaded) {
+        macro.collection = path;
+    }
+    doc.macros.push(...loaded);
+    if (asInFile) {
+        markCollectionSaved(doc, path);
+    } else {
+        doc.collections = [...(doc.collections ?? []), { path, saved: '' }];
+    }
+    return loaded.length;
+}
+
+/**
+ * The collection now lives at another file — a Save as — and its macros go
+ * with it. Its place in the list stays.
+ */
+export function renameCollection(doc: MacroDocument, from: string, to: string): void {
+    for (const macro of macrosOf(doc, from)) {
+        macro.collection = to;
+    }
+    for (const ref of doc.collections ?? []) {
+        if (ref.path === from) {
+            ref.path = to;
+        }
+    }
+}
+
+/**
+ * Move a macro one place up (-1) or down (1) among the macros the editor
+ * shows, past any of a collection switched off; false at either end.
+ */
+export function moveMacro(doc: MacroDocument, id: string, delta: 1 | -1): boolean {
+    const index = doc.macros.findIndex(macro => macro.id === id);
+    let target = index + delta;
+    while (target >= 0 && target < doc.macros.length && !macroLive(doc, doc.macros[target])) {
+        target += delta;
+    }
+    if (index < 0 || target < 0 || target >= doc.macros.length) {
+        return false;
+    }
+    const [macro] = doc.macros.splice(index, 1);
+    doc.macros.splice(target, 0, macro);
+    return true;
+}
+
+/**
+ * A copy of a macro under fresh ids, placed right after it. A Start or Stop
+ * in it that named the original names the copy, so a macro that restarts
+ * itself still does.
+ */
+export function copyMacro(doc: MacroDocument, id: string, collection?: string): Macro | null {
+    const index = doc.macros.findIndex(macro => macro.id === id);
+    if (index < 0) {
+        return null;
+    }
+    const copy: Macro = JSON.parse(JSON.stringify(doc.macros[index]));
+    freshIds([copy]);
+    copy.name = `${copy.name} (copy)`;
+    copy.collection = collection;
+    doc.macros.splice(index + 1, 0, copy);
+    return copy;
+}
+
+// --- named points -------------------------------------------------------------
+
+/** The stored points, tolerantly: each needs a name and two numbers; first of a name or a spot wins. */
+function cleanPoints(raw: unknown): NamedPoint[] {
+    const points: NamedPoint[] = [];
+    for (const point of Array.isArray(raw) ? raw : []) {
+        const { name, x, y } = (point ?? {}) as Partial<NamedPoint>;
+        if (typeof name === 'string' && name.trim() !== '' && Number.isFinite(x) && Number.isFinite(y) &&
+            !points.some(p => p.name === name.trim() || (p.x === x && p.y === y))) {
+            points.push({ name: name.trim(), x: x!, y: y! });
+        }
+    }
+    return points;
+}
+
+/** The named point at exactly these coordinates, if there is one. */
+export function pointAt(doc: MacroDocument, x: number | undefined, y: number | undefined): NamedPoint | undefined {
+    return (doc.points ?? []).find(point => point.x === x && point.y === y);
+}
+
+/**
+ * Name the spot at x, y. A spot that has a name already is renamed; an empty
+ * name takes the name away. Returns why not, when a name is already used for
+ * another spot — a name means one place.
+ */
+export function namePoint(doc: MacroDocument, x: number, y: number, name: string): string | null {
+    const wanted = name.trim();
+    const points = doc.points ?? [];
+    const here = points.find(point => point.x === x && point.y === y);
+    if (wanted === '') {
+        doc.points = points.filter(point => point !== here);
+        return null;
+    }
+    if (points.some(point => point.name === wanted && point !== here)) {
+        return `“${wanted}” is already another point`;
+    }
+    if (here) {
+        here.name = wanted;
+    } else {
+        doc.points = [...points, { name: wanted, x, y }];
+    }
+    return null;
+}
+
+/**
+ * The named points to offer: all but those only macros of a collection
+ * switched off are aimed at — they are its names, and go with it.
+ */
+export function livePoints(doc: MacroDocument): NamedPoint[] {
+    const off = pointsUsedBy(doc, doc.macros.filter(macro => !macroLive(doc, macro)));
+    const on = pointsUsedBy(doc, doc.macros.filter(macro => macroLive(doc, macro)));
+    return (doc.points ?? []).filter(point => !off.includes(point) || on.includes(point));
+}
+
+/** The named points that clicks and moves in these macros are aimed at. */
+function pointsUsedBy(doc: MacroDocument, macros: Macro[]): NamedPoint[] {
+    const used = new Set<NamedPoint>();
+    for (const macro of macros) {
+        walk(macro.body, ({ step }) => {
+            if ((step.kind === 'click' || step.kind === 'move') && step.mode === 'abs') {
+                const point = pointAt(doc, step.x, step.y);
+                if (point) {
+                    used.add(point);
+                }
+            }
+        });
+    }
+    return (doc.points ?? []).filter(point => used.has(point));
 }
 
 // --- construction ----------------------------------------------------------
@@ -954,6 +1283,19 @@ function migrateGuards(steps: Step[]): Step[] {
     return migrated;
 }
 
+/** Take the old per-check flash switch off a condition and everything in it. */
+function dropFlash(cond: Condition | null | undefined): void {
+    if (!cond) {
+        return;
+    }
+    delete (cond as { flash?: boolean }).flash;
+    if (cond.type === 'and' || cond.type === 'or') {
+        cond.of.forEach(dropFlash);
+    } else if (cond.type === 'not') {
+        dropFlash(cond.of);
+    }
+}
+
 export function parseDocument(json: string): MacroDocument {
     if (!json || json.trim() === '') {
         return emptyDocument();
@@ -979,6 +1321,8 @@ export function parseDocument(json: string): MacroDocument {
                 // the store tells a document from before the flag existed by
                 // the fact that nothing in it carries one.
                 enabled: typeof macro.enabled === 'boolean' ? macro.enabled : undefined,
+                collection: typeof macro.collection === 'string' && macro.collection !== ''
+                    ? macro.collection : undefined,
                 body: Array.isArray(macro.body) ? macro.body : [],
             };
             walk(fixed.body, loc => {
@@ -1009,9 +1353,39 @@ export function parseDocument(json: string): MacroDocument {
                 }
             });
             fixed.body = dropRetiredSteps(migrateGuards(migrateGates(migrateLoops(fixed.body))));
+            // Every check flashes the area it reads now, so the per-check
+            // switch for it is gone from what is kept — after the migrations,
+            // which carry the conditions of older steps into ifs.
+            walk(fixed.body, ({ step }) => {
+                if (step.kind === 'if') {
+                    dropFlash(step.cond);
+                }
+            });
             return fixed;
         });
-        return { version: raw.version ?? DOCUMENT_VERSION, macros };
+        let collections: CollectionRef[] = [];
+        for (const ref of Array.isArray(raw.collections) ? raw.collections : []) {
+            if (typeof ref?.path === 'string' && ref.path !== '' && typeof ref.saved === 'string' &&
+                !collections.some(other => other.path === ref.path)) {
+                collections.push({ path: ref.path, saved: ref.saved, ...(ref.off === true ? { off: true } : {}) });
+            }
+        }
+        // A macro of a collection that is not loaded could never be saved or
+        // switched off: it is simply one of yours.
+        for (const macro of macros) {
+            if (macro.collection && !collections.some(ref => ref.path === macro.collection)) {
+                macro.collection = undefined;
+            }
+        }
+        // And a collection with no macros left is gone.
+        collections = collections.filter(ref => macros.some(macro => macro.collection === ref.path));
+        const points = cleanPoints(raw.points);
+        return {
+            version: raw.version ?? DOCUMENT_VERSION,
+            macros,
+            ...(collections.length > 0 ? { collections } : {}),
+            ...(points.length > 0 ? { points } : {}),
+        };
     } catch (error) {
         // Returning an empty document rather than throwing keeps the extension
         // alive, but it also means every macro has just vanished from the UI —
@@ -1086,7 +1460,6 @@ export function prettySource(source: string, edge: EventEdge = 'either'): string
     return `${source.replace(/^KEY_/, '') || '…'} ${verb}`;
 }
 
-/** How a key or pad step reads. Absent is the follow, and follows just press. */
 /**
  * A key step's verb. The whole gesture is a Type, which leaves "press" free for
  * the half that goes down and stays there — so a keyboard names its halves

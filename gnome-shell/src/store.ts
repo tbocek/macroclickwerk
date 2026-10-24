@@ -9,6 +9,7 @@ import {
     MacroDocument,
     changedDefinitions,
     macroEnabled,
+    macroLive,
     parseDocument,
     stringifyDocument,
 } from './model.js';
@@ -92,7 +93,7 @@ export class MacroStore {
 
     /** The macros Run starts, in document order. */
     get enabledMacros(): Macro[] {
-        return this._doc.macros.filter(macroEnabled);
+        return this._doc.macros.filter(macro => macroEnabled(macro) && macroLive(this._doc, macro));
     }
 
     /**
@@ -151,14 +152,14 @@ export class MacroStore {
     /**
      * The macro being worked on — the one holding the selected row, which is
      * where a recording lands. Not the one that runs: Run starts every enabled
-     * macro. Falls back to the first one.
+     * macro. Falls back to the first one the editor shows.
      */
     get activeMacro(): Macro | null {
         const selected = this.getMacro(this.activeMacroId);
-        if (selected) {
+        if (selected && macroLive(this._doc, selected)) {
             return selected;
         }
-        return this._doc.macros[0] ?? null;
+        return this._doc.macros.find(macro => macroLive(this._doc, macro)) ?? null;
     }
 
     addMacro(macro: Macro): void {

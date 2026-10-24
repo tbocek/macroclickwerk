@@ -271,7 +271,7 @@ check('the inert ones claim no code',
     check('those survive a save', parseTriggers(JSON.stringify([{ id: 'p', source: 'BTN_EXTRA', action: 'panic' }])).length === 1);
 }
 
-// --- pressing a key in place of a button is a When step, not a trigger -------
+// --- pressing a key in place of a button is an On Event step, not a trigger ---
 {
     const kept = parseTriggers(JSON.stringify([
         { id: 'k', source: 'BTN_SIDE', action: 'key', key: 'KEY_E' },

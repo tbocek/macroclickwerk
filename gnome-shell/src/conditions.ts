@@ -25,8 +25,9 @@ export class ConditionEvaluator {
     private _onFlash?: (region?: Region | null) => void;
 
     /**
-     * `onFlash` shows a check's area on screen, for the conditions that asked
-     * for that; null is the whole screen. A callback because drawing belongs
+     * `onFlash` shows a check's area on screen every time it is read, so a
+     * running macro can be watched looking where it was meant to; null is the
+     * whole screen. A callback because drawing belongs
      * to the shell UI, and this file also runs under plain gjs in the tests.
      */
     constructor(
@@ -143,9 +144,7 @@ export class ConditionEvaluator {
         // of thing a colour check would then measure — and after the scan,
         // which holds the main loop and would sit between the flash and its
         // first paint.
-        if (condition.flash) {
-            this._onFlash?.({ x: condition.x, y: condition.y, w, h });
-        }
+        this._onFlash?.({ x: condition.x, y: condition.y, w, h });
         return outcome;
     }
 
@@ -172,9 +171,7 @@ export class ConditionEvaluator {
         // After the capture — the flash must not be in the picture the model
         // is asked about — and after the encode, which blocks the main loop
         // and would sit between the flash and its first paint.
-        if (condition.flash) {
-            this._onFlash?.(condition.region);
-        }
+        this._onFlash?.(condition.region);
         return this._llm.ask(condition.prompt, image, settings);
     }
 

@@ -20,8 +20,8 @@ import { Recorder, acceleratorToEvdevCodes } from './src/recorder.js';
 import { MacroStore, type Config } from './src/store.js';
 import { starterMacro } from './src/starter.js';
 import {
-    childLists, describeStep, findStep, lastPointerEndpoint, reachesEnd,
-    resolveRecordTarget, resolveRunStart, type LlmCondition, type Macro, type RecordTarget, type Region, type Step,
+    childLists, collectionName, describeStep, findStep, lastPointerEndpoint, reachesEnd,
+    macroLive, resolveRecordTarget, resolveRunStart, type LlmCondition, type Macro, type RecordTarget, type Region, type Step,
 } from './src/model.js';
 import { clearProblems, onProblemsChanged, problemCount, reportProblem } from './src/problems.js';
 import { TriggerEngine, parseTriggers } from './src/triggers.js';
@@ -602,6 +602,9 @@ export default class MacroclickwerkExtension extends Extension {
         if (!macro) {
             return 'that macro is no longer there';
         }
+        if (action === 'start' && !macroLive(this._store!.document, macro)) {
+            return `“${macro.name}” is in “${collectionName(macro.collection!)}”, which is switched off`;
+        }
         const runner = this._runnerFor(macroId);
         if (!runner) {
             return 'the extension is not ready yet';
@@ -894,6 +897,11 @@ export default class MacroclickwerkExtension extends Extension {
         const macro = request.macroId ? this._store?.getMacro(request.macroId) : null;
         if (!macro) {
             return { ok: false, message: 'that macro is no longer there' };
+        }
+        if (request.action !== 'stop' && request.action !== 'pause' && !macroLive(this._store!.document, macro)) {
+            const message = `“${macro.name}” is in “${collectionName(macro.collection!)}”, which is switched off`;
+            Main.notify('Macroclickwerk', message);
+            return { ok: false, message };
         }
         if (request.action === 'stop' || request.action === 'pause') {
             const runner = this._runners.get(macro.id);

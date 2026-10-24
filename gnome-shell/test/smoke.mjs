@@ -13,6 +13,12 @@ import { textToEvents, keyCode, keyName, charToKey, buttonFromCode } from '../di
 import { starterMacro } from '../dist/src/starter.js';
 import { parseDecision, parseVerdict, promptAdvice, verdictFromObjects } from '../dist/src/llm.js';
 import {
+    collectionName, collectionPaths, collectionText, collectionUnsaved, copyMacro, loadCollection,
+    macrosOf, markCollectionSaved, moveMacro, renameCollection,
+    collectionOn, setCollectionOn, macroLive, livePoints,
+    namePoint, pointAt,
+} from '../dist/src/model.js';
+import {
     reportProblem, listProblems, problemCount, clearProblems, onProblemsChanged,
 } from '../dist/src/problems.js';
 
@@ -382,9 +388,12 @@ check('area colour describes as an average', describeCondition(cols[1].cond).sta
       describeCondition(cols[1].cond));
 check('and both shapes say their tolerance', describeCondition(cols[0].cond).includes('±9')
       && describeCondition(cols[1].cond).includes('±7'), describeCondition(cols[0].cond));
-check('colour check remembers its flash', parseDocument(JSON.stringify({ version: 1, macros: [{ id: 'm', name: 'c', body: [
-    { id: 'a', kind: 'if', cond: { type: 'color', x: 1, y: 2, w: 3, h: 4, color: '#abcdef', tolerance: 9, flash: true }, then: [], else: [] },
-] }] })).macros[0].body[0].cond.flash === true);
+check('the old per-check flash switch is dropped on load', parseDocument(JSON.stringify({ version: 1, macros: [{ id: 'm', name: 'c', body: [
+    { id: 'a', kind: 'if', cond: { type: 'not', of: { type: 'color', x: 1, y: 2, w: 3, h: 4, color: '#abcdef', tolerance: 9, flash: true } }, then: [], else: [] },
+] }] })).macros[0].body[0].cond.of.flash === undefined);
+check('…also from a condition an old while loop carried', !JSON.stringify(parseDocument(JSON.stringify({ version: 1, macros: [{ id: 'm', name: 'w', body: [
+    { id: 'a', kind: 'while', cond: { type: 'color', x: 1, y: 2, color: '#abcdef', tolerance: 9, flash: true }, body: [] },
+] }] })).macros).includes('flash'));
 
 // never is a condition of its own, not a missing one: it survives a round trip
 const neverDoc = parseDocument(JSON.stringify({ version: 1, macros: [{ id: 'm', name: 'n', body: [
@@ -504,6 +513,151 @@ const before = notified;
 reportProblem('Macro', 'after unsubscribe');
 check('unsubscribed listener is silent', notified === before);
 clearProblems();
+
+// --- collections ------------------------------------------------------------
+{
+    const fileMacro = newMacro('Ready');
+    const starter = newStep('start');
+    starter.macro = fileMacro.id;
+    const restart = newMacro('Restart');
+    restart.body.push(starter);
+    const file = JSON.stringify({ version: 1, macros: [fileMacro, restart] });
+
+    const doc = { version: 1, macros: [newMacro('Mine')] };
+    const path = '/home/me/Tower defense.json';
+    check('a collection is named after its file', collectionName(path) === 'Tower defense');
+    check('loading adds its macros', loadCollection(doc, path, file) === 2 && doc.macros.length === 3);
+    check('…marked as coming from it', macrosOf(doc, path).map(m => m.name).join() === 'Ready,Restart');
+    check('a collection just loaded has nothing unsaved', !collectionUnsaved(doc, path));
+    macrosOf(doc, path)[0].name = 'Ready!';
+    check('an edit makes it unsaved', collectionUnsaved(doc, path));
+    markCollectionSaved(doc, path);
+    check('…until it is saved', !collectionUnsaved(doc, path));
+    let threw = '';
+    try { loadCollection(doc, path, file); } catch (e) { threw = e.message; }
+    check('the same collection cannot be loaded twice', threw.includes('already loaded'), threw);
+
+    // The same file under another name: every id is taken, so all are fresh,
+    // and the Start inside follows its own collection's macro, not the other.
+    const other = '/tmp/copy.json';
+    loadCollection(doc, other, file);
+    const copied = macrosOf(doc, other);
+    const ids = new Set(doc.macros.map(m => m.id));
+    check('clashing ids are made fresh', ids.size === doc.macros.length);
+    check('…and a Start follows its own collection', copied[1].body[0].macro === copied[0].id,
+          `${copied[1].body[0].macro} vs ${copied[0].id}`);
+
+    const saved = JSON.parse(collectionText(doc, path));
+    check('a saved collection holds its macros and not the membership',
+          saved.macros.length === 2 && saved.macros.every(m => m.collection === undefined));
+    check('a saved collection reads back as macros', parseDocument(collectionText(doc, path)).macros.length === 2);
+
+    renameCollection(doc, path, '/home/me/td2.json');
+    check('save as moves the membership', macrosOf(doc, '/home/me/td2.json').length === 2
+          && collectionPaths(doc).join() === `/home/me/td2.json,${other}`, collectionPaths(doc).join());
+
+    setCollectionOn(doc, other, false);
+    check('a collection switched off keeps its macros, out of the running', doc.macros.length === 5
+          && collectionPaths(doc).includes(other) && !macroLive(doc, macrosOf(doc, other)[0]) && macroLive(doc, doc.macros[0]));
+    check('moving down skips what is switched off', !moveMacro(doc, macrosOf(doc, '/home/me/td2.json')[1].id, 1));
+    check('…and it stays off through a save', !collectionOn(parseDocument(stringifyDocument(doc)), other));
+    setCollectionOn(doc, other, true);
+    check('switched on, its macros are back', macroLive(doc, macrosOf(doc, other)[0])
+          && !('off' in doc.collections.find(ref => ref.path === other)));
+    doc.macros = doc.macros.filter(macro => macro.collection !== other);
+    check('a collection with no macros left is gone', !collectionPaths(doc).includes(other)
+          && !parseDocument(stringifyDocument(doc)).collections.some(ref => ref.path === other));
+    let empty = '';
+    try { loadCollection(doc, '/home/me/empty.json', '{"version": 1, "macros": []}'); } catch (e) { empty = e.message; }
+    check('…so an empty one is not loaded', empty.includes('no macros'), empty);
+
+    check('macros move up and down', moveMacro(doc, doc.macros[1].id, -1) && doc.macros[0].name === 'Ready!');
+    check('…but not past the ends', !moveMacro(doc, doc.macros[0].id, -1));
+
+    const copy = copyMacro(doc, doc.macros.find(m => m.name === 'Restart').id, undefined);
+    check('a copy goes right after, under fresh ids, out of any collection',
+          doc.macros[doc.macros.indexOf(copy) - 1].name === 'Restart' && copy.collection === undefined
+          && copy.id !== doc.macros[doc.macros.indexOf(copy) - 1].id && copy.name === 'Restart (copy)');
+
+    let refused = '';
+    try { loadCollection(doc, '/home/me/settings.json', '{"llm-endpoint": "x"}'); } catch (e) { refused = e.message; }
+    check('a file that is not macros is not taken for a collection', refused.includes('not a file of macros')
+          && !collectionPaths(doc).includes('/home/me/settings.json'), refused);
+    refused = '';
+    try { loadCollection(doc, '/home/me/broken.json', '{"macros": ['); } catch (e) { refused = e.message; }
+    check('…nor is a broken one', refused.includes('not a file of macros'), refused);
+
+    // Only what clashes is renewed: a Start elsewhere aimed at a macro of the
+    // file keeps finding it, and an id used twice in the file comes apart.
+    const target = newMacro('Target');
+    const caller = newStep('start');
+    caller.macro = target.id;
+    const outside = { version: 1, macros: [Object.assign(newMacro('Outside'), { body: [caller] })] };
+    const twin = newMacro('Twin');
+    twin.id = outside.macros[0].id;
+    const twice = Object.assign(newMacro('Twice'), { id: target.id });
+    loadCollection(outside, '/home/me/t.json', JSON.stringify({ version: 1, macros: [target, twin, twice] }));
+    const loadedIds = outside.macros.map(m => m.id);
+    check('only clashing ids are renewed', loadedIds[1] === target.id && caller.macro === target.id
+          && new Set(loadedIds).size === 4, loadedIds.join());
+
+    const kept = parseDocument(stringifyDocument(doc));
+    check('membership and the loaded list survive a save',
+          collectionPaths(kept).join() === '/home/me/td2.json' && macrosOf(kept, '/home/me/td2.json').length === 2
+          && collectionUnsaved(kept, '/home/me/td2.json') === collectionUnsaved(doc, '/home/me/td2.json'));
+}
+
+// --- named points -----------------------------------------------------------
+{
+    const aimed = (x, y) => Object.assign(newStep('click'), { mode: 'abs', x, y });
+    const a = aimed(10, 20), b = aimed(10, 20), c = aimed(30, 40);
+    const macro = newMacro('Aim');
+    macro.body.push(a, b, c);
+    const doc = { version: 1, macros: [macro] };
+
+    check('a spot can be named', namePoint(doc, 10, 20, ' Start ') === null && pointAt(doc, 10, 20)?.name === 'Start');
+    check('…and every step at the same spot shares it', pointAt(doc, b.x, b.y)?.name === 'Start' && !pointAt(doc, c.x, c.y));
+    check('a name means one place', namePoint(doc, 30, 40, 'Start') !== null && !pointAt(doc, 30, 40));
+    check('naming a named spot renames it', namePoint(doc, 10, 20, 'Go') === null && doc.points.length === 1
+          && doc.points[0].name === 'Go');
+    namePoint(doc, 30, 40, 'Shop');
+    namePoint(doc, 10, 20, '');
+    check('forgetting a name keeps the coordinates', !pointAt(doc, 10, 20) && a.x === 10 && a.y === 20
+          && doc.points.map(p => p.name).join() === 'Shop');
+    check('an empty name takes the name away', namePoint(doc, 30, 40, '  ') === null && (doc.points ?? []).length === 0);
+
+    namePoint(doc, 10, 20, 'Go');
+    const kept = parseDocument(stringifyDocument(doc));
+    check('points survive a save', kept.points?.length === 1 && kept.points[0].name === 'Go');
+    check('bad and doubled points are dropped on load', parseDocument(JSON.stringify({
+        version: 1, macros: [], points: [{ name: 'A', x: 1, y: 2 }, { name: 'A', x: 3, y: 4 },
+            { name: 'B', x: 1, y: 2 }, { name: '', x: 5, y: 5 }, { name: 'C', x: 'no', y: 1 }],
+    })).points.map(p => p.name).join() === 'A');
+
+    // A collection carries the names its steps are aimed at, and only those.
+    namePoint(doc, 99, 99, 'Unused');
+    macro.collection = '/home/me/aim.json';
+    const file = JSON.parse(collectionText(doc, '/home/me/aim.json'));
+    check('a collection takes along the names it uses', file.points.map(p => p.name).join() === 'Go');
+    const other = { version: 1, macros: [], points: [{ name: 'Mine', x: 10, y: 20 }] };
+    loadCollection(other, '/home/me/aim.json', JSON.stringify(file));
+    check('…and loading it keeps a name already given to that spot', other.points.map(p => p.name).join() === 'Mine');
+    const fresh = { version: 1, macros: [] };
+    loadCollection(fresh, '/home/me/aim.json', JSON.stringify(file));
+    check('…or brings the name along', fresh.points?.map(p => p.name).join() === 'Go');
+    check('…and a collection whose name was not taken starts out unsaved',
+          collectionUnsaved(other, '/home/me/aim.json') && !collectionUnsaved(fresh, '/home/me/aim.json'));
+    check('a macro of a collection that is not loaded is simply yours', parseDocument(JSON.stringify({
+        version: 1, macros: [{ ...newMacro('Stray'), collection: '/gone.json' }],
+    })).macros[0].collection === undefined);
+    setCollectionOn(fresh, '/home/me/aim.json', false);
+    check('a collection switched off takes its names out of the list', livePoints(fresh).length === 0
+          && fresh.points.length === 1);
+    fresh.macros.push(Object.assign(newMacro('Mine too'), { body: [aimed(10, 20)] }));
+    namePoint(fresh, 7, 7, 'Mine, unused');
+    check('…but not one a macro still here uses, nor ones of your own',
+          livePoints(fresh).map(p => p.name).join() === 'Go,Mine, unused', livePoints(fresh).map(p => p.name).join());
+}
 
 // --- the wait after an action ----------------------------------------------
 {

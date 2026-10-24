@@ -27,7 +27,22 @@ import {
     EVENT_EDGES,
     childLists,
     describeStep,
+    collectionName,
+    collectionPaths,
+    collectionText,
+    collectionUnsaved,
+    copyMacro,
     emptyDocument,
+    livePoints,
+    loadCollection,
+    macroLive,
+    setCollectionOn,
+    collectionOn,
+    markCollectionSaved,
+    moveMacro,
+    namePoint,
+    pointAt,
+    renameCollection,
     findStep,
     eventFollows,
     macroEnabled,
@@ -198,8 +213,8 @@ const eventEdgeLabels = (): Record<string, string> => ({
 });
 
 /**
- * What a "When …" waits on, as its own line says it: the line already reads
- * "When", so "click" and "button" are both said once too often. The triggers
+ * What an On Event waits on, as its own line says it: the line already reads
+ * "On Event", so "click" and "button" are both said once too often. The triggers
  * page has rows to spare and keeps the long form.
  */
 const eventSourceLabels = (): Record<string, string> => ({
@@ -225,7 +240,7 @@ const stepTitles = (): Record<StepKind, string> => ({
     key: _('Key'),
     text: _('Text'),
     wait: _('Wait'),
-    onevent: _('When'),
+    onevent: _('On Event'),
     loop: _('Repeat'),
     if: _('If'),
     break: _('Break'),
@@ -617,6 +632,8 @@ type CheckAnswer = { match: boolean; reason: string; seconds: string } | null;
 interface Choice {
     label: string;
     tooltip?: string;
+    /** Drawn with a switch showing this, which `run` flips. */
+    on?: boolean;
     run: () => void;
 }
 
@@ -684,6 +701,9 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
     // Drag state: the row currently painted as the drop spot, and the folded
     // container a hovering drag is about to spring open.
     private _dropHighlight: Gtk.Widget | null = null;
+    // Steps at a named point whose numbers were asked for with x,y — for this
+    // window only, since by the coordinates alone they are still the point.
+    private _showNumbers = new Set<string>();
     private _springId = 0;
     private _springRow: Adw.ExpanderRow | null = null;
 
@@ -740,21 +760,49 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
      * line, since what follows the dropdown changes with it.
      */
     private _positionControls<M extends string>(opts: {
-        step: { mode: M; x?: number; y?: number; dx?: number; dy?: number };
+        step: { id: string; mode: M; x?: number; y?: number; dx?: number; dy?: number };
         places: { mode: M; label: string; numbers?: 'spot' | 'offset' }[];
     }): Gtk.Widget[] {
         const { step } = opts;
+        const doc = this._store.document;
+        const spot = opts.places.find(place => place.numbers === 'spot')!.mode;
+        // The named points come after the places, as places of their own; a
+        // step aimed at one shows its name instead of its numbers — unless
+        // x,y was picked to see and change them.
         const labels: Record<string, string> = {};
         for (const place of opts.places) {
             labels[place.mode] = place.label;
         }
-        const widgets: Gtk.Widget[] = [chooser(opts.places.map(place => place.mode), labels, step.mode,
-            _('Where this acts'),
+        const points = livePoints(doc);
+        for (const point of points) {
+            labels[`point:${point.name}`] = point.name;
+        }
+        const named = step.mode === spot && !this._showNumbers.has(step.id)
+            ? pointAt(doc, step.x, step.y) : undefined;
+        const dropdown = chooser(
+            [...opts.places.map(place => place.mode as string), ...points.map(point => `point:${point.name}`)],
+            labels, named ? `point:${named.name}` : step.mode,
+            named ? `${_('Where this acts')}: ${named.x}, ${named.y}` : _('Where this acts'),
             value => {
-                step.mode = value;
+                const point = points.find(p => `point:${p.name}` === value);
+                if (point) {
+                    step.mode = spot;
+                    step.x = point.x;
+                    step.y = point.y;
+                    this._showNumbers.delete(step.id);
+                } else {
+                    step.mode = value as M;
+                    this._showNumbers.add(step.id); // only matters at x,y
+                }
                 this._saveAndRebuild();
-            }, 10)];
+            }, 14);
+        const widgets: Gtk.Widget[] = [dropdown];
 
+        if (named) {
+            widgets.push(this._pointNameButton(step), ...this._spotButtons(null,
+                () => this._showMarker(named.x, named.y)));
+            return widgets;
+        }
         const numbers = opts.places.find(place => place.mode === step.mode)?.numbers;
         if (numbers === 'offset') {
             widgets.push(this._numbersEntry([step.dx ?? 0, step.dy ?? 0], ([dx, dy]) => {
@@ -768,7 +816,7 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
                 step.y = y;
                 this._save();
             });
-            widgets.push(entry, ...this._spotButtons({
+            widgets.push(entry, this._pointNameButton(step), ...this._spotButtons({
                 tooltip: _('Click the spot on the screen: that position lands here'),
                 run: () => this._pickPointInto(({ x, y }) => entry.set_text(`${x}, ${y}`)),
             }, () => {
@@ -777,6 +825,53 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
             }));
         }
         return widgets;
+    }
+
+    /**
+     * The ▾ after a spot: a name for it, so other steps can pick it from the
+     * list. The name belongs to the coordinates — every step aimed at the same
+     * spot shows it — and the trash takes it away again, leaving the numbers.
+     */
+    private _pointNameButton(step: { x?: number; y?: number }): Gtk.MenuButton {
+        const doc = this._store.document;
+        const entry = new Gtk.Entry({ placeholder_text: _('Name this point'), width_chars: 14 });
+        const trash = iconButton('user-trash-symbolic', _('Forget this name — the steps keep their coordinates'), () => {
+            entry.set_text('');
+            button.popdown();
+        });
+        const box = new Gtk.Box({ spacing: 6, margin_top: 6, margin_bottom: 6, margin_start: 6, margin_end: 6 });
+        box.append(entry);
+        box.append(trash);
+        const popover = new Gtk.Popover({ child: box });
+        const button = new Gtk.MenuButton({
+            icon_name: 'pan-down-symbolic',
+            tooltip_text: _('Name this point'),
+            valign: Gtk.Align.CENTER,
+            popover,
+        });
+        button.add_css_class('flat');
+        // Filled in on opening, from the numbers as they are by then, and
+        // taken however it closes — Enter, a click elsewhere, the trash.
+        popover.connect('show', () => {
+            const point = pointAt(doc, step.x, step.y);
+            entry.set_text(point?.name ?? '');
+            trash.set_visible(point !== undefined);
+            entry.grab_focus();
+        });
+        popover.connect('closed', () => {
+            const name = (entry.get_text() ?? '').trim();
+            if (name === (pointAt(doc, step.x, step.y)?.name ?? '')) {
+                return;
+            }
+            const problem = namePoint(doc, step.x ?? 0, step.y ?? 0, name);
+            if (problem) {
+                this._toast(problem);
+            } else {
+                this._saveAndRebuild();
+            }
+        });
+        entry.connect('activate', () => button.popdown());
+        return button;
     }
 
     /**
@@ -1071,6 +1166,11 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
             this._rebuildMacros();
         });
         const headerButtons = new Gtk.Box({ spacing: 6, valign: Gtk.Align.CENTER });
+        headerButtons.append(this._livePopupButton(new Gtk.MenuButton({
+            label: _('Collections'),
+            valign: Gtk.Align.CENTER,
+            tooltip_text: _('Files of macros: load them, switch them on and off, save them'),
+        }), () => this._collectionChoices()));
         for (const button of this._transferButtons()) {
             headerButtons.append(button);
         }
@@ -1080,18 +1180,21 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
         this._macrosPage.add(actions);
         this._macroGroups.push(actions);
 
-        if (this._store.macros.length === 0) {
+        const shown = this._store.macros.filter(macro => macroLive(this._store.document, macro));
+        if (shown.length === 0) {
             const empty = new Adw.PreferencesGroup();
             empty.add(new Adw.ActionRow({
                 title: _('No macros yet'),
-                subtitle: _('Add one, then record into it'),
+                subtitle: this._store.macros.length > 0
+                    ? _('Add one, or switch a collection on')
+                    : _('Add one, then record into it'),
             }));
             this._macrosPage.add(empty);
             this._macroGroups.push(empty);
             return;
         }
 
-        for (const macro of this._store.macros) {
+        for (const macro of shown) {
             const group = this._buildMacroGroup(macro);
             this._macrosPage.add(group);
             this._macroGroups.push(group);
@@ -1559,14 +1662,23 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
             this._rebuildMacros();
         });
 
-        const nameRow = entryRow(_('Macro'), macro.name, text => {
+        const nameRow = entryRow(macro.collection
+            ? `${_('Macro')} · ${collectionName(macro.collection)}` : _('Macro'), macro.name, text => {
             macro.name = text;
             this._save();
         });
         nameRow.add_css_class('macroclickwerk-macro-name');
+        // Moving it up and down, and between collections: built as it opens,
+        // since what there is to move to changes with every load.
+        const more = this._livePopupButton(new Gtk.MenuButton({
+            icon_name: 'view-more-symbolic',
+            valign: Gtk.Align.CENTER,
+            css_classes: ['flat'],
+            tooltip_text: _('Move up or down, or to another collection'),
+        }), () => this._macroChoices(macro));
         // The order every line in the editor keeps: what this line is about,
         // then ▶, then the bin last.
-        for (const widget of [enabled, runButton, stopButton, remove]) {
+        for (const widget of [enabled, runButton, stopButton, more, remove]) {
             nameRow.add_suffix(widget);
         }
         group.add(nameRow);
@@ -2089,8 +2201,8 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
                 ...this._positionControls({
                     step,
                     places: [
-                        { mode: 'abs', label: _('At x,y'), numbers: 'spot' },
-                        { mode: 'current', label: _('At pointer') },
+                        { mode: 'abs', label: _('x,y'), numbers: 'spot' },
+                        { mode: 'current', label: _('current') },
                     ],
                 }),
             ];
@@ -2099,8 +2211,8 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
             return this._positionControls({
                 step,
                 places: [
-                    { mode: 'abs', label: _('To x,y'), numbers: 'spot' },
-                    { mode: 'rel', label: _('By offset'), numbers: 'offset' },
+                    { mode: 'abs', label: _('x,y'), numbers: 'spot' },
+                    { mode: 'rel', label: _('offset'), numbers: 'offset' },
                 ],
             });
 
@@ -2237,7 +2349,7 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
         const options = ['', ...others.map(other => other.id)];
         const labels: Record<string, string> = { '': _('This one') };
         for (const other of others) {
-            labels[other.id] = other.name;
+            labels[other.id] = this._macroLabel(other);
         }
         // A macro that has since been deleted is said to be missing, in red,
         // until another is picked — not shown as "This one", which a stop
@@ -2431,26 +2543,6 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
         });
     }
 
-    /**
-     * The toggle that makes a check outline the area it is reading while it
-     * reads it. Both checks that look at a piece of the screen have one, and
-     * both mean the same thing by it, so they share the button.
-     */
-    private _flashToggle(condition: LlmCondition | ColorCondition): Gtk.ToggleButton {
-        const flash = new Gtk.ToggleButton({
-            label: _('Flash'),
-            active: condition.flash === true,
-            tooltip_text: _('Flash a green outline over the checked area for a second whenever this check runs'),
-            valign: Gtk.Align.CENTER,
-            css_classes: ['flat'],
-        });
-        flash.connect('toggled', () => {
-            condition.flash = flash.get_active();
-            this._save();
-        });
-        return flash;
-    }
-
     private _buildConditionRows(
         condition: Condition,
         depth: number,
@@ -2493,7 +2585,6 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
                         run: () => this._pickRegionFor(condition),
                     }, null),
                     area.show,
-                    this._flashToggle(condition),
                 ]) {
                     promptRow.add_suffix(widget);
                 }
@@ -2556,7 +2647,6 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
                             ?? [condition.x, condition.y, condition.w, condition.h];
                         this._showMarker(x, y, Math.max(1, w), Math.max(1, h));
                     }),
-                    this._flashToggle(condition),
                 ]) {
                     line.add_suffix(widget);
                 }
@@ -2653,6 +2743,154 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
     }
 
     /**
+     * A menu button whose list is built each time it opens, from `choices` as
+     * they are then — for menus whose entries depend on what has been loaded,
+     * moved or edited since the page was drawn.
+     */
+    private _livePopupButton(button: Gtk.MenuButton, choices: () => Choice[]): Gtk.MenuButton {
+        button.set_create_popup_func(() => button.set_popover(this._choicePopover(choices())));
+        return button;
+    }
+
+    /**
+     * Collections: load one, and for each loaded, a switch — off takes its
+     * macros out of the editor and out of running, without forgetting them —
+     * then save it, or save it under another file. A dot marks unsaved changes.
+     */
+    private _collectionChoices(): Choice[] {
+        const doc = this._store.document;
+        const choices: Choice[] = [{
+            label: _('Load collection…'),
+            tooltip: _('Add the macros of a file — a collection, or an export of macros'),
+            run: () => this._chooseFile('open', 'macros.json', path => this._loadCollection(path)),
+        }];
+        for (const path of collectionPaths(doc)) {
+            const name = collectionName(path);
+            const on = collectionOn(doc, path);
+            choices.push({
+                label: name,
+                tooltip: on ? _('On — its macros are here and run') : _('Off — its macros are put away, and do not run'),
+                on,
+                run: () => {
+                    setCollectionOn(doc, path, !on);
+                    this._saveAndRebuild();
+                },
+            }, {
+                label: `${_('Save')} “${name}”${collectionUnsaved(doc, path) ? ' •' : ''}`,
+                tooltip: path,
+                run: () => this._saveCollection(path),
+            }, {
+                label: `${_('Save')} “${name}” ${_('as…')}`,
+                run: () => this._chooseFile('save', `${name}.json`, to => this._saveCollectionAs(path, to)),
+            });
+        }
+        return choices;
+    }
+
+    /** A macro's name in a list of them, saying so when its collection is off. */
+    private _macroLabel(macro: Macro): string {
+        return macroLive(this._store.document, macro) ? macro.name : `${macro.name} (${_('off')})`;
+    }
+
+    /** What a macro's ⋯ offers: its place in the list, and its collection. */
+    private _macroChoices(macro: Macro): Choice[] {
+        const doc = this._store.document;
+        const shown = doc.macros.filter(other => macroLive(doc, other));
+        const index = shown.indexOf(macro);
+        const choices: Choice[] = [];
+        const act = (change: () => void) => () => {
+            change();
+            this._saveAndRebuild();
+        };
+        if (index > 0) {
+            choices.push({ label: _('Move up'), run: act(() => moveMacro(doc, macro.id, -1)) });
+        }
+        if (index >= 0 && index < shown.length - 1) {
+            choices.push({ label: _('Move down'), run: act(() => moveMacro(doc, macro.id, 1)) });
+        }
+        for (const path of collectionPaths(doc)) {
+            const name = collectionName(path);
+            // Into one switched off is out of sight, so it says so.
+            const off = collectionOn(doc, path) ? '' : ` (${_('off')})`;
+            if (path !== macro.collection) {
+                choices.push({ label: `${_('Move to')} “${name}”${off}`, run: act(() => { macro.collection = path; }) });
+            }
+            choices.push({ label: `${_('Copy to')} “${name}”${off}`, run: act(() => copyMacro(doc, macro.id, path)) });
+        }
+        if (macro.collection) {
+            choices.push({
+                label: `${_('Move out of')} “${collectionName(macro.collection)}”`,
+                run: act(() => { macro.collection = undefined; }),
+            });
+        }
+        const intoNew = (copy: boolean) => () => this._chooseFile('save', `${macro.name}.json`, path => {
+            const collections = doc.collections;
+            const from = macro.collection;
+            const added = copy ? copyMacro(doc, macro.id, path) : null;
+            macro.collection = copy ? from : path;
+            // Nothing changes unless the file is written: a collection that
+            // never reached its file would only be lost on the next save.
+            if (!this._saveCollection(path)) {
+                doc.collections = collections;
+                doc.macros = doc.macros.filter(other => other !== added);
+                macro.collection = from;
+            }
+        });
+        choices.push(
+            { label: _('Move to a new collection…'), run: intoNew(false) },
+            { label: _('Copy to a new collection…'), run: intoNew(true) },
+        );
+        return choices;
+    }
+
+    private _loadCollection(path: string): void {
+        try {
+            const [ok, bytes] = GLib.file_get_contents(path);
+            if (!ok) {
+                throw new Error(_('could not read the file'));
+            }
+            const count = loadCollection(this._store.document, path, new TextDecoder().decode(bytes));
+            this._saveAndRebuild();
+            this._toast(`${_('Loaded')} “${collectionName(path)}”: ${count} ${count === 1 ? _('macro') : _('macros')}`);
+        } catch (error) {
+            this._toast(`${_('Could not load')} “${collectionName(path)}”: ${(error as Error).message}`);
+        }
+    }
+
+    /** Write a collection to its file as it is now. True when it was written. */
+    private _saveCollection(path: string): boolean {
+        const doc = this._store.document;
+        try {
+            GLib.file_set_contents(path, `${collectionText(doc, path)}\n`);
+            markCollectionSaved(doc, path);
+            this._saveAndRebuild();
+            this._toast(`${_('Saved')} “${collectionName(path)}”`);
+            return true;
+        } catch (error) {
+            this._toast(`${_('Could not save')} “${collectionName(path)}”: ${(error as Error).message}`);
+            return false;
+        }
+    }
+
+    /** Save as: the collection is written to `to`, and lives there from now on. */
+    private _saveCollectionAs(from: string, to: string): void {
+        const doc = this._store.document;
+        if (to !== from && collectionPaths(doc).includes(to)) {
+            this._toast(`“${collectionName(to)}” ${_('is already a collection here — pick another file')}`);
+            return;
+        }
+        renameCollection(doc, from, to);
+        if (!this._saveCollection(to)) {
+            renameCollection(doc, to, from);   // nothing was written there; stay where it was
+            this._save();
+        }
+    }
+
+    /**
+     * Take a collection's macros out of the editor. With unsaved changes it
+     * asks first — save them, throw them away, or leave it loaded.
+     */
+    /**
      * A popover listing things to do, each a flat button. The popover goes down
      * before the choice runs: a choice may open a file dialog, minimise the
      * window or rebuild the page, and a popover left up over any of those comes
@@ -2669,6 +2907,12 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
         const popover = new Gtk.Popover({ child: box });
         for (const choice of choices) {
             const button = new Gtk.Button({ label: choice.label, css_classes: ['flat'] });
+            if (choice.on !== undefined) {
+                const line = new Gtk.Box({ spacing: 12 });
+                line.append(new Gtk.Label({ label: choice.label, hexpand: true, xalign: 0 }));
+                line.append(new Gtk.Switch({ active: choice.on, can_target: false, can_focus: false }));
+                button.set_child(line);
+            }
             // Set apart: GJS refuses `undefined` for a property in a constructor.
             if (choice.tooltip) {
                 button.set_tooltip_text(choice.tooltip);
@@ -3464,7 +3708,7 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
             const options = ['', ...macros.map(macro => macro.id)];
             const labels: Record<string, string> = { '': _('Everything switched on') };
             for (const macro of macros) {
-                labels[macro.id] = macro.name;
+                labels[macro.id] = this._macroLabel(macro);
             }
             line.append(chooser(options, labels, trigger.macro ?? '', _('Which macro this drives'), value => {
                 trigger.macro = value;

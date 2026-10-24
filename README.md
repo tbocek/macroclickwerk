@@ -6,7 +6,7 @@ conditions that can look at the screen.
 ![The macro editor: a macro that waits for the Ready button to turn green, then clicks it](docs/screenshot.png)
 
 A macro is a tree of steps: clicks, pointer moves, key presses, typed text,
-scrolls and waits — and **When**, which parks the run until a button or key of
+scrolls and waits — and **On Event**, which parks the run until a button or key of
 your choosing is pressed (or released) and swallows that press, so a side
 button can mean "do the next steps" instead of what it normally does. Around
 them go **Repeat** — forever, or a number of times — and **If**, which asks the
@@ -33,8 +33,10 @@ The screenshot above is the macro this was built for. A Repeat asks the model,
 once a second, whether the Ready button is green; when it is, the Mouse step
 clicks it and waits three seconds, give or take half a second. The question
 names an area — `938, 414, 194, 82` — so the model looks at the button and not
-at the whole screen, and **Flash** draws a green outline over that area every
-time the check runs, so you can watch it look where you meant. On the click,
+at the whole screen, and a green outline flashes over that area every time the
+check runs, so you can watch it look where you meant. The click is aimed at
+**Ready** — a named point, the button's coordinates under a name — and the
+macro lives in the *Tower defense* collection, a file of its own. On the click,
 **↓ 20ms** is how long the button is held down, and **⏰ 50ms** is the game's
 turn: the next step waits until the game has had a frame to register the click.
 
@@ -62,10 +64,10 @@ by side, interleaving a step at a time over the one pointer and keyboard.
 
 ![When the side button goes down, Shift goes down; when the extra button is pressed, click three times](docs/side-button-tricks.png)
 
-A **When** holds the steps after it, drawn as a block. A key or click under a
-When can *follow* it — the toggle next to the key — so it goes down when you
+An **On Event** holds the steps after it, drawn as a block. A key or click
+under an On Event can *follow* it — the toggle next to the key — so it goes down when you
 press the side button and comes up when you let go: hold to sprint, without the
-game ever seeing the side button. The second When waits for the extra button
+game ever seeing the side button. The second On Event waits for the extra button
 and fires three clicks, 40 ms apart.
 
 ### Ask the model the right question
@@ -106,9 +108,9 @@ it: it can start, pause or stop a macro, or everything switched on, even when
 none is running; start or stop recording; capture a step; or stop everything.
 Until you pick what it does, its button works as usual, and so does every
 button whenever Macroclickwerk is not running. To make a button press something
-else inside a game, use a When step in a macro, as in the side-button tricks
-above. While a macro is waiting on a button in a When, that press goes to the
-When, not to the shortcut list.
+else inside a game, use an On Event step in a macro, as in the side-button
+tricks above. While a macro is waiting on a button in an On Event, that press
+goes to the On Event, not to the shortcut list.
 
 ## Features
 
@@ -133,13 +135,19 @@ When, not to the shortcut list.
   stop everything, even when no macro is running.
 - **Pause and continue** — halting a run remembers the step it was on, and
   clicking a row is what says where the next run starts.
-- **See what a check is looking at** — **Flash** outlines the checked area for
-  a second every time it runs, drawn just after the screen is read, so it is
+- **See what a check is looking at** — the checked area is outlined for a
+  second every time it runs, drawn just after the screen is read, so it is
   never part of what was measured.
 - **A panel popup that stays out of the way** — a switch, a stop, what is
   running, and a way into the settings.
 - **Emergency stop** that aborts mid-macro and releases every held key; a
   stopped or paused macro also lets go of whatever it was holding down.
+- **Named points** — give a spot on the screen a name, and every click or
+  move aimed at it says the name instead of the numbers; other steps pick it
+  from the same list.
+- **Collections** — keep macros in files of their own, one per game, saved
+  and loaded alongside the rest, and switched on and off as one; a ⋯ on each
+  macro moves or copies it into one, or up and down the list.
 - **Backup** — **Export** and **Import** next to **Add macro**, for the macros
   and for the settings, to a file you choose.
 
@@ -497,7 +505,7 @@ a click really lands where you meant it to.
 
 Steps move by dragging the grip on their left. Drop on the top half of a row to
 put the step before it, the bottom half to put it after; drop on a Repeat or
-When header to put it first inside, and hover over a folded Repeat to spring it
+On Event header to put it first inside, and hover over a folded Repeat to spring it
 open. A step moves with everything inside it. Repeat and If fold from the arrow
 on their left; the rest of the header is for selecting, like any other row.
 
@@ -530,11 +538,19 @@ a fixed position fails outright against a game that has the pointer locked
 rather than clicking wherever it got stuck. Relative motion still works there,
 because relative motion is exactly what a locked pointer accepts.
 
-Where a click or a move goes is a dropdown on its line. A Mouse step acts **At
-x,y** or **At pointer** — wherever the pointer already is, and the numbers go
-away with it. A Move goes **To x,y** or **By offset** — the numbers stay but
-stop being a place, so **Pick** and **Show**, which are about a spot on the
-screen, go instead.
+Where a click or a move goes is a dropdown on its line. A Mouse step acts at
+**x,y** or at the **current** position of the pointer, and the numbers go away
+with it. A Move goes to **x,y** or by an **offset** — the numbers stay but stop
+being a place, so **Pick** and **Show**, which are about a spot on the screen,
+go instead.
+
+The **▾** after a spot names it: type a name — "Ready", "Shop" — and press
+Enter. The name belongs to the spot, not to the step, so every click or move
+aimed at those exact coordinates shows the name in its dropdown instead of the
+numbers, and every other one lists it next to x,y to pick. Choosing **x,y** on
+a named step shows its numbers again, to change them; a step moved off the
+spot stops showing the name. The trash in the same popup forgets the name, and
+the steps keep their coordinates.
 
 A model check is one line: the yes/no question, then its area — `x, y, width,
 height`, or empty for the whole screen. **Pick** drops the window out of the way
@@ -580,10 +596,9 @@ drawn as an empty outline while what you have typed is not a colour yet. The
 same block follows every colour a summary line names, so a folded `If avg of
 40×40 @ 1,2 ≈ #123456 ±30` says which blue it means without being opened.
 
-The **Flash** toggle on a check's line draws a green outline over the checked
-area for a second every time the check runs, so you can watch a running macro
-look where you meant it to. Both checks have one. The flash fires just after
-the screen is read, never before: the outline's own green would otherwise be
+Every time a check runs, a green outline is drawn over the area it checked for
+a second, so you can watch a running macro look where you meant it to. The
+outline is drawn just after the screen is read, never before: the outline's own green would otherwise be
 part of the colour the check measured, and part of the picture the model is
 asked about.
 
@@ -595,6 +610,19 @@ one comes back is yours to say; the names `macroclickwerk-macros.json` and
 `macroclickwerk-settings.json` are only what the save dialog starts with. Importing macros replaces every macro you
 have. Importing settings skips anything the schema does not know or will not
 take, and says which keys it ignored.
+
+**Collections**, beside Export, keep macros in files of their own — the macros
+for one game, say — loaded next to the ones you have. Each has a switch in the
+menu: off puts its macros away — out of the editor, out of Run, and a shortcut
+or a Start aimed at one says the collection is off — and on brings them back,
+nothing forgotten in between. Its named points come and go with it. A macro
+from a collection says so above its name, and the ⋯ on every macro moves it up
+or down, moves or copies it into a collection or a new one, or takes it out of
+the one it is in; a collection left with no macros is gone. **Save** writes a
+collection back to its file, marked with a • while it has changes that are not
+in the file yet; **Save as** writes it somewhere else and keeps working on that
+one. A collection file is just the macros and the named points they use, so it
+is also how macros are shared.
 
 ### Daemon HTTP API
 

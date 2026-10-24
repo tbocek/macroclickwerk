@@ -2,7 +2,7 @@
 // its place — start, pause or stop a macro, start or stop recording, capture a
 // step, or stop everything: what a keyboard shortcut does, from a button the
 // whole of which is taken over, and which works whether or not a macro is
-// running. Making a button press something else is a When step in a macro,
+// running. Making a button press something else is an On Event step in a macro,
 // not a trigger.
 //
 // The split mirrors who can do what. Only the daemon, holding the grab, can
@@ -46,8 +46,8 @@ const TRIGGER_ACTIONS: readonly string[] = ['none', ...MACRO_ACTIONS, 'record', 
 
 /**
  * The stored JSON, tolerantly: a bad document is no triggers, not a crash.
- * A trigger that pressed a key in place of its button is dropped — that is a
- * When step in a macro — and says so in the log.
+ * A trigger that pressed a key in place of its button is dropped — that is an
+ * On Event step in a macro — and says so in the log.
  */
 export function parseTriggers(json: string): Trigger[] {
     try {
@@ -61,7 +61,7 @@ export function parseTriggers(json: string): Trigger[] {
             }
             const action = (t as { action?: unknown }).action;
             if (typeof action !== 'string' || !TRIGGER_ACTIONS.includes(action)) {
-                log(`macroclickwerk: dropping a trigger that ${action === 'key' ? 'pressed a key; use a When step in a macro' : 'does nothing known'}`);
+                log(`macroclickwerk: dropping a trigger that ${action === 'key' ? 'pressed a key; use an On Event step in a macro' : 'does nothing known'}`);
                 return false;
             }
             return true;
