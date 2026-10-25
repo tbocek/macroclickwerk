@@ -72,7 +72,7 @@ import { isArmed, parseTriggers, type Trigger } from './src/triggers.js';
 import {
     chooser, clearClasses, colorSwatch, comboRow, commitNumbers, debounce, descendants,
     firstDescendant,
-    entryRow, fitToText, iconButton, infoButton, numberEntry, passwordRow, setClass,
+    entryRow, fitToText, iconButton, infoButton, numberEntry, on, passwordRow, releaseTree, setClass,
     spinRow, suffixEntry, toggleButton, withColorSwatches,
 } from './src/widgets.js';
 
@@ -862,7 +862,7 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
             button.popdown();
         });
         const ok = new Gtk.Button({ label: _('OK'), css_classes: ['suggested-action'], tooltip_text: _('Save the name') });
-        ok.connect('clicked', () => button.popdown());
+        on(ok, 'clicked', () => button.popdown());
         const moved = (point: NamedPoint) => (to: Place) => {
             const problem = movePoint(doc, point.name, to);
             if (problem) {
@@ -895,7 +895,7 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
         });
         button.add_css_class('flat');
         // Taken however it closes — OK, Enter, a click elsewhere, the trash.
-        popover.connect('show', () => {
+        on(popover, 'show', () => {
             const point = named();
             entry.set_text(point?.name ?? '');
             // The whole screen is no place to name.
@@ -912,7 +912,7 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
                 : _('Pick it again on the screen: everything aimed at it moves there'));
             entry.grab_focus();
         });
-        popover.connect('closed', () => {
+        on(popover, 'closed', () => {
             const name = (entry.get_text() ?? '').trim();
             const point = named();
             const where = point ?? place();
@@ -926,7 +926,7 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
                 this._saveAndRebuild();
             }
         });
-        entry.connect('activate', () => button.popdown());
+        on(entry, 'activate', () => button.popdown());
         return button;
     }
 
@@ -989,7 +989,7 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
             ? false
             : defaultExpanded || this._expanded.has(key);
         const row = new Adw.ExpanderRow({ ...props, expanded });
-        row.connect('notify::expanded', () => {
+        on(row, 'notify::expanded', () => {
             if (this._rebuilding) {
                 return; // teardown, not a user action
             }
@@ -1091,6 +1091,12 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
             provider.load_from_string(EDITOR_CSS);
             Gtk.StyleContext.add_provider_for_display(
                 display, provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION);
+            // Taken off again on close: the process hosts every extension's
+            // settings and outlives this window, and each opening adds one.
+            this._window?.connect('close-request', () => {
+                Gtk.StyleContext.remove_provider_for_display(display, provider);
+                return false;
+            });
         } catch (error) {
             // Cosmetic only: an unparsable rule must not cost you the editor.
             log(`macroclickwerk: could not load editor styles: ${(error as Error).message}`);
@@ -1170,18 +1176,24 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
             this._settings.connect('changed::record-into', () => this._applyRecordTarget()),
             // The help under every model check describes what is sent, which
             // depends on the kind of model and, for a decision model, the bar.
-            this._settings.connect('changed::llm-kind', () => this._saveAndRebuild()),
-            this._settings.connect('changed::llm-decision-threshold', debounce(() => this._saveAndRebuild())),
+            // What the rows say about the model changes; the macros do not.
+            this._settings.connect('changed::llm-kind', () => this._scheduleRebuild()),
+            this._settings.connect('changed::llm-decision-threshold', debounce(() => this._scheduleRebuild())),
             this._settings.connect('changed::recording', () => this._applyRecordTarget()),
         );
 
         window.connect('close-request', () => {
+            // Now rather than on the delay: after this, a save would be skipped.
+            this._saveExpansion();
             this._closed = true;
             unsubscribe();
             for (const id of this._watchers.splice(0)) {
                 this._settings.disconnect(id);
             }
             this._store.destroy();
+            // The window goes, and with it everything in it — once nothing of
+            // ours holds it together any more.
+            releaseTree(window);
             return false;
         });
     }
@@ -1197,6 +1209,11 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
      */
     private _saveAndRebuild(): void {
         this._store.save();
+        this._scheduleRebuild();
+    }
+
+    /** A rebuild on the next idle, collapsing several asks into one. */
+    private _scheduleRebuild(): void {
         if (this._rebuildScheduled) {
             return;
         }
@@ -1247,8 +1264,15 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
         put();
 
         const undo: Array<() => void> = [];
+        // Each undone only if still there: the window may have closed, and
+        // taken its handlers with it, before the timer comes round.
+        const disconnect = (object: GObject.Object, id: number) => {
+            if (GObject.signal_handler_is_connected(object, id)) {
+                object.disconnect(id);
+            }
+        };
         const adjustmentId = adjustment.connect('changed', put);
-        undo.push(() => adjustment.disconnect(adjustmentId));
+        undo.push(() => disconnect(adjustment, adjustmentId));
 
         const window = this._window;
         if (window) {
@@ -1260,7 +1284,7 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
                     return GLib.SOURCE_REMOVE;
                 });
             });
-            undo.push(() => window.disconnect(focusId));
+            undo.push(() => disconnect(window, focusId));
         }
 
         GLib.timeout_add(GLib.PRIORITY_DEFAULT, SCROLL_SETTLE_MS, () => {
@@ -1281,9 +1305,14 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
         this._rebuilding = true;
         for (const group of this._macroGroups) {
             this._macrosPage.remove(group);
+            // Or the handlers in it keep it alive: see `on`.
+            releaseTree(group);
         }
         this._macroGroups = [];
         this._rebuilding = false;
+        // Nothing may point into the old rows either.
+        this._dropHighlight = null;
+        this._disarmSpring();
         // Every row just went away, so nothing is highlighted any more either.
         this._stepRows.clear();
         this._targetRows.clear();
@@ -1302,7 +1331,7 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
             css_classes: ['suggested-action'],
             valign: Gtk.Align.CENTER,
         });
-        addButton.connect('clicked', () => {
+        on(addButton, 'clicked', () => {
             this._store.addMacro(newMacro(`Macro ${this._store.macros.length + 1}`));
             this._rebuildMacros();
         });
@@ -1467,9 +1496,9 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
         });
         grip.set_cursor_from_name('grab');
         const source = new Gtk.DragSource({ actions: Gdk.DragAction.MOVE });
-        source.connect('prepare', () =>
+        on(source, 'prepare', () =>
             Gdk.ContentProvider.new_for_value(`${macro.id} ${step.id}`));
-        source.connect('drag-begin', () => {
+        on(source, 'drag-begin', () => {
             // The row itself as the drag image, so what floats under the
             // pointer is what was picked up.
             source.set_icon(new Gtk.WidgetPaintable({ widget: row }), 12, 12);
@@ -1502,7 +1531,7 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
         const line = (row instanceof Adw.ExpanderRow ? this._headerOf(row) : null) ?? row;
         const fraction = (y: number) => y / Math.max(1, line.get_height());
         const target = Gtk.DropTarget.new(GObject.TYPE_STRING, Gdk.DragAction.MOVE);
-        target.connect('motion', (_target, _x, y) => {
+        on(target, 'motion', (_target, _x, y) => {
             const where = zone(fraction(y));
             this._paintDrop(line, where);
             if (springRow && !springRow.get_expanded()) {
@@ -1510,11 +1539,11 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
             }
             return where ? Gdk.DragAction.MOVE : 0;
         });
-        target.connect('leave', () => {
+        on(target, 'leave', () => {
             this._paintDrop(line, null);
             this._disarmSpring();
         });
-        target.connect('drop', (_target, value, _x, y) => {
+        on(target, 'drop', (_target, value, _x, y) => {
             this._paintDrop(line, null);
             this._disarmSpring();
             const [macroId, stepId] = String(value).split(' ');
@@ -1583,7 +1612,7 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
      */
     private _selectable(row: Gtk.Widget, target: string, macroId: string): void {
         const click = new Gtk.GestureClick({ button: Gdk.BUTTON_PRIMARY });
-        click.connect('pressed', (_gesture, _presses, x: number, y: number) => {
+        on(click, 'pressed', (_gesture, _presses, x: number, y: number) => {
             if (this._innermostRow(row, x, y) === row) {
                 this._selectTarget(macroId, target);
             }
@@ -1795,7 +1824,7 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
             valign: Gtk.Align.CENTER,
             tooltip_text: this._macroHint(macro),
         });
-        enabled.connect('notify::active', () => {
+        on(enabled, 'notify::active', () => {
             macro.enabled = enabled.get_active();
             enabled.set_tooltip_text(this._macroHint(macro));
             this._save();
@@ -1818,7 +1847,7 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
                     'From its next run'));
         };
         showExclusive();
-        exclusive.connect('toggled', () => {
+        on(exclusive, 'toggled', () => {
             macro.exclusive = exclusive.get_active() ? undefined : false;
             // Redrawn: the locks on its Waits and Repeats grey out with it.
             this._saveAndRebuild();
@@ -1876,7 +1905,7 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
             css_classes: ['flat', 'macroclickwerk-fold'],
             tooltip_text: _('Fold or unfold'),
         });
-        fold.connect('clicked', () => {
+        on(fold, 'clicked', () => {
             const key = `macro:${macro.id}`;
             if (folded) {
                 this._collapsed.delete(key);
@@ -1994,7 +2023,7 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
             _('down when it is pressed, up when it is released. ' +
               'Off: this step decides for itself.'),
             step.action === undefined);
-        toggle.connect('toggled', () => {
+        on(toggle, 'toggled', () => {
             // 'tap' rather than nothing when it stops following: a step with no
             // action *is* a follower, so there would be nothing to turn off.
             step.action = toggle.get_active() ? undefined : 'tap';
@@ -2070,8 +2099,8 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
             tooltip_text: _('Fold or unfold'),
         });
         const sync = () => button.set_icon_name(row.get_expanded() ? 'pan-down-symbolic' : 'pan-end-symbolic');
-        button.connect('clicked', () => row.set_expanded(!row.get_expanded()));
-        row.connect('notify::expanded', sync);
+        on(button, 'clicked', () => row.set_expanded(!row.get_expanded()));
+        on(row, 'notify::expanded', sync);
         sync();
         return button;
     }
@@ -2256,7 +2285,7 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
         // of its own: a step's line is already full, and this is the gesture
         // people try on a list without being told to.
         const secondary = new Gtk.GestureClick({ button: Gdk.BUTTON_SECONDARY });
-        secondary.connect('pressed', (_gesture, _presses, x: number, y: number) => {
+        on(secondary, 'pressed', (_gesture, _presses, x: number, y: number) => {
             this._stepMenu(macro, step, row, x, y);
         });
         row.add_controller(secondary);
@@ -2357,7 +2386,7 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
                     branch.set_visible(expander.get_expanded());
                 }
             };
-            expander.connect('notify::expanded', follow);
+            on(expander, 'notify::expanded', follow);
             follow();
         }
 
@@ -2390,7 +2419,7 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
                         : _('Lets the others go: other macros may act after every round')));
         };
         show();
-        button.connect('toggled', () => {
+        on(button, 'toggled', () => {
             if (button.get_active()) {
                 step.keepTurn = true;
             } else {
@@ -2428,7 +2457,7 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
             // repeat-song is the "keep going" variant of the same family.
             const forever = toggleButton('media-playlist-repeat-song-symbolic',
                 _('Repeat without a limit'), step.count === 'forever');
-            forever.connect('toggled', () => {
+            on(forever, 'toggled', () => {
                 step.count = forever.get_active() ? 'forever' : count;
                 spin.set_visible(!forever.get_active());
                 save();
@@ -2851,7 +2880,7 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
                     hint.say(advice ? 'advice' : null, advice ?? '');
                     onAnswer?.(null);
                 };
-                promptRow.connect('changed', advise);
+                on(promptRow, 'changed', advise);
                 advise();
                 indent(hint.row);
 
@@ -2872,7 +2901,7 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
                 // commit is on a delay, and a swatch that lags what you typed
                 // by half a second is a swatch you stop trusting.
                 const swatch = colorSwatch(() => colour.get_text() ?? '', _('What this colour looks like'));
-                colour.connect('changed', () => swatch.queue_draw());
+                on(colour, 'changed', () => swatch.queue_draw());
                 const area = this._numbersEntry([condition.x, condition.y, condition.w, condition.h],
                     ([x, y, w, h]) => {
                         this._setColorArea(condition, { x, y, w, h });
@@ -2982,20 +3011,21 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
         choices: Choice[],
         icon?: string,
     ): Gtk.MenuButton {
-        const popover = this._choicePopover(choices);
+        // Its list is built when it opens, not with the page: every add row
+        // has one, few are ever opened, and built up front they were half the
+        // widgets a rebuild made.
         if (!icon) {
-            return new Gtk.MenuButton({ label, popover, valign: Gtk.Align.CENTER });
+            return this._livePopupButton(new Gtk.MenuButton({ label, valign: Gtk.Align.CENTER }), () => choices);
         }
         const content = new Gtk.Box({ spacing: 6 });
         content.append(new Gtk.Image({ icon_name: icon }));
         content.append(new Gtk.Label({ label }));
-        return new Gtk.MenuButton({
+        return this._livePopupButton(new Gtk.MenuButton({
             child: content,
-            popover,
             always_show_arrow: true,
             valign: Gtk.Align.CENTER,
             css_classes: ['flat'],
-        });
+        }), () => choices);
     }
 
     /**
@@ -3004,7 +3034,14 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
      * moved or edited since the page was drawn.
      */
     private _livePopupButton(button: Gtk.MenuButton, choices: () => Choice[]): Gtk.MenuButton {
-        button.set_create_popup_func(() => button.set_popover(this._choicePopover(choices())));
+        button.set_create_popup_func(() => {
+            // The last one goes; let go of it, or every opening keeps one.
+            const last = button.get_popover();
+            button.set_popover(this._choicePopover(choices()));
+            if (last) {
+                releaseTree(last);
+            }
+        });
         return button;
     }
 
@@ -3193,7 +3230,7 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
             if (choice.tooltip) {
                 button.set_tooltip_text(choice.tooltip);
             }
-            button.connect('clicked', () => {
+            on(button, 'clicked', () => {
                 popover.popdown();
                 choice.run();
             });
@@ -3363,6 +3400,7 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
         }
         for (const page of this._settingsPages) {
             window.remove(page);
+            releaseTree(page);
         }
         this._settingsPages = [this._buildSetupPage(), this._buildShortcutsPage()];
         for (const page of this._settingsPages) {
@@ -3416,6 +3454,7 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
                 // case, an exchange the shell never answered would leave this
                 // handler parsing every future result on the key forever.
                 settings.disconnect(handlerId);
+                this._watchers = this._watchers.filter(id => id !== handlerId);
                 if (answer.serial > serial) {
                     return; // a newer exchange overtook this one; its handler answers
                 }
@@ -3424,6 +3463,9 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
                 }
                 options.onResult!(answer);
             });
+            // Among the watchers, so closing the window ends the wait too: an
+            // answer after that has no window to come back to.
+            this._watchers.push(handlerId);
         }
 
         if (options.minimize) {
@@ -3495,7 +3537,7 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
         }));
         // A popover parented by hand is unparented by hand, and not from inside
         // the signal that is still using it — hence the idle.
-        popover.connect('closed', () => {
+        on(popover, 'closed', () => {
             GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
                 popover.unparent();
                 return GLib.SOURCE_REMOVE;
@@ -3629,10 +3671,10 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
             }
         });
         const sync = () => show.set_visible(Boolean(read()));
-        entry.connect('changed', sync);
+        on(entry, 'changed', sync);
         // Committed once typing pauses, and only what reads: half a rectangle
         // is a field being typed, not the whole screen.
-        entry.connect('changed', debounce(() => {
+        on(entry, 'changed', debounce(() => {
             const next = read();
             setClass(entry, 'error', next === undefined);
             if (next !== undefined) {
@@ -3737,7 +3779,7 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
         const commitEndpoint = debounce(() => {
             this._settings.set_string('llm-endpoint', endpoint.get_text() ?? '');
         });
-        endpoint.connect('changed', commitEndpoint);
+        on(endpoint, 'changed', commitEndpoint);
 
         // Which kind of model the endpoint serves. Both answer the same yes or
         // no; a chat model writes it out, a decision model gives a probability
@@ -3790,7 +3832,7 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
         });
         const testButton = new Gtk.Button({ label: _('Test'), valign: Gtk.Align.CENTER });
         testRow.add_suffix(testButton);
-        testButton.connect('clicked', () => {
+        on(testButton, 'clicked', () => {
             for (const style of ['error', 'warning', 'success']) {
                 testRow.remove_css_class(style);
             }

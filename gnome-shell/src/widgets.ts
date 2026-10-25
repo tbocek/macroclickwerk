@@ -14,10 +14,71 @@ import type giCairo from '@girs/gjs/cairo';
 import Adw from 'gi://Adw';
 import Gdk from 'gi://Gdk';
 import GLib from 'gi://GLib';
+import GObject from 'gi://GObject';
 import Gtk from 'gi://Gtk';
 import Pango from 'gi://Pango';
 
 import { parseNumbers } from './model.js';
+
+/**
+ * Every handler connected through `on`, by the object it is on — so a torn
+ * down part of the window can be let go of; see `releaseTree`. Controllers
+ * are also kept in a list of their own: finding them from their widgets means
+ * asking every widget for its controllers, which was most of a release.
+ */
+const connected = new WeakMap<object, number[]>();
+const controllers = new Set<Gtk.EventController>();
+
+/**
+ * `object.connect`, remembered. Use it for widgets and their controllers: a
+ * handler on a widget that refers to anything above it — the row it sits in,
+ * the popover it closes — makes a loop through GTK's own references that
+ * neither side can collect, and keeps the whole tree alive after it is gone.
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export function on(object: GObject.Object, signal: string, handler: (...args: any[]) => unknown): number {
+    const id = object.connect(signal, handler);
+    connected.set(object, [...(connected.get(object) ?? []), id]);
+    if (object instanceof Gtk.EventController) {
+        controllers.add(object);
+    }
+    return id;
+}
+
+/**
+ * Let go of a part of the window that is being thrown away: disconnect what
+ * `on` connected to it and to everything in it, and drop the callbacks GTK
+ * holds for drawing and for popups. Nothing GTK connected itself is touched.
+ */
+export function releaseTree(root: Gtk.Widget): void {
+    const release = (object: GObject.Object) => {
+        for (const id of connected.get(object) ?? []) {
+            object.disconnect(id);
+        }
+        connected.delete(object);
+    };
+    const inside = new Set<Gtk.Widget>();
+    const visit = (widget: Gtk.Widget) => {
+        inside.add(widget);
+        release(widget);
+        if (widget instanceof Gtk.DrawingArea) {
+            widget.set_draw_func(null);
+        } else if (widget instanceof Gtk.MenuButton) {
+            widget.set_create_popup_func(null);
+        }
+        for (let child = widget.get_first_child(); child; child = child.get_next_sibling()) {
+            visit(child);
+        }
+    };
+    visit(root);
+    for (const controller of controllers) {
+        const widget = controller.get_widget();
+        if (!widget || inside.has(widget)) {
+            release(controller);
+            controllers.delete(controller);
+        }
+    }
+}
 
 export function debounce(fn: () => void, ms = 400): () => void {
     let sourceId = 0;
@@ -36,7 +97,7 @@ export function debounce(fn: () => void, ms = 400): () => void {
 /** Shared tail of entryRow and passwordRow: the initial text and a debounced commit. */
 function commitOnChange(row: Adw.EntryRow, value: string, onChange: (text: string) => void): Adw.EntryRow {
     row.set_text(value);
-    row.connect('changed', debounce(() => onChange(row.get_text() ?? '')));
+    on(row, 'changed', debounce(() => onChange(row.get_text() ?? '')));
     return row;
 }
 
@@ -61,7 +122,7 @@ export function spinRow(
         title,
         adjustment: new Gtk.Adjustment({ lower, upper, stepIncrement: step, value }),
     });
-    row.connect('notify::value', () => onChange(row.get_value()));
+    on(row, 'notify::value', () => onChange(row.get_value()));
     return row;
 }
 
@@ -87,7 +148,7 @@ function onPicked<T extends string>(
     onChange: (value: T) => void,
 ): void {
     let current = selected;
-    widget.connect('notify::selected', () => {
+    on(widget, 'notify::selected', () => {
         const value = options[widget.get_selected()];
         if (value !== undefined && value !== current) {
             current = value;
@@ -170,7 +231,7 @@ export function fitToText(entry: Gtk.Entry, floor: string): void {
     const fit = () => entry.set_size_request(
         Math.max(width(entry.get_text() ?? ''), width(floor)) + FIELD_PADDING, -1);
     fit();
-    entry.connect('changed', fit);
+    on(entry, 'changed', fit);
 }
 
 /** 200 → "0.2s", 20 → "20ms", 2500 → "2.5s": how a time field shows itself. */
@@ -260,13 +321,13 @@ export function numberEntry(
             onChange(current);
         }
     });
-    entry.connect('changed', typed);
-    entry.connect('activate', () => commit(read()));
+    on(entry, 'changed', typed);
+    on(entry, 'activate', () => commit(read()));
 
     // Captured before the text inside the entry sees them, which would take
     // ↑ and ↓ as a request to move the focus.
     const keys = new Gtk.EventControllerKey({ propagation_phase: Gtk.PropagationPhase.CAPTURE });
-    keys.connect('key-pressed', (_controller, keyval: number) => {
+    on(keys, 'key-pressed', (_controller, keyval: number) => {
         if (keyval === Gdk.KEY_Up || keyval === Gdk.KEY_KP_Up) {
             commit(bandedUp(read()));
             return true;
@@ -283,7 +344,7 @@ export function numberEntry(
     // fractions add up to whole steps rather than each being one.
     let scrolled = 0;
     const wheel = new Gtk.EventControllerScroll({ flags: Gtk.EventControllerScrollFlags.VERTICAL });
-    wheel.connect('scroll', (_controller, _dx: number, dy: number) => {
+    on(wheel, 'scroll', (_controller, _dx: number, dy: number) => {
         if (!(entry.get_state_flags() & Gtk.StateFlags.FOCUS_WITHIN)) {
             return false;   // the page's scroll, not ours
         }
@@ -301,8 +362,8 @@ export function numberEntry(
 
     const minus = new Gtk.Button({ label: '−', tooltip_text: tooltip });
     const plus = new Gtk.Button({ label: '+', tooltip_text: tooltip });
-    minus.connect('clicked', () => commit(bandedDown(read())));
-    plus.connect('clicked', () => commit(bandedUp(read())));
+    on(minus, 'clicked', () => commit(bandedDown(read())));
+    on(plus, 'clicked', () => commit(bandedUp(read())));
     const box = new Gtk.Box({
         valign: Gtk.Align.CENTER,
         css_classes: ['linked', 'macroclickwerk-spin'],
@@ -386,7 +447,7 @@ export function suffixEntry(
         max_width_chars: opts.max ?? -1,
     });
     const commit = () => onChange(entry.get_text() ?? '');
-    entry.connect('changed', opts.settle ? debounce(commit) : commit);
+    on(entry, 'changed', opts.settle ? debounce(commit) : commit);
     return entry;
 }
 
@@ -466,7 +527,7 @@ export function iconButton(iconName: string, tooltip: string, onClick: () => voi
         valign: Gtk.Align.CENTER,
         css_classes: ['flat', 'image-button'],
     });
-    button.connect('clicked', onClick);
+    on(button, 'clicked', onClick);
     return button;
 }
 
@@ -543,7 +604,7 @@ export function commitNumbers(
             onChange(parsed);
         }
     });
-    field.connect('changed', commit);
+    on(field, 'changed', commit);
     return () => current;
 }
 
