@@ -131,7 +131,7 @@ export default class MacroclickwerkExtension extends Extension {
 
         const config = this._store.config;
         this._daemon = new DaemonClient(config.controlSocket, config.eventSocket);
-        this._evaluator = new ConditionEvaluator(config, trace => this._onTrace(trace), flashRegion);
+        this._evaluator = new ConditionEvaluator(config, trace => this._onTrace(trace), flashRegion, clearMarker);
         this._recorder = new Recorder(this._daemon, config, {
             onStatus: text => this._onStatus(text),
             onError: error => {
@@ -866,11 +866,12 @@ export default class MacroclickwerkExtension extends Extension {
         }
 
         await settle(SETTLE_BEFORE_SAMPLE_MS);
+        clearMarker();   // an outline on screen is not the colour picked
         const pixbuf = await captureRegion(region.x, region.y, region.w, region.h);
         // The average, which is the same thing the check reads when it runs —
         // one number to store, the same number to compare against.
         const color = formatColor(averageColor(pixbuf));
-        // Only now: the outline is over the very pixels that were just read.
+        // Only now, around the very pixels that were just read.
         flashRegion(region);
         return { ok: true, region, color };
     }

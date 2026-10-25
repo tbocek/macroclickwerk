@@ -34,7 +34,7 @@ once a second, whether the Ready button is green; when it is, the Mouse step
 clicks it and waits three seconds, give or take half a second. The question
 looks at **Ready** — a named area, the button's rectangle under a name — so the
 model looks at the button and not at the whole screen, and a green outline
-flashes over that area every time the check runs, so you can watch it look
+flashes around that area every time the check runs, so you can watch it look
 where you meant. The click is aimed at **Ready** too, which for a click is the
 middle of the area. The macro lives in the *Tower defense* collection, a file
 of its own. On the click,
@@ -138,8 +138,8 @@ goes to the On Event, not to the shortcut list.
 - **Pause and continue** — halting a run remembers the step it was on, and
   clicking a row is what says where the next run starts.
 - **See what a check is looking at** — the checked area is outlined for a
-  second every time it runs, drawn just after the screen is read, so it is
-  never part of what was measured.
+  second every time it runs, around it rather than on it, and taken down
+  before the screen is read again, so it is never part of what is measured.
 - **A panel popup that stays out of the way** — a switch, a stop, what is
   running, and a way into the settings.
 - **Emergency stop** that aborts mid-macro and releases every held key; a
@@ -636,11 +636,13 @@ drawn as an empty outline while what you have typed is not a colour yet. The
 same block follows every colour a summary line names, so a folded `If avg of
 40×40 @ 1,2 ≈ #123456 ±30` says which blue it means without being opened.
 
-Every time a check runs, a green outline is drawn over the area it checked for
-a second, so you can watch a running macro look where you meant it to. The
-outline is drawn just after the screen is read, never before: the outline's own green would otherwise be
-part of the colour the check measured, and part of the picture the model is
-asked about.
+Every time a check runs, a green outline is drawn around the area it checked
+for a second, so you can watch a running macro look where you meant it to. The
+outline sits just outside the area, never on it, and comes down before the
+screen is read again — by the next round of the same check, by another check,
+or by a colour pick — and so does a **Show** marker: a capture sees what the
+shell draws on top, and an outline in the picture would be part of the colour
+the check measured, and of the picture the model is asked about.
 
 At the top of the Macros page, next to **Add macro**, are **Export** and
 **Import**, each offering **Macros** or **Settings** — two files, because they

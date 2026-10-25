@@ -30,14 +30,19 @@ export class ConditionEvaluator {
      * whole screen. A callback because drawing belongs
      * to the shell UI, and this file also runs under plain gjs in the tests.
      */
+    /** Called right before the screen is read, to take any outline down. */
+    private _beforeCapture?: () => void;
+
     constructor(
         config: Config,
         onTrace?: (trace: EvaluationTrace) => void,
         onFlash?: (region?: Region | null) => void,
+        beforeCapture?: () => void,
     ) {
         this._config = config;
         this._onTrace = onTrace;
         this._onFlash = onFlash;
+        this._beforeCapture = beforeCapture;
     }
 
     setConfig(config: Config): void {
@@ -131,6 +136,7 @@ export class ConditionEvaluator {
     private async _evaluateColor(condition: ColorCondition): Promise<{ result: boolean; detail: string }> {
         const w = Math.max(1, condition.w);
         const h = Math.max(1, condition.h);
+        this._beforeCapture?.();
         const pixbuf = await captureRegion(condition.x, condition.y, w, h);
 
         const actual = averageColor(pixbuf);
@@ -164,6 +170,7 @@ export class ConditionEvaluator {
             kind: this._config.llmKind,
             threshold: this._config.llmThreshold,
         };
+        this._beforeCapture?.();
         const pixbuf = condition.region
             ? await captureRegion(condition.region.x, condition.region.y, condition.region.w, condition.region.h)
             : await captureScreen();

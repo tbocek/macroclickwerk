@@ -60,7 +60,12 @@ function holdCompositing(on: boolean): void {
     compositingHeld = on;
 }
 
-/** Take down whatever marker is showing, if any. */
+/**
+ * Take down whatever marker is showing, if any. Also right before the screen
+ * is read: a capture sees the shell's own overlays, so a check repeating
+ * within the second would read the outline its last round left, and a Show
+ * pressed just before a colour pick would be part of the colour.
+ */
 export function clearMarker(): void {
     if (markerTimeoutId) {
         GLib.source_remove(markerTimeoutId);
@@ -160,6 +165,9 @@ const FLASH_DURATION_MS = 1000;
 /** Smaller than this and an outline is not something you would see. */
 const FLASH_MIN_SIZE = 24;
 
+/** The outline's width — `.macroclickwerk-marker-flash` in the stylesheet. */
+const FLASH_BORDER_PX = 3;
+
 /**
  * A green outline over the area a running check is reading, gone again within
  * the second; no region means the whole screen. That convention is resolved
@@ -167,11 +175,13 @@ const FLASH_MIN_SIZE = 24;
  */
 export function flashRegion(region?: Region | null): void {
     const area = region ?? { x: 0, y: 0, w: global.stage.width, h: global.stage.height };
-    // A colour check on a single pixel would otherwise flash a single pixel.
-    // The box grows around the area rather than out of its corner, so the spot
-    // it is pointing at stays in the middle of it.
-    const w = Math.max(Math.round(area.w), FLASH_MIN_SIZE);
-    const h = Math.max(Math.round(area.h), FLASH_MIN_SIZE);
+    // Around the area, never on it: the outline's inside edge is the area's
+    // outside edge, so not a pixel of what is measured is under it. A colour
+    // check on a single pixel would otherwise flash a single pixel; the box
+    // grows around the area rather than out of its corner, so the spot it is
+    // pointing at stays in the middle of it.
+    const w = Math.max(Math.round(area.w) + 2 * FLASH_BORDER_PX, FLASH_MIN_SIZE);
+    const h = Math.max(Math.round(area.h) + 2 * FLASH_BORDER_PX, FLASH_MIN_SIZE);
     const box = new St.Widget({ style_class: 'macroclickwerk-marker-flash', reactive: false });
     box.set_position(
         Math.round(area.x) - Math.round((w - area.w) / 2),
