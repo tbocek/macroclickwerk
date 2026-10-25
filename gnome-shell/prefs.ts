@@ -1041,6 +1041,45 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
         }));
     }
 
+    /**
+     * A maximize button, whatever the desktop's button layout leaves out —
+     * GNOME's own default is a close button and nothing else, and an editor
+     * of long macros is a window you want to make big. The rest of the layout
+     * is kept as it is set; only this window's header bars get the button.
+     *
+     * Not modal either, which the Extensions app asks for after this has run:
+     * GTK gives a modal window neither minimize nor maximize, whatever the
+     * layout says. All modal did was lock the app's own list while this is open.
+     */
+    private _offerMaximize(window: Adw.PreferencesWindow): void {
+        const unlock = () => {
+            if (window.get_modal()) {
+                window.set_modal(false);
+            }
+        };
+        window.connect('notify::modal', unlock);
+        unlock();
+
+        const layout = Gtk.Settings.get_default()?.gtk_decoration_layout || 'appmenu:close';
+        if (/(^|[,:])maximize([,:]|$)/.test(layout)) {
+            return;
+        }
+        const [left, right = ''] = layout.split(':');
+        const buttons = right.split(',').filter(Boolean);
+        const close = buttons.indexOf('close');
+        buttons.splice(close < 0 ? buttons.length : close, 0, 'maximize');
+        const withMaximize = `${left}:${buttons.join(',')}`;
+        const walkTree = (widget: Gtk.Widget) => {
+            if (widget instanceof Adw.HeaderBar || widget instanceof Gtk.HeaderBar) {
+                widget.set_decoration_layout(withMaximize);
+            }
+            for (let child = widget.get_first_child(); child; child = child.get_next_sibling()) {
+                walkTree(child);
+            }
+        };
+        walkTree(window);
+    }
+
     /** Load the editor's own style classes once, on top of whatever theme is set. */
     private _installCss(): void {
         const display = Gdk.Display.get_default();
@@ -1085,6 +1124,7 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
         this._store = new MacroStore(this._settings);
         this._loadExpansion();
         this._installCss();
+        this._offerMaximize(window);
 
         this._macrosPage = new Adw.PreferencesPage({
             title: _('Macros'),
