@@ -43,14 +43,14 @@ function pixbufFromBytes(bytes: GLib.Bytes): GdkPixbuf.Pixbuf {
     return pixbuf;
 }
 
-/** Full stage capture, across all monitors. */
-export async function captureScreen(): Promise<GdkPixbuf.Pixbuf> {
+/** Full stage capture, across all monitors, as the PNG the shell wrote. */
+async function screenPng(): Promise<GLib.Bytes> {
     ensurePromisified();
     const shooter = new Shell.Screenshot() as Shell.Screenshot & AsyncScreenshot;
     const stream = Gio.MemoryOutputStream.new_resizable();
     await shooter.screenshot(false, stream);
     stream.close(null);
-    return pixbufFromBytes(stream.steal_as_bytes());
+    return stream.steal_as_bytes();
 }
 
 function stageSize(): [number, number] {
@@ -61,6 +61,11 @@ function stageSize(): [number, number] {
 export async function captureRegion(
     x: number, y: number, width: number, height: number,
 ): Promise<GdkPixbuf.Pixbuf> {
+    return pixbufFromBytes(await regionPng(x, y, width, height));
+}
+
+/** A rectangle as the PNG the shell wrote — see `captureRegion`. */
+async function regionPng(x: number, y: number, width: number, height: number): Promise<GLib.Bytes> {
     ensurePromisified();
     const [stageWidth, stageHeight] = stageSize();
 
@@ -73,7 +78,38 @@ export async function captureRegion(
     const stream = Gio.MemoryOutputStream.new_resizable();
     await shooter.screenshot_area(cx, cy, cw, ch, stream);
     stream.close(null);
-    return pixbufFromBytes(stream.steal_as_bytes());
+    return stream.steal_as_bytes();
+}
+
+/** A PNG's size, from its header — the first chunk is always IHDR. */
+function pngSize(png: Uint8Array): { width: number; height: number } {
+    const read = (at: number) => ((png[at] << 24) | (png[at + 1] << 16) | (png[at + 2] << 8) | png[at + 3]) >>> 0;
+    return { width: read(16), height: read(20) };
+}
+
+/**
+ * What a model is shown: the area, or the whole screen when there is none,
+ * no wider than `maxWidth`. The shell already hands the capture over as a PNG,
+ * so one that fits — a model check's area nearly always does — goes out as it
+ * is: decoding it only to encode the same picture again cost the compositor a
+ * frame or more for nothing. Only a wider one is decoded, scaled and encoded.
+ */
+export async function captureForLlm(
+    region: { x: number; y: number; w: number; h: number } | null | undefined, maxWidth: number,
+): Promise<EncodedImage> {
+    const bytes = region ? await regionPng(region.x, region.y, region.w, region.h) : await screenPng();
+    const png = bytes.toArray();
+    const { width, height } = pngSize(png);
+    if (maxWidth > 0 && width > maxWidth) {
+        return encodeForLlm(pixbufFromBytes(bytes), maxWidth);
+    }
+    return {
+        dataUri: `data:image/png;base64,${GLib.base64_encode(png)}`,
+        mimeType: 'image/png',
+        byteLength: png.length,
+        width,
+        height,
+    };
 }
 
 // --- encoding for the LLM --------------------------------------------------
@@ -102,7 +138,7 @@ export interface EncodedImage {
  * level is left at the default — level 9 buys under a percent for twice the
  * time, and this runs on the compositor thread.
  */
-export function encodeForLlm(pixbuf: GdkPixbuf.Pixbuf, maxWidth: number): EncodedImage {
+function encodeForLlm(pixbuf: GdkPixbuf.Pixbuf, maxWidth: number): EncodedImage {
     const scaled = scaleToWidth(pixbuf, maxWidth);
 
     const [ok, buffer] = scaled.save_to_bufferv('png', [], []);

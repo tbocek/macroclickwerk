@@ -340,10 +340,34 @@ export class TriggerEngine {
         ])];
     }
 
+    // One connect at a time: a second one started while the first was still
+    // opening the stream cancelled it, and the first one's error then closed
+    // the second — a false "not active", and three seconds without triggers.
+    // Asked again meanwhile, it goes round once more when this one is done.
+    private _connecting = false;
+    private _connectAgain = false;
+
     private async _connect(): Promise<void> {
         if (this._destroyed || this._codes().length === 0) {
             return;
         }
+        if (this._connecting) {
+            this._connectAgain = true;
+            return;
+        }
+        this._connecting = true;
+        try {
+            await this._connectOnce();
+        } finally {
+            this._connecting = false;
+        }
+        if (this._connectAgain) {
+            this._connectAgain = false;
+            void this._connect();
+        }
+    }
+
+    private async _connectOnce(): Promise<void> {
         try {
             if (!this._stream.active) {
                 await this._stream.open(

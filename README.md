@@ -539,10 +539,11 @@ down the list, greyed out at either end.
 
 Coordinates are single fields — `100, 200` for a point, `10, 20, 40, 40` for an
 area — sized to what is in them. Beside each, **⌖ Pick** fills the field by
-pointing: the window gets out of the way, the screen dims, and where you click
-lands in the field — which is how you correct a coordinate that has moved
+pointing: the screen dims, and where you click lands in the field — which is how you correct a coordinate that has moved
 without recording the step again. Escape leaves the field as it was, and what
-was picked is flashed back at you. **👁 Show** flashes a red X (or an outline)
+was picked is flashed back at you. The window stays where it is while you pick
+— move it aside if it covers the spot — unless **Hide this window while
+picking** is on, under Setup → Picking. **👁 Show** flashes a red X (or an outline)
 at that spot on the real screen for a couple of seconds, so you can check a
 number without running anything. An area is picked by dragging one out on the
 same overlay, described with the condition it belongs to below.
@@ -593,9 +594,8 @@ its middle along with it; on a click, the crosshair is greyed out for an area,
 since a click picks a point. A name means one place, point or area.
 
 A model check is one line: the yes/no question, then its area — `x, y, width,
-height`, or empty for the whole screen. **Pick** drops the window out of the way
-and lets you drag a rectangle over the screen, and whatever you drag out is
-flashed back at you once the window returns, so the numbers in the field never
+height`, or empty for the whole screen. **Pick** lets you drag a rectangle over
+the screen, and whatever you drag out is flashed back at you, so the numbers in the field never
 have to be taken on trust.
 
 Ask so that Yes means what you are waiting for is on the screen, and put what

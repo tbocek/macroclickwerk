@@ -25,11 +25,6 @@
              highlights them, and uses the macro ids to show which are running.
              Carries a serial because two identical writes — the empty list at the
              end of one run and of the next — would not be signalled. -->
-        <key name="running-steps" type="s">
-            <default>''</default>
-            <summary>Running steps</summary>
-            <description>Internal: JSON, per running macro, of the step ids its runner is inside</description>
-        </key>
 
         <!-- The row selected in the editor: "after:abc123" for a step,
              "in:abc123:body" for one of its bodies, "end:macroId" or empty for
@@ -249,6 +244,13 @@
             <default>'/var/run/macroclickwerk-events'</default>
             <summary>Daemon event socket</summary>
             <description>Unix socket the daemon streams recorded input events on</description>
+        </key>
+
+        <!-- Editor -->
+        <key name="hide-while-picking" type="b">
+            <default>false</default>
+            <summary>Hide the settings window while picking</summary>
+            <description>Minimize the settings window while a place, an area or a colour is picked on the screen with the crosshair</description>
         </key>
 
         <!-- Recording -->

@@ -2,6 +2,7 @@
 // went wrong, and a way into the editor. All macro editing lives in the
 // preferences window.
 
+import GLib from 'gi://GLib';
 import Pango from 'gi://Pango';
 import Clutter from 'gi://Clutter';
 import St from 'gi://St';
@@ -149,12 +150,34 @@ export class MacroPopup {
     }
 
     destroy(): void {
+        if (this._refreshId) {
+            GLib.source_remove(this._refreshId);
+            this._refreshId = 0;
+        }
         this._unsubscribe();
         this._statusLabel.destroy();
         this._detailLabel.destroy();
     }
 
+    /**
+     * Brought up to date on the next idle, once however often it is asked:
+     * one run starting or ending asks several times over, and a macro that
+     * restarts itself does that every round.
+     */
     refresh(): void {
+        if (this._refreshId) {
+            return;
+        }
+        this._refreshId = GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
+            this._refreshId = 0;
+            this._refreshNow();
+            return GLib.SOURCE_REMOVE;
+        });
+    }
+
+    private _refreshId = 0;
+
+    private _refreshNow(): void {
         const store = this._deps.store;
         const runningIds = this._deps.runningMacroIds();
         const running = runningIds.length > 0;

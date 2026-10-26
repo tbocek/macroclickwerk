@@ -231,6 +231,11 @@ export class Recorder {
 
     destroy(): void {
         this.cancel();
+        // A whole recording still going: the daemon is told it is over, or it
+        // stays in recording mode with no one listening.
+        if (this._mode !== 'idle') {
+            void this._daemon.setRecording(false).catch(() => {});
+        }
         this._clearTimers();
         this._stream?.close();
         this._stream = null;

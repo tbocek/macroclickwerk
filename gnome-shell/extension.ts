@@ -19,6 +19,7 @@ import { MacroRunner, Turn, type FinishReason, type RunningStep } from './src/ru
 import { Recorder, acceleratorToEvdevCodes } from './src/recorder.js';
 import { MacroStore, type Config } from './src/store.js';
 import { starterMacro } from './src/starter.js';
+import { LIVE_PATH, LIVE_XML } from './src/live.js';
 import {
     childLists, collectionName, describeStep, findStep, lastPointerEndpoint, reachesEnd,
     macroLive, resolveRecordTarget, resolveRunStart, type LlmCondition, type Macro, type RecordTarget, type Region, type Step,
@@ -26,7 +27,7 @@ import {
 import { clearProblems, onProblemsChanged, problemCount, reportProblem } from './src/problems.js';
 import { TriggerEngine, parseTriggers } from './src/triggers.js';
 import { MacroPopup } from './ui/popup.js';
-import { clearMarker, flashRegion, pickRegion, showMarker } from './ui/overlay.js';
+import { cancelPick, clearMarker, flashRegion, pickRegion, showMarker } from './ui/overlay.js';
 import { captureRegion } from './src/screenshot.js';
 import { averageColor, formatColor } from './src/colours.js';
 
@@ -110,10 +111,14 @@ export default class MacroclickwerkExtension extends Extension {
     private _problemsUnsubscribe?: () => void;
     private _runningPaths = new Map<string, RunningStep[]>();
     private _publishSourceId = 0;
-    private _publishSerial = 0;
+    /** On the session bus while enabled: see `src/live.ts`. */
+    private _live: Gio.DBusExportedObject | null = null;
 
     enable(): void {
         this._settings = this.getSettings();
+        // Fresh with every enable: runs left over from the last one may still
+        // be giving theirs back.
+        this._turn = new Turn();
 
         this._store = new MacroStore(this._settings);
         if (this._store.macros.length === 0) {
@@ -122,12 +127,11 @@ export default class MacroclickwerkExtension extends Extension {
             this._store.activeMacroId = macro.id;
         }
 
-        // Nothing is running in a shell that has only just started, whatever
-        // the last one left in the key. `disable` clears it on the way out, but
-        // a session that ends takes the process with it and never gets there —
-        // so a logout during a run left the editor showing that run for ever
-        // after, offering Pause on a macro no longer capable of being paused.
-        this._publishRunningPaths();
+        // Where runs are, for an open editor: see `src/live.ts`.
+        this._live = Gio.DBusExportedObject.wrapJSObject(LIVE_XML, {
+            GetRunningSteps: () => this._runningJson(),
+        });
+        this._live.export(Gio.DBus.session, LIVE_PATH);
 
         const config = this._store.config;
         this._daemon = new DaemonClient(config.controlSocket, config.eventSocket);
@@ -218,7 +222,18 @@ export default class MacroclickwerkExtension extends Extension {
         }
         this._runningPaths.clear();
         this._publishRunningPaths();
+        this._live?.unexport();
+        this._live = null;
 
+        // Runs and checks first, so nothing still under way draws again
+        // after the marker is cleared.
+        this._restarting.clear();
+        for (const runner of this._runners.values()) {
+            runner.stop();
+        }
+        this._runners.clear();
+        this._evaluator?.destroy();
+        cancelPick();
         clearMarker();
         // Nothing is recording once we are gone; a stale "yes" here would leave
         // the editor painted red until the next recording corrected it.
@@ -226,14 +241,8 @@ export default class MacroclickwerkExtension extends Extension {
             this._settings.set_string('recording', '');
         }
         this._recorder?.cancel();
-        this._restarting.clear();
-        for (const runner of this._runners.values()) {
-            runner.stop();
-        }
-        this._runners.clear();
         this._triggers?.destroy();
         this._recorder?.destroy();
-        this._evaluator?.destroy();
         this._popup?.destroy();
         this._indicator?.destroy();
 
@@ -417,20 +426,22 @@ export default class MacroclickwerkExtension extends Extension {
             .join('\n');
     }
 
-    private _publishRunningPaths(): void {
-        // The serial is what makes the write differ: the empty list at the end of
-        // one run is the same string as at the end of the last, and GSettings does
-        // not signal an identical value.
-        this._settings?.set_string('running-steps', JSON.stringify({
-            serial: ++this._publishSerial,
+    /** Where every run is, as `src/live.ts` describes it. */
+    private _runningJson(edited: string[] = []): string {
+        return JSON.stringify({
             running: [...this._runningPaths].map(([macro, path]) => ({
                 macro,
                 steps: path.map(entry => entry.id),
             })),
-            // Named once, on the first publish after the edit, so the editor
-            // can say why the highlight went out. See `_stopEditedRuns`.
-            edited: [...this._stoppedByEdit],
-        }));
+            edited,
+        });
+    }
+
+    private _publishRunningPaths(): void {
+        // Named once, on the first publish after the edit, so the editor can
+        // say why the highlight went out. See `_stopEditedRuns`.
+        this._live?.emit_signal('RunningSteps',
+            new GLib.Variant('(s)', [this._runningJson([...this._stoppedByEdit])]));
         this._stoppedByEdit.clear();
     }
 
@@ -445,14 +456,19 @@ export default class MacroclickwerkExtension extends Extension {
         if (!this._daemon || !this._evaluator || !this._settings || !this._store) {
             return null;
         }
-        const runner = new MacroRunner(
+        // A runner still unwinding after a disable — or after a quick disable
+        // and enable, which leaves a fresh extension state under the same
+        // macro id — is no longer the one in the map, and is not listened to.
+        const current = () => this._runners.get(macroId) === runner;
+        const runner: MacroRunner = new MacroRunner(
             this._daemon, this._evaluator, {
-                onStatus: text => this._onStatus(text),
-                onRunningChanged: () => this._onRunningChanged(),
-                onStepsChanged: path => this._onStepsChanged(macroId, path),
+                onStatus: text => current() && this._onStatus(text),
+                onRunningChanged: () => current() && this._onRunningChanged(),
+                onStepsChanged: path => current() && this._onStepsChanged(macroId, path),
                 shouldPause: () => this._isPointerOverMenu(),
-                onFinished: (reason, error) => this._onFinished(macroId, reason, error),
-                onMacroControl: (action, target, at) => this._macroControl(action, target, at ?? ''),
+                onFinished: (reason, error) => current() && this._onFinished(macroId, reason, error),
+                onMacroControl: (action, target, at) => current()
+                    ? this._macroControl(action, target, at ?? '') : 'the extension was turned off',
                 macroName: id => this._store?.getMacro(id)?.name,
                 waitForInput: (source, edge) => this._triggers?.waitFor(source, edge),
             }, this._turn);
@@ -848,6 +864,9 @@ export default class MacroclickwerkExtension extends Extension {
             return { ok: false, message: 'only a model check can be tried this way' };
         }
         await settle(SETTLE_BEFORE_SAMPLE_MS);
+        if (!this._evaluator) {
+            return { ok: false, message: 'the extension was turned off' };
+        }
         try {
             const verdict = await this._evaluator.askLlm(condition);
             return { ok: true, match: verdict.match, reason: verdict.reason, latencyMs: verdict.latencyMs };
@@ -1136,9 +1155,6 @@ export default class MacroclickwerkExtension extends Extension {
         if (key === 'macros' || key === 'active-macro-id') {
             this._popup?.refresh();
             return;
-        }
-        if (key === 'running-steps') {
-            return; // our own write, several times a second while a macro runs
         }
         if (key === 'record-into') {
             // The selected row is also where the next run starts, and the popup

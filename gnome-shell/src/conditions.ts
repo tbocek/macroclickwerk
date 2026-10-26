@@ -8,7 +8,7 @@ import { describeCondition } from './model.js';
 import { LlmClient, LlmError, type LlmSettings, type Verdict } from './llm.js';
 import { reportProblem } from './problems.js';
 import type { Config } from './store.js';
-import { captureRegion, captureScreen, encodeForLlm } from './screenshot.js';
+import { captureForLlm, captureRegion } from './screenshot.js';
 import { averageColor, colorDistance, formatColor, parseColor } from './colours.js';
 
 export interface EvaluationTrace {
@@ -50,7 +50,21 @@ export class ConditionEvaluator {
     }
 
     destroy(): void {
+        this._destroyed = true;
         this._llm.destroy();
+    }
+
+    /**
+     * Gone with the extension. A check whose capture was under way when that
+     * happened ends there: no outline on a screen that may be the lock
+     * screen by now, and no question sent to a model nobody is waiting on.
+     */
+    private _destroyed = false;
+
+    private _stillWanted(): void {
+        if (this._destroyed) {
+            throw new Error('the extension was turned off');
+        }
     }
 
     /** Evaluate a condition tree. Throws when a check cannot be answered. */
@@ -138,6 +152,7 @@ export class ConditionEvaluator {
         const h = Math.max(1, condition.h);
         this._beforeCapture?.();
         const pixbuf = await captureRegion(condition.x, condition.y, w, h);
+        this._stillWanted();
 
         const actual = averageColor(pixbuf);
         const distance = colorDistance(actual, parseColor(condition.color));
@@ -171,12 +186,10 @@ export class ConditionEvaluator {
             threshold: this._config.llmThreshold,
         };
         this._beforeCapture?.();
-        const pixbuf = condition.region
-            ? await captureRegion(condition.region.x, condition.region.y, condition.region.w, condition.region.h)
-            : await captureScreen();
-        const image = encodeForLlm(pixbuf, this._config.llmMaxWidth);
+        const image = await captureForLlm(condition.region, this._config.llmMaxWidth);
+        this._stillWanted();
         // After the capture — the flash must not be in the picture the model
-        // is asked about — and after the encode, which blocks the main loop
+        // is asked about — and after any encode, which blocks the main loop
         // and would sit between the flash and its first paint.
         this._onFlash?.(condition.region);
         return this._llm.ask(condition.prompt, image, settings);

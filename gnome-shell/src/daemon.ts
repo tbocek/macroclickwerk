@@ -109,7 +109,13 @@ export class DaemonClient {
     setPaths(controlPath: string, eventPath: string): void {
         this._controlPath = controlPath || DEFAULT_CONTROL_SOCKET;
         this._eventPath = eventPath || DEFAULT_EVENT_SOCKET;
+        this._address = null;
     }
+
+    // Made once rather than per request: a request goes out for every click
+    // and key a macro plays, and each pair was garbage until the next GC.
+    private _client = new Gio.SocketClient() as Gio.SocketClient & AsyncSocketClient;
+    private _address: Gio.UnixSocketAddress | null = null;
 
     private async _request(method: string, path: string, body: object | null, timeoutMs: number): Promise<any> {
         const cancellable = new Gio.Cancellable();
@@ -122,10 +128,10 @@ export class DaemonClient {
             });
         }
 
+        let connection: Gio.SocketConnection | null = null;
         try {
-            const client = new Gio.SocketClient() as Gio.SocketClient & AsyncSocketClient;
-            const address = new Gio.UnixSocketAddress({ path: this._controlPath });
-            const connection = await client.connect_async(address, cancellable);
+            this._address ??= new Gio.UnixSocketAddress({ path: this._controlPath });
+            connection = await this._client.connect_async(this._address, cancellable);
 
             const encoder = new TextEncoder();
             const payload = body ? encoder.encode(JSON.stringify(body)) : new Uint8Array(0);
@@ -162,7 +168,6 @@ export class DaemonClient {
                     throw new DaemonError('response too large');
                 }
             }
-            connection.close(null);
 
             const merged = new Uint8Array(total);
             let offset = 0;
@@ -186,6 +191,13 @@ export class DaemonClient {
         } finally {
             if (timeoutId) {
                 GLib.source_remove(timeoutId);
+            }
+            // On every way out — a timeout or an error left the socket open
+            // until a GC came round, one file descriptor each.
+            try {
+                connection?.close(null);
+            } catch {
+                // Already closed, or never fully opened.
             }
         }
     }

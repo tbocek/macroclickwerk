@@ -206,6 +206,14 @@ export interface PickOptions {
  * Drag a rectangle over the screen. Resolves null when cancelled with Escape or
  * a right click.
  */
+/** Ends the picker that is up, if one is — see `cancelPick`. */
+let cancelActivePick: (() => void) | null = null;
+
+/** Take an open picker down, as Escape would: the extension is going away. */
+export function cancelPick(): void {
+    cancelActivePick?.();
+}
+
 export function pickRegion(options: PickOptions = {}): Promise<Region | null> {
     return new Promise(resolve => {
         const overlay = new St.Widget({
@@ -255,12 +263,14 @@ export function pickRegion(options: PickOptions = {}): Promise<Region | null> {
                 return;
             }
             settled = true;
+            cancelActivePick = null;
             if (grab) {
                 Main.popModal(grab);
             }
             overlay.destroy();
             resolve(region);
         };
+        cancelActivePick = () => finish(null);
 
         const updateBand = (x: number, y: number) => {
             const left = Math.min(startX, x);

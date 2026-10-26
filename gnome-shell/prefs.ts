@@ -67,6 +67,7 @@ import {
     walk,
 } from './src/model.js';
 import { MacroStore } from './src/store.js';
+import { LIVE_BUS_NAME, LIVE_IFACE, LIVE_PATH } from './src/live.js';
 import { buildInstruction, promptAdvice, testConnection } from './src/llm.js';
 import { isArmed, parseTriggers, type Trigger } from './src/triggers.js';
 import {
@@ -110,7 +111,7 @@ const SETTINGS_FILE = 'macroclickwerk-settings.json';
  * clobber the other export or replay a stale request.
  */
 const NOT_SETTINGS = [
-    'macros', 'active-macro-id', 'running-steps', 'record-into', 'recording',
+    'macros', 'active-macro-id', 'record-into', 'recording',
 ];
 
 function isTransferableKey(key: string): boolean {
@@ -686,6 +687,9 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
     private _highlighted: string[] = [];
     /** Settings watchers held for the life of the window, dropped when it closes. */
     private _watchers: number[] = [];
+    /** Where runs are, as the shell last said — see `src/live.ts`. */
+    private _running = '';
+    private _runsSubscription = 0;
     /** The ▶ beside each macro's name, by macro id: it becomes a pause. */
     private _runButtons = new Map<string, Gtk.Button>();
 
@@ -1164,13 +1168,6 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
         // apart: a watcher added here is dropped below without being named
         // twice more.
         this._watchers.push(
-            // Where the shell's runner currently is. Only style classes change,
-            // so this can arrive several times a second without disturbing an
-            // edit.
-            this._settings.connect('changed::running-steps', () => {
-                this._reportEditedStops();
-                this._applyRunningHighlight();
-            }),
             // Both are painted by the same pass: the target only reads as a
             // target once you can see whether it is live.
             this._settings.connect('changed::record-into', () => this._applyRecordTarget()),
@@ -1182,7 +1179,9 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
             this._settings.connect('changed::recording', () => this._applyRecordTarget()),
         );
 
+        this._watchRuns();
         window.connect('close-request', () => {
+            Gio.DBus.session.signal_unsubscribe(this._runsSubscription);
             // Now rather than on the delay: after this, a save would be skipped.
             this._saveExpansion();
             this._closed = true;
@@ -1674,10 +1673,44 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
         }
     }
 
+    /**
+     * Where the shell's runners are, from the session bus: asked once on
+     * opening, then told on every change. Only style classes change, so this
+     * can arrive several times a second without disturbing an edit. A shell
+     * without it yet — one not restarted since the update — just answers
+     * nothing, and nothing is highlighted.
+     */
+    private _watchRuns(): void {
+        const bus = Gio.DBus.session;
+        const heard = (json: string, fresh: boolean) => {
+            if (this._closed) {
+                return;
+            }
+            this._running = json;
+            if (fresh) {
+                this._reportEditedStops();
+            }
+            this._applyRunningHighlight();
+        };
+        this._runsSubscription = bus.signal_subscribe(LIVE_BUS_NAME, LIVE_IFACE, 'RunningSteps', LIVE_PATH,
+            null, Gio.DBusSignalFlags.NONE,
+            (_connection, _sender, _path, _iface, _signal, parameters) => {
+                heard((parameters.deepUnpack() as [string])[0], true);
+            });
+        bus.call(LIVE_BUS_NAME, LIVE_PATH, LIVE_IFACE, 'GetRunningSteps', null, new GLib.VariantType('(s)'),
+            Gio.DBusCallFlags.NONE, -1, null, (connection, result) => {
+                try {
+                    heard((connection!.call_finish(result).deepUnpack() as [string])[0], false);
+                } catch {
+                    // Not there: nothing is running that we could know of.
+                }
+            });
+    }
+
     /** What the shell publishes: one chain of step ids per running macro. */
     private _runningPaths(): { macro: string; steps: string[] }[] {
         try {
-            const raw = this._settings.get_string('running-steps');
+            const raw = this._running;
             if (!raw) {
                 return [];
             }
@@ -1709,8 +1742,7 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
     private _reportEditedStops(): void {
         let edited: unknown;
         try {
-            edited = (JSON.parse(this._settings.get_string('running-steps') || '{}') as
-                { edited?: unknown }).edited;
+            edited = (JSON.parse(this._running || '{}') as { edited?: unknown }).edited;
         } catch {
             return;
         }
@@ -3612,13 +3644,14 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
     }
 
     /**
-     * Get out of the way, let the picker take a click on the real screen, and
-     * hand back where it landed. The window comes back either way; a pick that
-     * caught nothing says so rather than leaving the field looking picked.
+     * Let the picker take a click on the real screen, and hand back where it
+     * landed — out of the way first, if Setup says so, and back either way. A
+     * pick that caught nothing says so rather than leaving the field looking
+     * picked.
      */
     private _pickPointInto(onPoint: (point: { x: number; y: number }) => void): void {
         this._askShell('pick-point', {}, {
-            minimize: true,
+            minimize: this._hideWhilePicking(),
             onResult: answer => {
                 if (answer.ok && typeof answer.x === 'number' && typeof answer.y === 'number') {
                     onPoint({ x: answer.x, y: answer.y });
@@ -3629,10 +3662,15 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
         });
     }
 
+    /** Whether the window gets out of the way for a pick — a choice in Setup. */
+    private _hideWhilePicking(): boolean {
+        return this._settings.get_boolean('hide-while-picking');
+    }
+
     /** As `_pickPointInto`, for a rectangle dragged over the screen. */
     private _pickRegionInto(onRegion: (region: Region) => void): void {
         this._askShell('pick-region', {}, {
-            minimize: true,
+            minimize: this._hideWhilePicking(),
             onResult: answer => {
                 if (answer.region) {
                     onRegion(answer.region as Region);
@@ -3703,7 +3741,7 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
      */
     private _pickColorFor(condition: ColorCondition): void {
         this._askShell('pick-color', {}, {
-            minimize: true,
+            minimize: this._hideWhilePicking(),
             onResult: answer => {
                 const region = answer.region as Region | undefined;
                 if (!answer.ok || !region) {
@@ -3883,6 +3921,16 @@ export default class MacroclickwerkPreferences extends ExtensionPreferences {
     }
 
     private _addInputGroups(page: Adw.PreferencesPage): void {
+        const picking = new Adw.PreferencesGroup({ title: _('Picking') });
+        const hide = new Adw.SwitchRow({
+            title: _('Hide this window while picking'),
+            subtitle: _('Out of the way while you click or drag on the screen with ⌖. ' +
+                'Off, it stays — move it aside if it covers what you want to pick'),
+        });
+        this._settings.bind('hide-while-picking', hide, 'active', Gio.SettingsBindFlags.DEFAULT);
+        picking.add(hide);
+        page.add(picking);
+
         const recording = new Adw.PreferencesGroup({ title: _('Recording') });
         recording.add(spinRow(
             _('Pauses longer than this become waits (ms, 0 = never)'),
